@@ -268,12 +268,38 @@ body,
 }
 
 .tool-result-content {
-  max-height: 220px;
+  max-height: 420px;
   overflow-y: auto;
+}
+
+.tool-result-content-fetch {
+  max-height: 720px;
 }
 
 .tool-result-preview {
   opacity: 0.85;
+}
+
+.tool-result-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-raw-toggle {
+  align-self: flex-start;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  border-radius: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.tool-result-raw {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 10px;
 }
 
 .cursor-blink {

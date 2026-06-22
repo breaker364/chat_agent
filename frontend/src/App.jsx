@@ -38,6 +38,15 @@ function formatValue(value) {
   }
 }
 
+function tryParseJson(value) {
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
 function ToolCallBubble({ toolName, args }) {
   return (
     <div className="message tool-message">
@@ -53,8 +62,13 @@ function ToolCallBubble({ toolName, args }) {
 
 function ToolResultBubble({ toolName, content }) {
   const [expanded, setExpanded] = useState(false);
+  const [rawExpanded, setRawExpanded] = useState(false);
   const text = formatValue(content);
   const preview = text.length > 220 ? `${text.slice(0, 220)}...` : text;
+  const parsed = tryParseJson(typeof content === "string" ? content : "");
+  const isWebFetch = (toolName || "").toLowerCase() === "web_fetch";
+  const fetchPreview = typeof parsed?.content_preview === "string" ? parsed.content_preview : "";
+  const fetchPreviewShort = fetchPreview.length > 320 ? `${fetchPreview.slice(0, 320)}...` : fetchPreview;
 
   return (
     <div className="message tool-result-message">
@@ -63,9 +77,36 @@ function ToolResultBubble({ toolName, content }) {
         <span>{toolName || "tool result"}</span>
         <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
       </button>
-      <pre className={expanded ? "tool-result-content" : "tool-result-preview"}>
-        {expanded ? text : preview}
-      </pre>
+      {isWebFetch && parsed ? (
+        <div className="tool-result-block">
+          <pre className={expanded ? "tool-result-content tool-result-content-fetch" : "tool-result-preview"}>
+            {expanded
+              ? [
+                  parsed.url ? `url: ${parsed.url}` : null,
+                  parsed.title ? `title: ${parsed.title}` : null,
+                  parsed.code ? `code: ${parsed.code}` : null,
+                  parsed.code_text ? `status: ${parsed.code_text}` : null,
+                  parsed.prompt ? `prompt: ${parsed.prompt}` : null,
+                  parsed.duration_seconds != null ? `duration_seconds: ${parsed.duration_seconds}` : null,
+                  "",
+                  fetchPreview || text,
+                ]
+                  .filter(Boolean)
+                  .join("\n")
+              : fetchPreviewShort || preview}
+          </pre>
+          {expanded ? (
+            <button className="tool-raw-toggle" onClick={() => setRawExpanded((v) => !v)}>
+              {rawExpanded ? "hide raw json" : "show raw json"}
+            </button>
+          ) : null}
+          {expanded && rawExpanded ? <pre className="tool-result-content tool-result-raw">{text}</pre> : null}
+        </div>
+      ) : (
+        <pre className={expanded ? "tool-result-content" : "tool-result-preview"}>
+          {expanded ? text : preview}
+        </pre>
+      )}
     </div>
   );
 }

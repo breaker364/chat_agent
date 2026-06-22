@@ -48,6 +48,11 @@ _BING_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+_BING_HEADERS_EN = {
+    **_BING_HEADERS,
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 _TIME_KEYWORDS = ("今天", "今日", "今年", "本周", "最新", "最近", "刚刚", "current", "latest", "today")
 _VOLATILE_KEYWORDS = ("价格", "售价", "多少钱", "股价", "汇率", "天气", "排名", "积分", "standings", "price", "weather")
 _HISTORY_KEYWORDS = ("历史", "回顾", "archive", "历年", "百科", "wiki")
@@ -207,6 +212,54 @@ def get_file_info(path: str) -> str:
     )
 
 
+@tool
+def write_file(path: str, content: str, overwrite: bool = True) -> str:
+    """Create or replace a text file in the workspace. Use overwrite=false to avoid replacing an existing file."""
+    try:
+        target = _ensure_allowed(path)
+    except PermissionError as exc:
+        return str(exc)
+    existed_before = target.exists()
+    if target.exists() and target.is_dir():
+        return f"Cannot write file because target is a directory: {target}"
+    if target.exists() and not overwrite:
+        return f"File already exists and overwrite is false: {target}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content or "", encoding="utf-8", newline="\n")
+    action = "Updated" if existed_before else "Created"
+    return f"{action} file: {target}"
+
+
+@tool
+def append_file(path: str, content: str) -> str:
+    """Append text to a file in the workspace. Creates the file if it does not exist."""
+    try:
+        target = _ensure_allowed(path)
+    except PermissionError as exc:
+        return str(exc)
+    if target.exists() and target.is_dir():
+        return f"Cannot append because target is a directory: {target}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(content or "")
+    return f"Appended to file: {target}"
+
+
+@tool
+def delete_file(path: str) -> str:
+    """Delete a file in the workspace. Does not delete directories."""
+    try:
+        target = _ensure_allowed(path)
+    except PermissionError as exc:
+        return str(exc)
+    if not target.exists():
+        return f"File not found: {target}"
+    if target.is_dir():
+        return f"Refusing to delete directory with delete_file: {target}"
+    target.unlink()
+    return f"Deleted file: {target}"
+
+
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
@@ -245,7 +298,23 @@ def _detect_language(query: str) -> str:
     return "en"
 
 
-def _detect_query_type(query: str) -> str:
+def _build_bing_params(query: str) -> dict[str, str]:
+    ascii_terms = _extract_ascii_terms(query)
+    chinese_terms = _extract_chinese_terms(query)
+    mostly_ascii = len(ascii_terms) >= max(2, len(chinese_terms) * 2)
+    if mostly_ascii:
+        return {"q": query, "setmkt": "en-US", "setlang": "en-US"}
+    return {"q": query, "setmkt": "zh-CN", "setlang": "zh-Hans"}
+
+
+def _build_bing_headers(query: str) -> dict[str, str]:
+    ascii_terms = _extract_ascii_terms(query)
+    chinese_terms = _extract_chinese_terms(query)
+    mostly_ascii = len(ascii_terms) >= max(2, len(chinese_terms) * 2)
+    return _BING_HEADERS_EN if mostly_ascii else _BING_HEADERS
+
+
+def _legacy_removed_query_type(query: str) -> str:
     lowered = _normalize_text(query)
     if "天气" in query or "weather" in lowered:
         return "weather"
@@ -260,29 +329,27 @@ def _detect_query_type(query: str) -> str:
     return "generic"
 
 
-def _contains_any(query: str, tokens: list[str]) -> bool:
-    return any(token in query for token in tokens)
-
-
 def _detect_query_type_v2(query: str) -> str:
-    lowered = _normalize_text(query)
-    weather_tokens = ["\u5929\u6c14"]
-    ranking_tokens = ["\u6392\u540d", "\u79ef\u5206", "\u699c\u5355", "\u79ef\u5206\u699c"]
-    product_tokens = ["\u5c3a\u5bf8", "\u4ef7\u683c", "\u91cd\u91cf", "\u53c2\u6570", "\u914d\u7f6e"]
-    people_tokens = ["\u603b\u88c1", "\u8463\u4e8b\u957f", "\u6821\u957f", "\u9662\u957f", "\u6bd5\u4e1a\u9662\u6821", "\u5b66\u5386", "\u4e2a\u4eba\u7b80\u4ecb"]
-    location_tokens = ["\u5730\u5740", "\u4f4d\u7f6e", "\u5728\u54ea", "\u5de5\u5382"]
+    ascii_terms = _extract_ascii_terms(query)
+    chinese_terms = _extract_chinese_terms(query)
+    years = _extract_years(query)
+    numbers = re.findall(r"\d+(?:\.\d+)?", query)
+    model_code = re.search(r"[A-Za-z]{1,4}\d{1,3}", query)
+    compact_length = len(re.sub(r"\s+", "", query))
 
-    if _contains_any(query, weather_tokens) or "weather" in lowered:
-        return "weather"
-    if _contains_any(query, ranking_tokens) or "standings" in lowered:
-        return "ranking"
-    if _contains_any(query, product_tokens) or any(token in lowered for token in ("spec", "price", "weight", "dimensions")):
+    if model_code:
         return "product_specs"
-    if _contains_any(query, people_tokens) or any(token in lowered for token in ("ceo", "president", "biography", "alma mater")):
+    if len(numbers) >= 3 and compact_length <= 40:
+        return "product_specs"
+    if years and len(numbers) >= 2 and len(ascii_terms) >= 2:
+        return "ranking"
+    if len(chinese_terms) >= 2 and compact_length <= 24 and len(numbers) <= 1:
         return "people_role"
-    if _contains_any(query, location_tokens) or any(token in lowered for token in ("address", "location", "factory")):
+    if len(chinese_terms) == 1 and len(ascii_terms) <= 2 and compact_length <= 16:
         return "location"
-    return _detect_query_type(query)
+    if years and compact_length <= 32:
+        return "ranking"
+    return "generic"
 
 
 def _extract_entities(query: str) -> list[str]:
@@ -346,48 +413,27 @@ def _extract_primary_subject(query: str) -> str:
 
 
 def _extract_subject_candidates(query: str) -> list[str]:
-    lowered = _normalize_text(query)
     subjects: list[str] = []
-    if "\u851a\u6765" in query or "nio" in lowered:
-        subjects.append("\u851a\u6765")
-        subjects.append("NIO")
-    if "\u5c0f\u7c73" in query or "xiaomi" in lowered:
-        subjects.append("\u5c0f\u7c73\u96c6\u56e2")
-        subjects.append("Xiaomi")
     entities = _extract_entities(query)
     for entity in entities:
         if entity not in subjects:
             subjects.append(entity)
+    for term in _extract_ascii_terms(query):
+        if len(term) >= 3 and term.upper() not in subjects:
+            subjects.append(term.upper())
     return list(dict.fromkeys(subjects))[:4]
 
 
 def _extract_person_names(query: str) -> list[str]:
-    company_terms = {
-        "\u851a\u6765",
-        "\u851a\u6765\u6c7d\u8f66",
-        "\u5c0f\u7c73",
-        "\u5c0f\u7c73\u96c6\u56e2",
-        "NIO",
-        "Xiaomi",
-    }
-    role_terms = {
-        "\u603b\u88c1",
-        "\u8463\u4e8b\u957f",
-        "\u521b\u59cb\u4eba",
-        "\u6bd5\u4e1a\u5b66\u6821",
-        "\u6bd5\u4e1a\u9662\u6821",
-        "\u5b66\u5386",
-        "\u4e2a\u4eba\u7b80\u4ecb",
-        "CEO",
-        "ceo",
-    }
     names: list[str] = []
+    entities = _extract_entities(query)
     for token in re.findall(r"[\u4e00-\u9fff]{2,4}", query):
-        if token in company_terms or token in role_terms:
+        if token not in entities:
             continue
-        if any(term in token for term in ["\u6bd5\u4e1a", "\u5b66\u6821", "\u9662\u6821", "\u7b80\u4ecb", "\u5b66\u5386"]):
+        if re.search(r"\d", token):
             continue
-        names.append(token)
+        if len(token) in {2, 3}:
+            names.append(token)
     return list(dict.fromkeys(names))[:3]
 
 
@@ -466,6 +512,9 @@ def _extract_keywords_for_query_v3(query: str, query_type: str, expected_year: i
             keys.append(company_nio)
         if "xiaomi" in lowered or company_xiaomi in query:
             keys.append(company_xiaomi)
+        model_match = re.search(r"([A-Za-z]{1,4}\d{1,2})", query)
+        if model_match:
+            keys.append(model_match.group(1).upper())
         for token in ["\u5c3a\u5bf8", "\u91cd\u91cf", "\u4ef7\u683c", "\u53c2\u6570", "\u914d\u7f6e"]:
             if token in query:
                 keys.append(token)
@@ -637,10 +686,68 @@ def _build_search_queries_v3(query: str, query_type: str, language: str, expecte
         queries = prioritized_queries + [query]
     elif query_type == "product_specs":
         queries.append(" ".join(keywords))
+        model_code = next((term for term in keywords if re.fullmatch(r"[A-Z]{1,4}\d{1,2}", term)), "")
+        brand = next((term for term in keywords if term in {"\u851a\u6765", "\u5c0f\u7c73"}), "")
+        if brand and model_code:
+            queries.append(f"{brand}{model_code} \u53c2\u6570 \u914d\u7f6e")
+            queries.append(f"{brand}{model_code} \u5c3a\u5bf8 \u8f74\u8ddd \u91cd\u91cf")
+            queries.append(f"site:autohome.com.cn {brand}{model_code} \u53c2\u6570")
+            queries.append(f"site:bitauto.com {brand}{model_code} \u53c2\u6570")
     elif query_type == "ranking" and "f1" in lowered:
         queries.append(f"{expected_year or _current_year()} F1 driver standings points leader")
     elif query_type == "weather":
         queries.append(" ".join(keywords))
+    else:
+        queries.append(" ".join(keywords))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in queries:
+        normalized = _normalize_text(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item)
+    return deduped[:_MAX_SEARCH_VARIANTS]
+
+
+def _extract_keywords_for_query_v4(query: str, query_type: str, expected_year: int | None) -> list[str]:
+    keywords = _extract_entities(query)
+    keywords.extend(term.upper() for term in _extract_ascii_terms(query) if len(term) >= 3)
+    model_match = re.search(r"([A-Za-z]{1,4}\d{1,3})", query)
+    if model_match:
+        keywords.append(model_match.group(1).upper())
+    if query_type == "people_role":
+        keywords.extend(_extract_person_names(query))
+        keywords.extend(_extract_person_role_terms_v2(query))
+    if expected_year and str(expected_year) not in keywords:
+        keywords.insert(0, str(expected_year))
+    return list(dict.fromkeys([k for k in keywords if k]))[:12]
+
+
+def _build_search_queries_v4(query: str, query_type: str, language: str, expected_year: int | None) -> list[str]:
+    keywords = _extract_keywords_for_query_v4(query, query_type, expected_year)
+    queries = [query]
+    subject = _extract_primary_subject(query)
+    model_code = next((term for term in keywords if re.fullmatch(r"[A-Z]{1,4}\d{1,3}", term)), "")
+    person_names = _extract_person_names(query)
+    role_terms = _extract_person_role_terms_v2(query)
+
+    if query_type == "people_role":
+        for person_name in person_names[:2]:
+            if subject:
+                queries.append(f"{person_name} {subject}")
+            if role_terms:
+                queries.append(f"{person_name} {' '.join(role_terms)}")
+                if subject:
+                    queries.append(f"{person_name} {subject} {' '.join(role_terms)}")
+        if subject and role_terms:
+            queries.append(f"{subject} {' '.join(role_terms)}")
+    elif query_type == "product_specs":
+        queries.append(" ".join(keywords))
+        if subject and model_code:
+            queries.append(f"{subject}{model_code}")
+            queries.append(f"{subject} {model_code}")
     else:
         queries.append(" ".join(keywords))
 
@@ -679,6 +786,11 @@ def _infer_preferred_domains_v2(query: str, query_type: str) -> list[str]:
         if "nio" in lowered or "\u851a\u6765" in query:
             domains.extend(["nio.cn", "nio.com", "baike.baidu.com"])
     return list(dict.fromkeys(domains))
+
+
+def _infer_preferred_domains_v3(query: str, query_type: str) -> list[str]:
+    explicit_sites = re.findall(r"site:([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", query)
+    return list(dict.fromkeys(site.lower() for site in explicit_sites))
 
 
 def _should_search(query: str, expected_year: int | None) -> bool:
@@ -733,10 +845,12 @@ def _extract_bing_snippet(block: str) -> str:
 
 
 def _search_with_bing(query: str, count: int) -> list[dict[str, str]]:
+    params = _build_bing_params(query)
+    headers = _build_bing_headers(query)
     response = requests.get(
         "https://www.bing.com/search",
-        params={"q": query, "setmkt": "zh-CN", "setlang": "zh-Hans"},
-        headers=_BING_HEADERS,
+        params=params,
+        headers=headers,
         timeout=_SEARCH_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
@@ -791,14 +905,12 @@ def _extract_domain(url: str) -> str:
 
 def _score_credibility(url: str) -> tuple[float, str]:
     domain = _extract_domain(url)
-    if domain in _OFFICIAL_DOMAINS or domain.endswith(".gov.cn") or domain.endswith(".edu.cn"):
+    if domain.endswith(".gov.cn") or domain.endswith(".edu.cn") or domain.endswith(".gov") or domain.endswith(".edu"):
         return 0.95, "tier1_official"
-    if domain in _VERTICAL_DOMAINS:
-        return 0.85, "tier2_vertical"
-    if domain in _TECH_MEDIA_DOMAINS:
-        return 0.70, "tier2_media"
     if domain in _AGGREGATOR_DOMAINS:
         return 0.50, "tier3_aggregator"
+    if domain.count(".") >= 1:
+        return 0.70, "tier2_general"
     return 0.30, "tier3_unknown"
 
 
@@ -832,6 +944,67 @@ def _score_relevance(query: str, title: str, snippet: str, url: str, query_terms
     if any(noise in raw_text for noise in _NOISE_KEYWORDS):
         score -= 8.0
     return score
+
+
+def _score_product_page_specificity(query: str, title: str, snippet: str, url: str, query_terms: list[str]) -> float:
+    text = f"{title} {snippet} {url}"
+    lowered = _normalize_text(text)
+    score = 0.0
+
+    model_terms = [term for term in query_terms if re.fullmatch(r"[A-Z]{1,4}\d{1,2}", term)]
+    for model_term in model_terms:
+        if model_term.lower() in lowered:
+            score += 4.0
+
+    detail_tokens = [
+        "\u53c2\u6570",
+        "\u914d\u7f6e",
+        "\u5c3a\u5bf8",
+        "\u8f74\u8ddd",
+        "\u91cd\u91cf",
+        "\u62a5\u4ef7",
+        "param",
+        "spec",
+        "config",
+    ]
+    for token in detail_tokens:
+        if token.lower() in lowered:
+            score += 1.5
+
+    generic_tokens = [
+        "\u6c7d\u8f66\u9891\u9053",
+        "\u56fe\u7247",
+        "\u5173\u6ce8\u5ea6",
+        "\u9500\u91cf",
+        "\u53e3\u7891",
+        "\u9996\u9875",
+        "\u5b98\u7f51",
+        "\u54c1\u724c",
+    ]
+    for token in generic_tokens:
+        if token.lower() in lowered:
+            score -= 1.2
+
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    if any(token in path for token in ("param", "spec", "config", "peizhi")):
+        score += 2.5
+    if path in {"", "/"} or path.count("/") <= 1:
+        score -= 2.0
+    return score
+
+
+def _is_generic_product_listing_page(title: str, snippet: str, url: str, query_terms: list[str]) -> bool:
+    text = f"{title} {snippet} {url}"
+    lowered = _normalize_text(text)
+    model_terms = [term for term in query_terms if re.fullmatch(r"[A-Z]{1,4}\d{1,2}", term)]
+    has_model = any(term.lower() in lowered for term in model_terms) if model_terms else False
+    has_detail_signal = any(
+        token in text for token in ["\u53c2\u6570", "\u914d\u7f6e", "\u5c3a\u5bf8", "\u8f74\u8ddd", "\u91cd\u91cf"]
+    ) or any(token in lowered for token in ("param", "spec", "config"))
+    generic_tokens = ["\u6c7d\u8f66\u9891\u9053", "\u56fe\u7247", "\u5173\u6ce8\u5ea6", "\u9500\u91cf", "\u53e3\u7891", "\u54c1\u724c"]
+    has_generic_signal = any(token in text for token in generic_tokens)
+    return has_generic_signal and not has_model and not has_detail_signal
 
 
 def _is_low_quality_result(title: str, snippet: str, url: str) -> bool:
@@ -880,6 +1053,19 @@ def _has_people_role_signal(query: str, title: str, snippet: str, url: str) -> b
     return False
 
 
+def _has_people_role_signal_v2(query: str, title: str, snippet: str, url: str) -> bool:
+    haystack = _normalize_text(f"{title} {snippet} {url}")
+    query_entities = _extract_entities(query)
+    overlap = 0
+    for entity in query_entities:
+        if _normalize_text(entity) in haystack:
+            overlap += 1
+    if overlap >= 2:
+        return True
+    person_names = _extract_person_names(query)
+    return bool(person_names and any(_normalize_text(name) in haystack for name in person_names))
+
+
 def _evaluate_results(
     query: str,
     query_type: str,
@@ -901,7 +1087,10 @@ def _evaluate_results(
         if _is_low_quality_result(title, snippet, url):
             rejected.append({"url": url, "reason": "low_quality"})
             continue
-        if query_type == "people_role" and not _has_people_role_signal(query, title, snippet, url):
+        if query_type == "product_specs" and _is_generic_product_listing_page(title, snippet, url, query_terms):
+            rejected.append({"url": url, "reason": "generic_product_listing"})
+            continue
+        if query_type == "people_role" and not _has_people_role_signal_v2(query, title, snippet, url):
             rejected.append({"url": url, "reason": "missing_people_role_signal"})
             continue
 
@@ -912,6 +1101,8 @@ def _evaluate_results(
             continue
 
         relevance = _score_relevance(query, title, snippet, url, query_terms, preferred_domains)
+        if query_type == "product_specs":
+            relevance += _score_product_page_specificity(query, title, snippet, url, query_terms)
         if relevance <= 0:
             rejected.append({"url": url, "reason": "low_relevance"})
             continue
@@ -1081,6 +1272,16 @@ def _merge_evaluated_results(results: list[dict[str, Any]], count: int) -> tuple
     return merged, evaluation
 
 
+def _collect_rejected_domains(attempts: list[dict[str, Any]], reason: str) -> set[str]:
+    domains: set[str] = set()
+    for attempt in attempts:
+        evaluation = attempt.get("evaluation") or {}
+        for item in evaluation.get("rejected_examples") or []:
+            if item.get("reason") == reason and item.get("url"):
+                domains.add(_extract_domain(str(item["url"])))
+    return domains
+
+
 def _select_candidate_results(raw_results: list[dict[str, str]], count: int) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
@@ -1104,6 +1305,31 @@ def _select_candidate_results(raw_results: list[dict[str, str]], count: int) -> 
         if len(candidates) >= count:
             break
     return candidates
+
+
+def _top_result_signature(results: list[dict[str, str]]) -> str:
+    if not results:
+        return ""
+    top_url = str(results[0].get("url", "")).strip().lower()
+    return top_url
+
+
+def _extract_model_terms(query_terms: list[str]) -> list[str]:
+    return [term for term in query_terms if re.fullmatch(r"[A-Z]{1,4}\d{1,2}", term)]
+
+
+def _extract_product_detail_from_preview(query_terms: list[str], preview: str) -> str:
+    if not preview:
+        return ""
+    model_terms = _extract_model_terms(query_terms)
+    normalized_preview = re.sub(r"\s+", " ", preview)
+    if not model_terms:
+        return normalized_preview[:240]
+    for model_term in model_terms:
+        match = re.search(rf"(.{{0,80}}{re.escape(model_term)}.{{0,220}})", normalized_preview, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return normalized_preview[:240]
 
 
 def _fetch_preview(url: str) -> str:
@@ -1172,7 +1398,13 @@ def _summarize_search_results(query: str, results: list[dict[str, Any]], need_we
     best_preview = best.get("page_preview", "").strip()
     summary_parts: list[str] = []
 
-    if best_snippet:
+    query_terms = _extract_keywords_for_query_v4(query, _detect_query_type_v2(query), _resolve_expected_year(query))
+
+    if best.get("page_preview") and _extract_model_terms(query_terms):
+        detail = _extract_product_detail_from_preview(query_terms, best_preview)
+        if detail:
+            summary_parts.append(detail)
+    elif best_snippet:
         summary_parts.append(best_snippet)
     elif best_preview:
         summary_parts.append(best_preview[:220])
@@ -1245,9 +1477,9 @@ def web_search(
     expected_year = _resolve_expected_year(query)
     language = _detect_language(query)
     query_type = _detect_query_type_v2(query)
-    query_terms = _extract_keywords_for_query_v3(query, query_type, expected_year)
-    preferred_domains = list(dict.fromkeys((allowed_domains or []) + _infer_preferred_domains_v2(query, query_type)))
-    search_variants = _build_search_queries_v3(query, query_type, language, expected_year)
+    query_terms = _extract_keywords_for_query_v4(query, query_type, expected_year)
+    preferred_domains = list(dict.fromkeys((allowed_domains or []) + _infer_preferred_domains_v3(query, query_type)))
+    search_variants = _build_search_queries_v4(query, query_type, language, expected_year)
     should_search = _should_search(query, expected_year)
 
     started_at = time.time()
@@ -1260,6 +1492,8 @@ def web_search(
     backend_note: str | None = None
 
     if should_search:
+        repeated_signature_count = 0
+        last_signature = ""
         for variant in search_variants:
             raw_search = _search_with_bing(variant, min(max(count, 3), 10))
             raw_results = _apply_domain_filters(
@@ -1269,6 +1503,12 @@ def web_search(
             )
             if not raw_results and not allowed_domains:
                 raw_results = _apply_domain_filters(raw_search, None, blocked_domains)
+            signature = _top_result_signature(raw_results)
+            if signature and signature == last_signature:
+                repeated_signature_count += 1
+            else:
+                repeated_signature_count = 0
+                last_signature = signature
             for candidate in _select_candidate_results(raw_results, count):
                 if all(existing.get("url") != candidate.get("url") for existing in candidate_results):
                     candidate_results.append(candidate)
@@ -1296,6 +1536,8 @@ def web_search(
                     break
             elif overall_evaluation is None:
                 overall_evaluation = evaluation
+            if repeated_signature_count >= 2:
+                break
 
     if aggregated_results:
         final_results, overall_evaluation = _merge_evaluated_results(aggregated_results, count)
@@ -1303,15 +1545,18 @@ def web_search(
     if query_type == "people_role" and not final_results:
         person_names = _extract_person_names(query)
         subject_candidates = _extract_subject_candidates(query)
-        fallback_domains = ["baike.baidu.com", "wikipedia.org"]
+        fallback_domains = []
+        for item in candidate_results:
+            domain = _extract_domain(str(item.get("url", "")))
+            if domain:
+                fallback_domains.append(domain)
+        fallback_domains = list(dict.fromkeys(fallback_domains))[:3]
         for person_name in person_names[:2]:
             for subject in subject_candidates[:2]:
-                for variant in [
-                    f"{person_name} {subject} site:baike.baidu.com",
-                    f"{person_name} {subject} site:wikipedia.org",
-                ]:
+                for domain in fallback_domains or [""]:
+                    variant = f"{person_name} {subject}" if not domain else f"{person_name} {subject} site:{domain}"
                     raw_search = _search_with_bing(variant, min(max(count, 3), 10))
-                    raw_results = _apply_domain_filters(raw_search, fallback_domains, blocked_domains)
+                    raw_results = _apply_domain_filters(raw_search, [domain] if domain else None, blocked_domains)
                     for candidate in _select_candidate_results(raw_results, count):
                         if all(existing.get("url") != candidate.get("url") for existing in candidate_results):
                             candidate_results.append(candidate)
@@ -1321,7 +1566,7 @@ def web_search(
                         raw_results,
                         expected_year,
                         query_terms,
-                        fallback_domains,
+                        [domain] if domain else [],
                         count,
                     )
                     attempts.append(
@@ -1336,6 +1581,13 @@ def web_search(
                         aggregated_results.extend(evaluated)
         if aggregated_results:
             final_results, overall_evaluation = _merge_evaluated_results(aggregated_results, count)
+
+    rejected_generic_domains = _collect_rejected_domains(attempts, "generic_product_listing")
+    if query_type == "product_specs" and rejected_generic_domains and final_results:
+        final_results = [
+            item for item in final_results
+            if _extract_domain(str(item.get("url", ""))) not in rejected_generic_domains or "param" in str(item.get("url", "")).lower()
+        ] or final_results
 
     need_webfetch = _need_webfetch(query_type, final_results)
     if need_webfetch or query_type == "people_role":
@@ -1465,7 +1717,7 @@ async def load_12306_tools(
     return await load_mcp_tools(session=None, connection=connection)
 
 
-_FILE_TOOLS: list[Any] = [list_directory, read_file, get_file_info]
+_FILE_TOOLS: list[Any] = [list_directory, read_file, get_file_info, write_file, append_file, delete_file]
 _SEARCH_TOOLS: list[Any] = [web_search, web_fetch]
 
 
