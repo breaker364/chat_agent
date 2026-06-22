@@ -61,8 +61,14 @@ function Resolve-PythonLauncher {
             continue
         }
 
-        $pythonPath = Join-Path $dir "Scripts\python.exe"
-        if (Test-Path $pythonPath) {
+        $pythonCandidates = @(
+            (Join-Path $dir "python.exe"),
+            (Join-Path $dir "Scripts\python.exe")
+        )
+        foreach ($pythonPath in $pythonCandidates) {
+            if (-not (Test-Path $pythonPath)) {
+                continue
+            }
             return @{
                 Mode = "python"
                 FilePath = $pythonPath
@@ -151,6 +157,46 @@ function Start-BackgroundProcess {
         -WindowStyle Hidden
 }
 
+function Get-ListeningPidsOnPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    $matches = netstat -ano -p tcp | Select-String "[:.]$Port\s+.*LISTENING\s+(\d+)$"
+    $pids = @()
+    foreach ($match in $matches) {
+        if ($match.Matches.Count -gt 0) {
+            $pids += [int]$match.Matches[0].Groups[1].Value
+        }
+    }
+    return $pids | Select-Object -Unique
+}
+
+function Stop-ProcessesOnPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $pids = @(Get-ListeningPidsOnPort -Port $Port)
+    if (-not $pids.Count) {
+        return
+    }
+
+    Write-Host "Stopping existing $Name process(es) on port ${Port}: $($pids -join ', ')"
+    foreach ($processId in $pids) {
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to stop PID ${processId} on port ${Port}: $($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Seconds 1
+}
+
 if (-not (Test-Path $backendDir)) {
     throw "Backend directory not found: $backendDir"
 }
@@ -174,41 +220,36 @@ if (-not (Test-Path (Join-Path $backendDir "main.py"))) {
     throw "Backend entry file not found: $(Join-Path $backendDir 'main.py')"
 }
 
-if (-not (Test-HttpReady -Url $backendUrl)) {
-    Write-Host "Starting backend with $($pythonLauncher.Description)..."
-    $backendArgsToRun = @($pythonLauncher.BaseArguments + $backendArgs)
-    $backendProcess = Start-BackgroundProcess `
-        -FilePath $pythonLauncher.FilePath `
-        -ArgumentList $backendArgsToRun `
-        -WorkingDirectory $root `
-        -StdOutPath $backendLogOut `
-        -StdErrPath $backendLogErr
-    Write-Host "Backend PID: $($backendProcess.Id)"
-} else {
-    Write-Host "Backend already running at $backendUrl"
-}
+Stop-ProcessesOnPort -Port 8000 -Name "backend"
+Stop-ProcessesOnPort -Port 5173 -Name "frontend"
 
-if (-not (Test-HttpReady -Url $frontendUrl)) {
-    Write-Host "Starting frontend..."
-    $frontendArgs = @(
-        "run",
-        "dev",
-        "--",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "5173"
-    )
-    $frontendProcess = Start-BackgroundProcess `
-        -FilePath $npmExe `
-        -ArgumentList $frontendArgs `
-        -WorkingDirectory $frontendDir `
-        -StdOutPath $frontendLogOut `
-        -StdErrPath $frontendLogErr
-    Write-Host "Frontend PID: $($frontendProcess.Id)"
-} else {
-    Write-Host "Frontend already running at $frontendUrl"
-}
+Write-Host "Starting backend with $($pythonLauncher.Description)..."
+$backendArgsToRun = @($pythonLauncher.BaseArguments + $backendArgs)
+$backendProcess = Start-BackgroundProcess `
+    -FilePath $pythonLauncher.FilePath `
+    -ArgumentList $backendArgsToRun `
+    -WorkingDirectory $root `
+    -StdOutPath $backendLogOut `
+    -StdErrPath $backendLogErr
+Write-Host "Backend PID: $($backendProcess.Id)"
+
+Write-Host "Starting frontend..."
+$frontendArgs = @(
+    "run",
+    "dev",
+    "--",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "5173"
+)
+$frontendProcess = Start-BackgroundProcess `
+    -FilePath $npmExe `
+    -ArgumentList $frontendArgs `
+    -WorkingDirectory $frontendDir `
+    -StdOutPath $frontendLogOut `
+    -StdErrPath $frontendLogErr
+Write-Host "Frontend PID: $($frontendProcess.Id)"
 
 $null = Wait-ForHttpReady -Url $backendUrl -Name "Backend" -TimeoutSeconds 30
 $frontendReady = Wait-ForHttpReady -Url $frontendUrl -Name "Frontend" -TimeoutSeconds 30
