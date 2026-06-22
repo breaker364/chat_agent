@@ -65,16 +65,28 @@ if query_type == "people_role":
 3. **与 LLM 架构矛盾**：本项目的核心优势是 LLM 推理，硬编码等同于用规则引擎替代 LLM，本末倒置
 4. **领域耦合**：当前代码深度耦合汽车/高校领域，无法作为通用搜索工具复用
 
-### 已有硬编码清单（需逐步消除）
+### 当前架构（已重构）
 
-以下为 `backend/tools.py` 中已识别的硬编码问题：
+项目已按照 Claude Code 的适配器架构完成重构：
 
-- L61-96: `_OFFICIAL_DOMAINS` / `_VERTICAL_DOMAINS` / `_TECH_MEDIA_DOMAINS` / `_AGGREGATOR_DOMAINS` — 静态域名集
-- L444-525: `_extract_keywords_for_query_v2/v3` — 蔚来/小米/合工大/合肥工业大学 硬编码分支
-- L536-572: `_extract_keywords_for_query` — 同上
-- L765-777: `_infer_preferred_domains` — 按具体实体推荐域名
-- L780-788: `_infer_preferred_domains_v2` — 同上 + baike.baidu.com
-- L30-31: `_MAX_BING_RESULTS` / `_MAX_SEARCH_VARIANTS` — 这些属于**可调参数**，不违规
+```
+backend/
+├── adapters/              # 搜索适配器包
+│   ├── __init__.py        # 导出 SearchResult, SearchOptions, 工厂函数等
+│   ├── base.py            # 抽象基类与类型定义 (Protocol)
+│   ├── bing_adapter.py    # Bing HTML 抓取适配器（无需 API Key）
+│   ├── tavily_adapter.py  # Tavily 搜索 + 提取适配器
+│   └── factory.py         # create_search_adapter() / create_fetch_adapter()
+├── tools.py               # 工具定义（web_search, web_fetch, 文件操作, 12306 MCP）
+├── agent.py               # LangGraph Agent + System Prompt
+├── config.py              # LLM 配置
+└── main.py                # FastAPI 入口
+```
+
+- **web_search**：通过适配器工厂调用 Tavily（需配置 `TAVILY_BASE_URL`）或 Bing（默认，免费抓取），返回简洁的 `{title, url, snippet}` 结果
+- **web_fetch**：优先使用 Tavily Extract 获取 Markdown，回退到直接 HTTP + BeautifulSoup 文本提取
+- **所有硬编码实体已清除**（`grep` 验证通过）
+- **适配器切换**：设置环境变量 `WEB_SEARCH_ADAPTER=tavily` 即可切换
 
 ## 编辑代码规范
 
@@ -83,3 +95,4 @@ if query_type == "people_role":
 3. **如需领域知识，通过 system prompt 引导 LLM 推理，而非代码中 if/else**
 4. **配置项**（超时、数量限制、缓存 TTL）可用常量，**领域知识**不可
 5. **测试用例**中的具体实体不在此限（测试需要确定性）
+6. **适配器接口兼容**：新增搜索后端需实现 `WebSearchAdapter` Protocol

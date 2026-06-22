@@ -21,37 +21,36 @@ SYSTEM_PROMPT = (
     "First resolve stations with tools such as `get-station-code-by-names`, "
     "`get-stations-code-in-city`, or `get-station-code-of-citys`; then query tickets with "
     "`get-tickets` or interline tickets with `get-interline-tickets`.\n\n"
-    "Search quality rules:\n"
-    "- Keep search queries tightly aligned with the user's topic; do not switch to adjacent topics.\n"
-    "- For compound questions involving multiple people, companies, or comparisons, decompose the task and research each entity separately.\n"
-    "- For sports/news/facts, prefer short literal queries using the user's original language first.\n"
-    "- Before searching, reason about which websites are authoritative for this specific topic, then prefer those domains.\n"
-    "- When a domain-focused search is appropriate, pass `allowed_domains` to `web_search` based on your own reasoning.\n"
-    "- Domain choice must be inferred from the entity and topic, not from a fixed hardcoded list.\n"
-    "- Prefer official websites first when the user asks for rankings, standings, specifications, schedules, regulations, prices, or structured facts.\n"
-    "- If official websites are weak or incomplete, expand to reputable specialist media or trusted community sources for that field.\n"
-    "- If the first domain choice is weak or irrelevant, switch domains instead of repeating the same noisy search pattern.\n"
-    "- Search iteratively until you reach a high-confidence answer or exhaust the search budget.\n"
-    "- Prefer 2-4 searches for difficult factual questions when the first result set lacks cross-validation.\n"
-    "- If search results look off-topic, explicitly retry with a narrower query instead of using them.\n"
-    "- Ignore results whose title/snippet obviously do not match the user's subject.\n"
-    "- Do not cite or summarize irrelevant snippets just because the tool returned them.\n\n"
-    "Tool usage rules:\n"
-    "- Treat `web_search` output as structured JSON. Read `confidence`, `insufficiencies`, `recommended_next_steps`, `summary`, `results`, `candidate_results`, and `need_webfetch` before deciding the next step.\n"
-    "- For multi-entity questions, do not stop after researching only one entity; cover every requested entity before answering.\n"
-    "- For people/company identity facts, do not answer decisively until at least two independent sources support the key fact, or one official source plus one independent source.\n"
-    "- If `web_search.results` is empty but `candidate_results` is non-empty, fetch the best candidate pages instead of saying nothing was found.\n"
-    "- If `web_search.confidence.level` is low or `insufficient_cross_validation` is present, run another narrower search instead of answering.\n"
-    "- If `web_search` returns relevant links but evidence is snippet-only, call `web_fetch` on the best 1-3 URLs and compare the facts.\n"
-    "- Your final answer must be a synthesized summary, not a link dump. Include confidence level and mention source agreement or disagreement.\n"
-    "- Do not loop on near-duplicate searches once confidence is already high.\n"
-    "- When the user asks to create or modify a local file, use `write_file` or `append_file` instead of only describing the content.\n"
-    "- When the user asks to remove a local file, use `delete_file`.\n"
-    "- Do not use file tools for general web knowledge questions.\n"
-    "- Do not use emojis, just answer technically.\n"
-    "- Use file tools only when the user explicitly asks about local files, code, or the current workspace.\n\n"
+    "--- Search strategy ---\n"
+    "You are responsible for evaluating search quality yourself. `web_search` returns raw results (title, url, snippet); "
+    "it does NOT provide confidence scores, evaluation, or diagnostics. You must:\n"
+    "- Inspect titles and snippets to judge relevance and credibility.\n"
+    "- Infer which domains are authoritative for the topic (e.g., .gov/.edu for official data, "
+    "official brand sites for product specs, specialist media for sports/news).\n"
+    "- Pass `allowed_domains` or `blocked_domains` when you have a clear domain strategy.\n"
+    "- If initial results are off-topic or low-quality, refine the query — do not reuse noisy results.\n"
+    "- For facts that require high confidence (people's roles, product specs, rankings), "
+    "cross-validate across at least 2 independent sources. Use `web_fetch` to read full pages "
+    "when snippets are insufficient.\n"
+    "- For multi-entity questions, research each entity separately before synthesizing.\n"
+    "- Search iteratively until you reach a well-supported answer or exhaust the search budget.\n\n"
+    "--- Tool usage ---\n"
+    "- `web_search` output is JSON with `results` (array of {title, url, snippet}), `query`, `engine`, `duration_seconds`, `result_count`.\n"
+    "- If `results` is empty, retry with a different query or broader terms.\n"
+    "- Use `web_fetch` to read the full content of promising URLs. Provide a `prompt` describing what you need, "
+    "and the tool returns a `result` field with the model-processed answer (not raw HTML).\n"
+    "- If `web_fetch` reports a redirect, call it again with the redirect URL.\n"
+    "- Your final answer must be a synthesized summary with specific facts, citing sources as markdown links.\n"
+    "- Include your confidence assessment and note source agreement or disagreement.\n"
+    "- Do not loop on near-duplicate searches once you have sufficient evidence.\n\n"
+    "--- File operations ---\n"
+    "- Use file tools only when the user explicitly asks about local files, code, or the workspace.\n"
+    "- When asked to create/modify a file, use `write_file` or `append_file` — do not only describe the content.\n"
+    "- When asked to remove a file, use `delete_file`.\n\n"
+    "--- General ---\n"
     "Use tools only when needed. If a question can be answered directly, answer without tools.\n"
-    "Be concise, accurate, and include concrete details (dates, filenames, numbers)."
+    "Be concise, accurate, and include concrete details (dates, filenames, numbers).\n"
+    "Do not use emojis."
 )
 
 MAX_AGENT_STEPS = 25
@@ -110,6 +109,7 @@ async def stream_agent_events(
     web_search_calls = 0
     web_fetch_calls = 0
     last_web_search_payload: dict[str, Any] | None = None
+    last_web_fetch_results: list[str] = []
 
     def to_jsonable(value: Any) -> Any:
         try:
@@ -132,36 +132,99 @@ async def stream_agent_events(
         return to_jsonable(value)
 
     def build_search_fallback(payload: dict[str, Any] | None) -> str:
+        """Build a fallback response. Uses web_fetch results when available,
+        otherwise synthesizes from search snippets via a quick LLM call."""
+
+        # --- Case 1: we have web_fetch results — use them directly ---
+        if last_web_fetch_results:
+            parts: list[str] = []
+            for i, fetch_text in enumerate(last_web_fetch_results[:3], 1):
+                parts.append(f"Source {i}:\n{fetch_text}")
+            joined = "\n\n---\n\n".join(parts)
+
+            # If the model already collected some text, prepend it
+            if collected_text and should_use_collected_text_as_final(collected_text):
+                return f"{collected_text}\n\n---\n\nSupporting evidence:\n{joined}"
+
+            # Otherwise synthesize from fetch results via a quick LLM call
+            try:
+                from .config import create_chat_deepseek, load_llm_config
+                cfg = load_llm_config()
+                llm = create_chat_deepseek(cfg, temperature=0.0, streaming=False)
+                system_prompt = (
+                    "You are a helpful assistant. Synthesize the following web-sourced information "
+                    "into a concise, well-structured answer for the user. "
+                    "Include specific facts, dates, numbers, and source attribution. "
+                    "Be objective and note any contradictions between sources."
+                )
+                user_prompt = (
+                    f"User question: {message}\n\n"
+                    f"Information retrieved from web pages:\n{joined}\n\n"
+                    f"Based on the above, provide a comprehensive answer to the user's question."
+                )
+                response = llm.invoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ])
+                llm_answer = response.content if hasattr(response, "content") else str(response)
+                if llm_answer and len(llm_answer.strip()) > 20:
+                    return llm_answer.strip()
+            except Exception:
+                pass
+            return joined
+
+        # --- Case 2: only search snippets available ---
         if not payload:
             return "I could not find enough reliable search results. Please narrow the topic or add more specific keywords."
-        summary = str(payload.get("summary") or "").strip()
-        confidence = payload.get("confidence") or {}
-        confidence_level = str(confidence.get("level") or "").strip()
-        confidence_reason = str(confidence.get("reason") or "").strip()
-        insufficiencies = payload.get("insufficiencies") or []
         results = payload.get("results") or []
-        candidate_results = payload.get("candidate_results") or []
-        if not results and not candidate_results:
-            note = payload.get("note")
-            return str(note or summary or "I could not find enough reliable search results. Please narrow the topic or add more specific keywords.")
-        lines: list[str] = []
-        if summary:
-            lines.append(summary)
-        else:
-            lines.append("I found relevant results and stopped repeated searching.")
-        if confidence_level:
-            detail = f"Confidence: {confidence_level}"
-            if confidence_reason:
-                detail += f" ({confidence_reason})"
-            lines.append(detail)
-        if insufficiencies:
-            lines.append("Gaps: " + ", ".join(str(item) for item in insufficiencies[:3]))
-        lines.append("Sources:")
-        source_items = results[:3] if results else candidate_results[:3]
-        for item in source_items:
+        note = payload.get("note") or ""
+        error = payload.get("error") or ""
+        if error:
+            return f"Search failed: {error}"
+        if not results:
+            return str(note or "I could not find enough reliable search results. Please narrow the topic or add more specific keywords.")
+
+        # Build a quick synthesis from snippets
+        snippets_text = ""
+        for item in results[:5]:
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            url = item.get("url", "")
+            snippets_text += f"- [{title}]({url}): {snippet}\n"
+
+        try:
+            from .config import create_chat_deepseek, load_llm_config
+            cfg = load_llm_config()
+            llm = create_chat_deepseek(cfg, temperature=0.0, streaming=False)
+            system_prompt = (
+                "You are a helpful assistant. Below are search result snippets for a user's query. "
+                "Synthesize them into a concise, informative answer. Include specific facts where available. "
+                "If the snippets lack enough detail for a complete answer, say so honestly."
+            )
+            user_prompt = (
+                f"User question: {message}\n\n"
+                f"Search snippets:\n{snippets_text}\n\n"
+                f"Based on these snippets, provide a helpful answer to the user."
+            )
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ])
+            llm_answer = response.content if hasattr(response, "content") else str(response)
+            if llm_answer and len(llm_answer.strip()) > 20:
+                return llm_answer.strip()
+        except Exception:
+            pass
+
+        # Fallback: just list sources
+        lines: list[str] = [
+            f"I found {len(results)} search results but could not synthesize a complete answer. Key sources:"
+        ]
+        for item in results[:3]:
             title = item.get("title", "Untitled")
             url = item.get("url", "")
-            lines.append(f"- [{title}]({url})")
+            snippet = item.get("snippet", "")[:120]
+            lines.append(f"- [{title}]({url}) — {snippet}")
         return "\n".join(lines)
 
     def should_use_collected_text_as_final(text: str) -> bool:
@@ -175,6 +238,8 @@ async def stream_agent_events(
             "让我搜索一下",
             "let me check",
             "let me search",
+            "let me look",
+            "i'll search",
         ]
         if len(normalized) < 40 and any(marker in normalized.lower() for marker in weak_markers):
             return False
@@ -349,6 +414,14 @@ async def stream_agent_events(
                     last_web_search_payload = json.loads(output_str)
                 except Exception:
                     last_web_search_payload = None
+            elif tool_name in {"web_fetch", "fetch_webpage"}:
+                try:
+                    fetch_payload = json.loads(output_str)
+                    fetch_result = fetch_payload.get("result", "")
+                    if fetch_result and len(fetch_result) > 80:
+                        last_web_fetch_results.append(fetch_result)
+                except Exception:
+                    pass
             active_tool = None
             progress_count = 0
             elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
