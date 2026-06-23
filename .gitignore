@@ -29,7 +29,7 @@ frontend/dist/
 
 # Logs
 *.log
-
+*.docx
 # Temporary debug / test artifacts
 tmp_*
 

@@ -119,6 +119,26 @@ def _resolve_python_executable(preferred: str = "") -> str:
     )
 
 
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    """Terminate the process and any child processes it may have started."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        else:
+            os.killpg(process.pid, 9)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
 class RunPythonFileInput(BaseModel):
     """Arguments for running a Python script via the agent tool."""
 
@@ -507,21 +527,39 @@ def run_python_file(
 
     command = [resolved_python_executable, str(target), *shlex.split(cli_args or "", posix=False)]
     started_at = time.monotonic()
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd_path),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "shell": False,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = creationflags
+    else:
+        popen_kwargs["start_new_session"] = True
 
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd_path),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_value,
-            shell=False,
+        process = subprocess.Popen(command, **popen_kwargs)
+    except Exception as exc:
+        return json.dumps(
+            {"path": str(target), "command": command, "error": str(exc)},
+            ensure_ascii=False,
+            indent=2,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout_text = (exc.stdout or "")[:_PYTHON_OUTPUT_MAX_CHARS]
-        stderr_text = (exc.stderr or "")[:_PYTHON_OUTPUT_MAX_CHARS]
+
+    try:
+        stdout_text, stderr_text = process.communicate(timeout=timeout_value)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(process)
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
         return json.dumps(
             {
                 "path": str(target),
@@ -530,8 +568,8 @@ def run_python_file(
                 "timed_out": True,
                 "timeout_seconds": timeout_value,
                 "duration_seconds": round(time.monotonic() - started_at, 3),
-                "stdout": stdout_text,
-                "stderr": stderr_text,
+                "stdout": "",
+                "stderr": "",
             },
             ensure_ascii=False,
             indent=2,
@@ -548,10 +586,10 @@ def run_python_file(
             "path": str(target),
             "command": command,
             "cwd": str(cwd_path),
-            "exit_code": completed.returncode,
+            "exit_code": process.returncode,
             "duration_seconds": round(time.monotonic() - started_at, 3),
-            "stdout": completed.stdout[:_PYTHON_OUTPUT_MAX_CHARS],
-            "stderr": completed.stderr[:_PYTHON_OUTPUT_MAX_CHARS],
+            "stdout": (stdout_text or "")[:_PYTHON_OUTPUT_MAX_CHARS],
+            "stderr": (stderr_text or "")[:_PYTHON_OUTPUT_MAX_CHARS],
         },
         ensure_ascii=False,
         indent=2,
