@@ -225,6 +225,7 @@ Stop-ProcessesOnPort -Port 5173 -Name "frontend"
 
 Write-Host "Starting backend with $($pythonLauncher.Description)..."
 $backendArgsToRun = @($pythonLauncher.BaseArguments + $backendArgs)
+$env:PYTHON_EXECUTABLE = Join-Path $envRoot "python.exe"
 $backendProcess = Start-BackgroundProcess `
     -FilePath $pythonLauncher.FilePath `
     -ArgumentList $backendArgsToRun `

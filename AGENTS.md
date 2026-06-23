@@ -75,6 +75,11 @@ for entity in entities:
 - 可以指导 LLM 如何为不同类型问题选择权威域名
 - **禁止在 system prompt 中列出具体实体→域名的硬映射**
 
+
+## 规则 5：禁用emoji回复
+
+
+
 ## 总结
 
 > **代码处理"怎么做"（How），LLM 理解"是什么"（What）。**

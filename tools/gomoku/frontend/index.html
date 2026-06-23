@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>五子棋 - Gomoku</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            color: #fff;
+        }
+        .container {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 30px;
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            max-width: 650px;
+            width: 100%;
+        }
+        h1 {
+            text-align: center;
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(90deg, #f7971e, #ffd200);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            text-align: center;
+            color: rgba(255,255,255,0.5);
+            font-size: 13px;
+            margin-bottom: 20px;
+            letter-spacing: 2px;
+        }
+        .game-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding: 0 5px;
+        }
+        .player-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 15px;
+        }
+        .stone-icon {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: 2px solid rgba(255,255,255,0.3);
+        }
+        .stone-black { background: #222; }
+        .stone-white { background: #f0f0f0; }
+        .turn-text { font-weight: 600; }
+
+        .status {
+            font-size: 16px;
+            font-weight: 600;
+            color: #ffd700;
+            min-width: 100px;
+            text-align: right;
+        }
+
+        .board-wrapper {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            background: rgba(0,0,0,0.2);
+            border-radius: 16px;
+            padding: 10px;
+        }
+        canvas {
+            cursor: pointer;
+            border-radius: 12px;
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 18px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .btn-reset {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+        }
+        .btn-undo {
+            background: linear-gradient(135deg, #3498db, #2980b9);
+            color: white;
+        }
+
+        .move-list {
+            margin-top: 15px;
+            max-height: 80px;
+            overflow-y: auto;
+            background: rgba(0,0,0,0.2);
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 12px;
+            color: rgba(255,255,255,0.6);
+        }
+        .move-list::-webkit-scrollbar {
+            width: 4px;
+        }
+        .move-list::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.2);
+            border-radius: 2px;
+        }
+        .move-item {
+            display: inline-block;
+            margin: 2px 4px;
+            padding: 2px 8px;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.05);
+        }
+        .move-item.black { color: #ccc; }
+        .move-item.white { color: #ffd700; }
+
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(5px);
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .modal-overlay.active {
+            display: flex;
+        }
+        .modal {
+            background: #1a1a2e;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 20px;
+            padding: 40px 50px;
+            text-align: center;
+            animation: modalPop 0.3s ease;
+        }
+        @keyframes modalPop {
+            0% { transform: scale(0.8); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .modal h2 {
+            font-size: 36px;
+            margin-bottom: 10px;
+        }
+        .modal p {
+            font-size: 18px;
+            color: rgba(255,255,255,0.7);
+            margin-bottom: 20px;
+        }
+        .modal .btn {
+            font-size: 16px;
+            padding: 12px 36px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>♟ 五子棋</h1>
+    <p class="subtitle">GOMOKU · 连五子为胜</p>
+
+    <div class="game-info">
+        <div class="player-indicator">
+            <span>当前:</span>
+            <span id="stoneIcon" class="stone-icon stone-black"></span>
+            <span id="turnText" class="turn-text">黑棋</span>
+        </div>
+        <div id="statusText" class="status">对局中</div>
+    </div>
+
+    <div class="board-wrapper">
+        <canvas id="boardCanvas"></canvas>
+    </div>
+
+    <div class="controls">
+        <button class="btn btn-undo" id="undoBtn">↩ 悔棋</button>
+        <button class="btn btn-reset" id="resetBtn">🔄 重开</button>
+    </div>
+
+    <div id="moveList" class="move-list">
+        📜 落子记录将显示在这里
+    </div>
+</div>
+
+<!-- Win Modal -->
+<div class="modal-overlay" id="winModal">
+    <div class="modal">
+        <h2 id="modalTitle">🏆 黑棋获胜!</h2>
+        <p id="modalDesc">恭喜!</p>
+        <button class="btn btn-reset" id="modalResetBtn">🔄 再来一局</button>
+    </div>
+</div>
+
+<script>
+// Canvas setup
+const canvas = document.getElementById('boardCanvas');
+const ctx = canvas.getContext('2d');
+
+const BOARD_SIZE = 15;
+const CELL_SIZE = 34;
+const PADDING = 28;
+const STONE_RADIUS = 14;
+
+const totalSize = CELL_SIZE * (BOARD_SIZE - 1) + PADDING * 2;
+canvas.width = totalSize;
+canvas.height = totalSize;
+
+let board = Array(BOARD_SIZE).fill().map(() => Array(BOARD_SIZE).fill(0));
+let currentPlayer = 1;
+let gameOver = false;
+let winner = 0;
+let moveHistory = [];
+
+// Draw board
+function drawBoard() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Background - warm wood color
+    ctx.fillStyle = '#d4a853';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Subtle wood grain texture
+    ctx.strokeStyle = 'rgba(180, 130, 50, 0.15)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 40; i++) {
+        const y = Math.random() * canvas.height;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        for (let x = 0; x < canvas.width; x += 20) {
+            ctx.lineTo(x, y + (Math.random() - 0.5) * 3);
+        }
+        ctx.stroke();
+    }
+
+    // Grid lines
+    ctx.strokeStyle = '#5d3a1a';
+    ctx.lineWidth = 1.2;
+    for (let i = 0; i < BOARD_SIZE; i++) {
+        const pos = PADDING + i * CELL_SIZE;
+
+        // Horizontal line
+        ctx.beginPath();
+        ctx.moveTo(PADDING, pos);
+        ctx.lineTo(PADDING + (BOARD_SIZE - 1) * CELL_SIZE, pos);
+        ctx.stroke();
+
+        // Vertical line
+        ctx.beginPath();
+        ctx.moveTo(pos, PADDING);
+        ctx.lineTo(pos, PADDING + (BOARD_SIZE - 1) * CELL_SIZE);
+        ctx.stroke();
+    }
+
+    // Star points (天元 and 星位)
+    const starPoints = [
+        [3, 3], [3, 11], [11, 3], [11, 11], [7, 7],
+        [7, 3], [7, 11], [3, 7], [11, 7]
+    ];
+    ctx.fillStyle = '#5d3a1a';
+    for (const [r, c] of starPoints) {
+        ctx.beginPath();
+        ctx.arc(PADDING + c * CELL_SIZE, PADDING + r * CELL_SIZE, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Coordinate labels
+    ctx.fillStyle = 'rgba(93, 58, 26, 0.6)';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    for (let i = 0; i < BOARD_SIZE; i++) {
+        ctx.fillText(String.fromCharCode(65 + i), PADDING + i * CELL_SIZE, 3);
+    }
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i < BOARD_SIZE; i++) {
+        ctx.fillText((BOARD_SIZE - i).toString(), PADDING - 8, PADDING + i * CELL_SIZE);
+    }
+}
+
+// Draw stones
+function drawStones() {
+    for (let r = 0; r < BOARD_SIZE; r++) {
+        for (let c = 0; c < BOARD_SIZE; c++) {
+            if (board[r][c] === 0) continue;
+
+            const x = PADDING + c * CELL_SIZE;
+            const y = PADDING + r * CELL_SIZE;
+            const isBlack = board[r][c] === 1;
+
+            // Shadow
+            ctx.beginPath();
+            ctx.arc(x + 1.5, y + 1.5, STONE_RADIUS + 1, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(0,0,0,0.25)';
+            ctx.fill();
+
+            // Stone body with gradient
+            const gradient = ctx.createRadialGradient(
+                x - 5, y - 5, 2,
+                x, y, STONE_RADIUS
+            );
+            if (isBlack) {
+                gradient.addColorStop(0, '#555');
+                gradient.addColorStop(0.6, '#222');
+                gradient.addColorStop(1, '#111');
+            } else {
+                gradient.addColorStop(0, '#ffffff');
+                gradient.addColorStop(0.6, '#e8e8e8');
+                gradient.addColorStop(1, '#b0b0b0');
+            }
+            ctx.beginPath();
+            ctx.arc(x, y, STONE_RADIUS, 0, Math.PI * 2);
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Border
+            ctx.strokeStyle = isBlack ? '#000' : '#999';
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+
+            // Specular highlight
+            ctx.beginPath();
+            ctx.arc(x - 4, y - 4, 4, 0, Math.PI * 2);
+            ctx.fillStyle = isBlack ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.6)';
+            ctx.fill();
+
+            // Last move marker (red dot)
+            if (moveHistory.length > 0) {
+                const last = moveHistory[moveHistory.length - 1];
+                if (last[0] === r && last[1] === c) {
+                    ctx.beginPath();
+                    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+                    ctx.fillStyle = '#ff3333';
+                    ctx.fill();
+                }
+            }
+        }
+    }
+}
+
+function render() {
+    drawBoard();
+    drawStones();
+    updateUI();
+}
+
+// Update UI elements
+function updateUI() {
+    const stoneIcon = document.getElementById('stoneIcon');
+    const turnText = document.getElementById('turnText');
+    const statusText = document.getElementById('statusText');
+
+    if (gameOver) {
+        if (winner === 1) {
+            stoneIcon.className = 'stone-icon stone-black';
+            turnText.textContent = '黑棋';
+            statusText.textContent = '🏆 黑棋胜!';
+            statusText.style.color = '#ffd700';
+        } else if (winner === 2) {
+            stoneIcon.className = 'stone-icon stone-white';
+            turnText.textContent = '白棋';
+            statusText.textContent = '🏆 白棋胜!';
+            statusText.style.color = '#ffd700';
+        } else {
+            statusText.textContent = '🤝 平局';
+            statusText.style.color = '#aaa';
+        }
+    } else {
+        stoneIcon.className = currentPlayer === 1 ? 'stone-icon stone-black' : 'stone-icon stone-white';
+        turnText.textContent = currentPlayer === 1 ? '黑棋' : '白棋';
+        statusText.textContent = '⚔️ 对局中';
+        statusText.style.color = '#ffd700';
+    }
+    updateMoveList();
+}
+
+function updateMoveList() {
+    const container = document.getElementById('moveList');
+    if (moveHistory.length === 0) {
+        container.innerHTML = '📜 落子记录将显示在这里';
+        return;
+    }
+    let html = '';
+    moveHistory.forEach(([r, c, p], i) => {
+        const colLabel = String.fromCharCode(65 + c);
+        const rowLabel = BOARD_SIZE - r;
+        const colorName = p === 1 ? '黑' : '白';
+        html += `<span class="move-item ${p === 1 ? 'black' : 'white'}">#${i+1} ${colorName}${colLabel}${rowLabel}</span>`;
+    });
+    container.innerHTML = html;
+    container.scrollTop = container.scrollHeight;
+}
+
+// Click handler - place stone
+canvas.addEventListener('click', function(e) {
+    if (gameOver) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const my = (e.clientY - rect.top) * scaleY;
+
+    const col = Math.round((mx - PADDING) / CELL_SIZE);
+    const row = Math.round((my - PADDING) / CELL_SIZE);
+
+    if (row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) return;
+    if (board[row][col] !== 0) return;
+
+    fetch('/api/place', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ row, col })
+    })
+    .then(res => res.json())
+    .then(data => {
+        fetchState();
+        if (data.winner === 1) {
+            showWinModal('⚫ 黑棋获胜!', '连五子，恭喜黑方!');
+        } else if (data.winner === 2) {
+            showWinModal('⚪ 白棋获胜!', '连五子，恭喜白方!');
+        } else if (data.message === '平局!') {
+            showWinModal('🤝 平局!', '棋盘已满，不分胜负');
+        }
+    })
+    .catch(err => console.error('Error:', err));
+});
+
+function fetchState() {
+    fetch('/api/state')
+    .then(res => res.json())
+    .then(data => {
+        board = data.board;
+        currentPlayer = data.current_player;
+        gameOver = data.game_over;
+        winner = data.winner;
+        moveHistory = data.move_history;
+        render();
+    })
+    .catch(err => console.error('Error:', err));
+}
+
+// Reset game
+document.getElementById('resetBtn').addEventListener('click', function() {
+    fetch('/api/reset', { method: 'POST' })
+    .then(res => res.json())
+    .then(() => {
+        fetchState();
+        document.getElementById('winModal').classList.remove('active');
+    });
+});
+
+// Undo last move
+document.getElementById('undoBtn').addEventListener('click', function() {
+    fetch('/api/undo', { method: 'POST' })
+    .then(res => res.json())
+    .then(() => {
+        fetchState();
+        document.getElementById('winModal').classList.remove('active');
+    });
+});
+
+// Modal reset button
+document.getElementById('modalResetBtn').addEventListener('click', function() {
+    document.getElementById('resetBtn').click();
+});
+
+function showWinModal(title, desc) {
+    document.getElementById('modalTitle').textContent = title;
+    document.getElementById('modalDesc').textContent = desc;
+    document.getElementById('winModal').classList.add('active');
+}
+
+// Close modal on overlay click
+document.getElementById('winModal').addEventListener('click', function(e) {
+    if (e.target === this) {
+        this.classList.remove('active');
+    }
+});
+
+// Keyboard shortcuts: R = reset, Ctrl+Z = undo
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'r' || e.key === 'R') {
+        if (!e.ctrlKey && !e.metaKey) {
+            document.getElementById('resetBtn').click();
+        }
+    }
+    if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        document.getElementById('undoBtn').click();
+    }
+});
+
+// Initial render
+fetchState();
+</script>
+</body>
+</html>

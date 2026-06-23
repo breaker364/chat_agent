@@ -7,26 +7,20 @@ and clean Markdown extraction. Falls back gracefully on any error.
 
 from __future__ import annotations
 
-import os
 import time
 
 import requests
 
+from ..config import load_tavily_config
 from .base import FetchResult, RedirectInfo, SearchOptions, SearchResult
 
-_DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 _TAVILY_TIMEOUT_SECONDS = 20
 
 
 def _get_tavily_config() -> tuple[str, str | None]:
-    """Return (base_url, api_key) from environment or defaults."""
-    base_url = os.environ.get(
-        "TAVILY_BASE_URL",
-        os.environ.get("TAVILY_ENDPOINT_URL", _DEFAULT_TAVILY_BASE_URL),
-    ).rstrip("/")
-    # api_key = os.environ.get("TAVILY_API_KEY") or None
-    api_key='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'
-    return base_url, api_key
+    """Return (base_url, api_key) from environment or config.json."""
+    config = load_tavily_config()
+    return str(config["base_url"]), config["api_key"]
 
 
 def _tavily_headers() -> dict[str, str]:
@@ -56,7 +50,7 @@ class TavilySearchAdapter:
         opts = options or SearchOptions()
         base_url, _ = _get_tavily_config()
 
-        body: dict = {
+        body: dict[str, object] = {
             "query": query,
             "max_results": max(opts.num_results, 3),
         }

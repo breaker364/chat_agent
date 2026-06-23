@@ -4,7 +4,12 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
+import subprocess
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -12,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_mcp_adapters.sessions import StdioConnection
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -40,6 +46,9 @@ _SEARCH_CACHE_TTL_SECONDS = 900
 _FETCH_CACHE_TTL_SECONDS = 900
 _FETCH_TIMEOUT_SECONDS = 15
 _MAX_FETCH_REDIRECTS = 10
+_PYTHON_RUN_TIMEOUT_SECONDS = 60
+_PYTHON_OUTPUT_MAX_CHARS = 12_000
+_MAX_PARALLEL_SEARCH_ROUTES = 2
 
 _FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -59,14 +68,65 @@ def set_allowed_root(path: str | Path) -> None:
 def _ensure_allowed(path: str) -> Path:
     raw = (path or "").strip() or "."
     candidate = Path(raw)
-    if candidate.is_absolute():
-        return candidate.resolve()
     root_str = _ALLOWED_ROOT or os.getcwd()
     root = Path(root_str).resolve()
-    target = (root / candidate).resolve()
-    if not str(target).startswith(str(root)):
-        raise PermissionError(f"Access denied: {target} is outside {root}")
+    if candidate.is_absolute():
+        target = candidate.resolve()
+    else:
+        target = (root / candidate).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError(f"Access denied: {target} is outside {root}") from exc
     return target
+
+
+def _workspace_root() -> Path:
+    return Path(_ALLOWED_ROOT or os.getcwd()).resolve()
+
+
+def _resolve_python_script_path(path: str) -> Path:
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("Python file path is required.")
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (Path(_workspace_root()) / candidate).resolve()
+
+
+def _resolve_python_executable(preferred: str = "") -> str:
+    configured = preferred.strip()
+    candidates = [
+        configured,
+        (os.environ.get("PYTHON_EXECUTABLE") or "").strip(),
+        sys.executable or "",
+        shutil.which("python") or "",
+        shutil.which("py") or "",
+        shutil.which("python3") or "",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            resolved = Path(candidate).resolve(strict=False)
+        except OSError:
+            continue
+        if resolved.exists():
+            return str(resolved)
+    raise FileNotFoundError(
+        "Python interpreter not found. Set PYTHON_EXECUTABLE or run the agent from a Python environment."
+    )
+
+
+class RunPythonFileInput(BaseModel):
+    """Arguments for running a Python script via the agent tool."""
+
+    path: str = Field(..., description="Path to the Python script. Relative paths use the workspace root.")
+    cli_args: str = Field("", description="Command-line arguments passed to the script.")
+    timeout_seconds: int = Field(_PYTHON_RUN_TIMEOUT_SECONDS, description="Execution timeout in seconds.")
+    working_directory: str = Field("", description="Optional working directory for the script.")
+    python_executable: str = Field("", description="Optional Python executable path.")
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +225,118 @@ def _html_to_text(html: str) -> tuple[str, str]:
     return title, text
 
 
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _contains_latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def _tokenize_query(query: str) -> list[str]:
+    return [token for token in re.split(r"\s+", (query or "").strip()) if token]
+
+
+def _keyword_fallback_query(query: str) -> str:
+    tokens = _tokenize_query(query)
+    if not tokens:
+        return ""
+    return " ".join(tokens[:12])
+
+
+def _build_cross_language_query(query: str) -> str:
+    """Build a keyword-style query in the other language for bilingual search."""
+    normalized = (query or "").strip()
+    if not normalized:
+        return ""
+
+    target_language = "English" if _contains_cjk(normalized) else "Simplified Chinese"
+    system_text = (
+        "You rewrite web search queries for bilingual retrieval. "
+        "Return only a compact search-engine query in the requested language. "
+        "Keep product names, model names, years, numbers, and acronyms exact. "
+        "Do not add explanations, quotes, or markdown."
+    )
+    user_text = (
+        f"Original query: {normalized}\n"
+        f"Target language: {target_language}\n"
+        "Rewrite it as a concise search query optimized for web search."
+    )
+    llm = _get_secondary_llm()
+    response = llm.invoke(
+        [SystemMessage(content=system_text), HumanMessage(content=user_text)]
+    )
+    rewritten = response.content if hasattr(response, "content") else str(response)
+    candidate = (rewritten or "").strip().strip('"').strip("'")
+    if not candidate or candidate.casefold() == normalized.casefold():
+        candidate = _keyword_fallback_query(normalized)
+        if not candidate or candidate.casefold() == normalized.casefold():
+            return ""
+    return candidate
+
+
+def _build_bilingual_queries(query: str) -> list[tuple[str, str]]:
+    normalized = (query or "").strip()
+    if not normalized:
+        return []
+
+    routes: list[tuple[str, str]] = [("primary", normalized)]
+    try:
+        alternate = _build_cross_language_query(normalized)
+    except Exception as exc:
+        logger.warning("Cross-language query generation failed: %s", exc)
+        alternate = ""
+    if alternate and alternate.casefold() != normalized.casefold():
+        routes.append(("alternate", alternate))
+    return routes[:_MAX_PARALLEL_SEARCH_ROUTES]
+
+
+def _merge_search_results(
+    route_results: list[tuple[str, str, list[SearchResult]]],
+    count: int,
+) -> tuple[list[SearchResult], list[dict[str, Any]]]:
+    """Merge results from multiple search routes, deduplicating by URL.
+
+    Returns at most `count` results, interleaving from different routes
+    for diversity (primary first, then alternate, etc.).
+    """
+    # First pass: collect all unique results per route
+    per_route: list[tuple[str, str, list[SearchResult]]] = []
+    all_seen: set[str] = set()
+    for route_name, route_query, results in route_results:
+        unique: list[SearchResult] = []
+        for r in results:
+            key = (r.url or "").strip().lower()
+            if not key or key in all_seen:
+                continue
+            all_seen.add(key)
+            unique.append(r)
+        per_route.append((route_name, route_query, unique))
+
+    # Build route_info from all routes
+    route_info: list[dict[str, Any]] = [
+        {"route": name, "query": q, "result_count": len(items)}
+        for name, q, items in per_route
+    ]
+
+    # Interleave: round-robin from each route for diversity
+    merged: list[SearchResult] = []
+    indices = [0] * len(per_route)
+    while len(merged) < count:
+        added = False
+        for i, (_, _, items) in enumerate(per_route):
+            if indices[i] < len(items):
+                merged.append(items[indices[i]])
+                indices[i] += 1
+                added = True
+                if len(merged) >= count:
+                    break
+        if not added:
+            break
+
+    return merged, route_info
+
+
 # ---------------------------------------------------------------------------
 # File-operation tools
 # ---------------------------------------------------------------------------
@@ -237,9 +409,10 @@ def write_file(path: str, content: str, overwrite: bool = True) -> str:
         return f"Cannot write file because target is a directory: {target}"
     if target.exists() and not overwrite:
         return f"File already exists and overwrite is false: {target}"
+    existed_before = target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content or "", encoding="utf-8", newline="\n")
-    action = "Updated" if target.exists() else "Created"
+    action = "Updated" if existed_before else "Created"
     return f"{action} file: {target}"
 
 
@@ -271,6 +444,118 @@ def delete_file(path: str) -> str:
         return f"Refusing to delete directory with delete_file: {target}"
     target.unlink()
     return f"Deleted file: {target}"
+
+
+@tool(args_schema=RunPythonFileInput)
+def run_python_file(
+    path: str,
+    cli_args: str = "",
+    timeout_seconds: int = _PYTHON_RUN_TIMEOUT_SECONDS,
+    working_directory: str = "",
+    python_executable: str = "",
+) -> str:
+    """Run a Python file for local verification. Relative paths use the workspace root; absolute paths may be outside it."""
+    try:
+        target = _resolve_python_script_path(path)
+    except Exception as exc:
+        return json.dumps({"path": path, "error": str(exc)}, ensure_ascii=False, indent=2)
+
+    if not target.is_file():
+        return json.dumps({"path": str(target), "error": "File not found."}, ensure_ascii=False, indent=2)
+    if target.suffix.lower() != ".py":
+        return json.dumps({"path": str(target), "error": "Only .py files can be executed."}, ensure_ascii=False, indent=2)
+
+    try:
+        timeout_value = max(1, int(timeout_seconds))
+    except (TypeError, ValueError):
+        timeout_value = _PYTHON_RUN_TIMEOUT_SECONDS
+
+    try:
+        resolved_python_executable = _resolve_python_executable(python_executable)
+    except Exception as exc:
+        return json.dumps(
+            {"path": str(target), "error": str(exc)},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if working_directory.strip():
+        try:
+            cwd_path = Path(working_directory).expanduser()
+            if not cwd_path.is_absolute():
+                cwd_path = (_workspace_root() / cwd_path).resolve()
+            else:
+                cwd_path = cwd_path.resolve()
+        except Exception as exc:
+            return json.dumps(
+                {"path": str(target), "error": f"Invalid working_directory: {exc}"},
+                ensure_ascii=False,
+                indent=2,
+            )
+    else:
+        cwd_path = target.parent if target.parent.exists() else _workspace_root()
+
+    if not cwd_path.exists() or not cwd_path.is_dir():
+        return json.dumps(
+            {
+                "path": str(target),
+                "error": f"Working directory not found or not a directory: {cwd_path}",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    command = [resolved_python_executable, str(target), *shlex.split(cli_args or "", posix=False)]
+    started_at = time.monotonic()
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd_path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_value,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout_text = (exc.stdout or "")[:_PYTHON_OUTPUT_MAX_CHARS]
+        stderr_text = (exc.stderr or "")[:_PYTHON_OUTPUT_MAX_CHARS]
+        return json.dumps(
+            {
+                "path": str(target),
+                "command": command,
+                "cwd": str(cwd_path),
+                "timed_out": True,
+                "timeout_seconds": timeout_value,
+                "duration_seconds": round(time.monotonic() - started_at, 3),
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"path": str(target), "command": command, "error": str(exc)},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "path": str(target),
+            "command": command,
+            "cwd": str(cwd_path),
+            "exit_code": completed.returncode,
+            "duration_seconds": round(time.monotonic() - started_at, 3),
+            "stdout": completed.stdout[:_PYTHON_OUTPUT_MAX_CHARS],
+            "stderr": completed.stderr[:_PYTHON_OUTPUT_MAX_CHARS],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +616,7 @@ def web_search(
         return json.dumps(cached["payload"], ensure_ascii=False, indent=2)
 
     start = time.monotonic()
+    routes = _build_bilingual_queries(query.strip())
     options = SearchOptions(
         allowed_domains=allowed_domains,
         blocked_domains=blocked_domains,
@@ -339,17 +625,46 @@ def web_search(
 
     try:
         adapter = create_search_adapter()
-        results = adapter.search(query.strip(), options)
+        route_results: list[tuple[str, str, list[SearchResult]]] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(routes))) as executor:
+            future_map = {
+                executor.submit(adapter.search, route_query, options): (route_name, route_query)
+                for route_name, route_query in routes
+            }
+            for future in as_completed(future_map):
+                route_name, route_query = future_map[future]
+                route_results.append((route_name, route_query, future.result()))
+        route_results.sort(key=lambda item: 0 if item[0] == "primary" else 1)
+        results, route_info = _merge_search_results(route_results, count)
         duration_ms = (time.monotonic() - start) * 1000
         payload_str = _format_search_results(query, results, adapter.name, duration_ms)
+        payload = json.loads(payload_str)
+        payload["search_routes"] = route_info
+        payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
-        logger.warning("Search adapter '%s' failed: %s", getattr(adapter, 'name', '?'), exc)
+        requested_engine = getattr(adapter, "name", "?")
+        logger.warning("Search adapter '%s' failed: %s", requested_engine, exc)
         # Fallback to Bing if Tavily fails
         adapter = BingSearchAdapter()
         try:
-            results = adapter.search(query.strip(), options)
+            route_results = []
+            with ThreadPoolExecutor(max_workers=max(1, len(routes))) as executor:
+                future_map = {
+                    executor.submit(adapter.search, route_query, options): (route_name, route_query)
+                    for route_name, route_query in routes
+                }
+                for future in as_completed(future_map):
+                    route_name, route_query = future_map[future]
+                    route_results.append((route_name, route_query, future.result()))
+            route_results.sort(key=lambda item: 0 if item[0] == "primary" else 1)
+            results, route_info = _merge_search_results(route_results, count)
             duration_ms = (time.monotonic() - start) * 1000
             payload_str = _format_search_results(query, results, adapter.name, duration_ms)
+            payload = json.loads(payload_str)
+            payload["requested_engine"] = requested_engine
+            payload["fallback_reason"] = str(exc)
+            payload["search_routes"] = route_info
+            payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as fallback_exc:
             duration_ms = (time.monotonic() - start) * 1000
             payload_str = json.dumps(
@@ -605,7 +920,15 @@ async def load_12306_tools(
 # Tool collections
 # ---------------------------------------------------------------------------
 
-_FILE_TOOLS: list[Any] = [list_directory, read_file, get_file_info, write_file, append_file, delete_file]
+_FILE_TOOLS: list[Any] = [
+    list_directory,
+    read_file,
+    get_file_info,
+    write_file,
+    append_file,
+    delete_file,
+    run_python_file,
+]
 _SEARCH_TOOLS: list[Any] = [web_search, web_fetch]
 
 

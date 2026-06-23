@@ -1,9 +1,9 @@
 """
-Search adapter factory — selects the appropriate backend.
+Search adapter factory - selects the appropriate backend.
 
 Priority (highest first):
   1. WEB_SEARCH_ADAPTER environment variable (explicit override)
-  2. Default: 'tavily' (API key already configured in tavily_adapter.py)
+  2. Default: 'tavily'
 """
 
 from __future__ import annotations
@@ -14,20 +14,24 @@ from .base import WebFetchAdapter, WebSearchAdapter
 from .bing_adapter import BingSearchAdapter
 from .tavily_adapter import TavilySearchAdapter, fetch_with_tavily
 
-_SEARCH_ADAPTER_KEY = os.environ.get("WEB_SEARCH_ADAPTER", "").strip().lower()
 _SEARCH_CACHE: WebSearchAdapter | None = None
 _SEARCH_CACHE_KEY: str | None = None
 
 
+def _get_search_adapter_key() -> str:
+    return os.environ.get("WEB_SEARCH_ADAPTER", "").strip().lower() or "tavily"
+
+
 def create_search_adapter() -> WebSearchAdapter:
-    """Return a WebSearchAdapter — Tavily (default) or Bing (fallback via env)."""
+    """Return a WebSearchAdapter - Tavily (default) or Bing (env override)."""
     global _SEARCH_CACHE, _SEARCH_CACHE_KEY
 
-    adapter_key = _SEARCH_ADAPTER_KEY or "tavily"
+    adapter_key = _get_search_adapter_key()
 
     if _SEARCH_CACHE is not None and _SEARCH_CACHE_KEY == adapter_key:
         return _SEARCH_CACHE
 
+    adapter: WebSearchAdapter
     if adapter_key == "bing":
         adapter = BingSearchAdapter()
     else:
@@ -39,12 +43,8 @@ def create_search_adapter() -> WebSearchAdapter:
 
 
 def create_fetch_adapter() -> WebFetchAdapter | None:
-    """Return a WebFetchAdapter — Tavily Extract (default) or None for direct HTTP.
-
-    Returns None when adapter_key is 'bing', which triggers direct HTTP fallback
-    in web_fetch.
-    """
-    adapter_key = _SEARCH_ADAPTER_KEY or "tavily"
+    """Return a WebFetchAdapter - Tavily Extract (default) or None for direct HTTP."""
+    adapter_key = _get_search_adapter_key()
     if adapter_key == "bing":
         return None
 
