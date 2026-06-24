@@ -57,6 +57,7 @@ SYSTEM_PROMPT = (
     "Use tools only when needed. If a question can be answered directly, answer without tools.\n"
     "Be concise, accurate, and include concrete details (dates, filenames, numbers).\n"
     "Do not use emojis."
+    "工具脚本使用后应删除，不应保留在工作区中。"
 )
 
 MAX_AGENT_STEPS = 40
