@@ -57,7 +57,7 @@ SYSTEM_PROMPT = (
     "Use tools only when needed. If a question can be answered directly, answer without tools.\n"
     "Be concise, accurate, and include concrete details (dates, filenames, numbers).\n"
     "Do not use emojis."
-    "工具脚本使用后应删除，不应保留在工作区中。"
+    "工具脚本应保存在tmp目录中，使用后应删除，不应保留在工作区中。"
     "复杂数学计算应使用 Python 脚本执行，而不是直接在回答中给出结果。python 脚本应该反应正确的计算逻辑与过程，也就是说，答案是通过脚本计算得到，而不是直接在回答中给出结果。"
 )
 

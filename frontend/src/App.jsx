@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Loader2,
   Send,
@@ -13,12 +13,37 @@ import {
   PanelRightOpen,
   PanelRightClose,
   Square,
+  Plus,
+  MessageSquare,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
 
 const API_BASE = "";
+const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
+
+function makeSessionId() {
+  return `session-${Date.now()}`;
+}
+
+function readLastSessionId() {
+  try {
+    return window.localStorage.getItem(LAST_SESSION_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writeLastSessionId(sessionId) {
+  try {
+    if (sessionId) {
+      window.localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
+    }
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
 
 function iconForTool(toolName) {
   const label = (toolName || "").toLowerCase();
@@ -103,9 +128,7 @@ function ToolResultBubble({ toolName, content }) {
           {expanded && rawExpanded ? <pre className="tool-result-content tool-result-raw">{text}</pre> : null}
         </div>
       ) : (
-        <pre className={expanded ? "tool-result-content" : "tool-result-preview"}>
-          {expanded ? text : preview}
-        </pre>
+        <pre className={expanded ? "tool-result-content" : "tool-result-preview"}>{expanded ? text : preview}</pre>
       )}
     </div>
   );
@@ -196,6 +219,39 @@ function DebugSidebar({ open, events, loading, onToggle, onClear }) {
   );
 }
 
+function SessionSidebar({ sessions, activeSessionId, onSelect, onCreate }) {
+  return (
+    <aside className="session-sidebar">
+      <div className="session-sidebar-header">
+        <div className="session-brand">
+          <Bot size={20} />
+          <span>Chat Agent</span>
+        </div>
+        <button className="session-create-btn" onClick={onCreate} title="New session">
+          <Plus size={16} />
+        </button>
+      </div>
+      <div className="session-sidebar-body">
+        {sessions.map((session) => (
+          <button
+            key={session.session_id}
+            className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
+            onClick={() => onSelect(session.session_id)}
+          >
+            <MessageSquare size={16} />
+            <div className="session-item-content">
+              <div className="session-item-title">{session.title || session.session_id}</div>
+              <div className="session-item-meta">
+                {session.task_progress?.status === "running" ? "running" : "idle"}
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
 function dispatchSseBlock(block, onEvent) {
   const lines = block.split(/\r?\n/);
   let eventType = "";
@@ -231,13 +287,9 @@ function parseSseChunk(buffer, onEvent) {
 }
 
 export default function App() {
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      content: "I am Chat Agent. I can search the web, inspect files, and query 12306 tickets.",
-      tools: [],
-    },
-  ]);
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [streamingText, setStreamingText] = useState("");
@@ -246,15 +298,125 @@ export default function App() {
   const [debugOpen, setDebugOpen] = useState(true);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
-  const sessionId = useRef(`session-${Date.now()}`);
+
+  const defaultAssistantMessage = useMemo(
+    () => ({
+      role: "assistant",
+      content: "I am Chat Agent. I can search the web, inspect files, and query 12306 tickets.",
+      tools: [],
+    }),
+    []
+  );
 
   const scrollDown = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
+  const refreshSessions = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/sessions`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const nextSessions = data.sessions || [];
+      setSessions(nextSessions);
+      return nextSessions;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const loadSession = useCallback(async (sessionId) => {
+    try {
+      const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      setActiveSessionId(data.session_id);
+      writeLastSessionId(data.session_id);
+      setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
+      return data.session_id;
+    } catch {
+      setActiveSessionId(sessionId);
+      writeLastSessionId(sessionId);
+      return sessionId;
+    }
+  }, [defaultAssistantMessage]);
+
   useEffect(() => {
     scrollDown();
   }, [messages, streamingText, toolEvents, scrollDown]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const sessionList = await refreshSessions();
+        if (cancelled) return;
+        if (sessionList?.length) {
+          const rememberedSessionId = readLastSessionId();
+          const matchedSession = rememberedSessionId
+            ? sessionList.find((session) => session.session_id === rememberedSessionId)
+            : null;
+          await loadSession((matchedSession || sessionList[0]).session_id);
+        } else {
+          const sessionId = makeSessionId();
+          const resp = await fetch(`${API_BASE}/sessions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+            body: JSON.stringify({ session_id: sessionId }),
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          await refreshSessions();
+          await loadSession(sessionId);
+        }
+      } catch {
+        const sessionId = makeSessionId();
+        setActiveSessionId(sessionId);
+        writeLastSessionId(sessionId);
+        setMessages([defaultAssistantMessage]);
+        setSessions((prev) => prev);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [defaultAssistantMessage, loadSession, refreshSessions]);
+
+  const currentHistory = useMemo(
+    () =>
+      messages
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ({ role: m.role, content: m.content })),
+    [messages]
+  );
+
+  const handleCreateSession = useCallback(async () => {
+    const sessionId = makeSessionId();
+    setActiveSessionId(sessionId);
+    writeLastSessionId(sessionId);
+    try {
+      await fetch(`${API_BASE}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      await refreshSessions();
+      await loadSession(sessionId);
+    } catch {
+      setActiveSessionId(sessionId);
+      setMessages([defaultAssistantMessage]);
+      setSessions((prev) => [
+        {
+          session_id: sessionId,
+          title: "New Session",
+          task_progress: { status: "idle" },
+        },
+        ...prev,
+      ]);
+    }
+    setDebugEvents([]);
+    setToolEvents([]);
+    setStreamingText("");
+  }, [defaultAssistantMessage, loadSession, refreshSessions]);
 
   const handleStop = useCallback(() => {
     if (!abortRef.current) return;
@@ -279,10 +441,14 @@ export default function App() {
     const text = input.trim();
     if (!text || loading) return;
 
+    let ensuredSessionId = activeSessionId;
+    if (!ensuredSessionId) {
+      ensuredSessionId = makeSessionId();
+      setActiveSessionId(ensuredSessionId);
+      writeLastSessionId(ensuredSessionId);
+    }
+
     const userMsg = { role: "user", content: text, tools: [] };
-    const history = messages
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => ({ role: m.role, content: m.content }));
 
     setInput("");
     setLoading(true);
@@ -366,8 +532,8 @@ export default function App() {
         headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           message: text,
-          session_id: sessionId.current,
-          history,
+          session_id: ensuredSessionId,
+          history: currentHistory,
         }),
         signal: controller.signal,
       });
@@ -399,6 +565,7 @@ export default function App() {
           tools: runState.tools,
         },
       ]);
+      await refreshSessions();
     } catch (err) {
       if (err.name === "AbortError") {
         setMessages((prev) => [
@@ -424,7 +591,7 @@ export default function App() {
       setToolEvents([]);
       abortRef.current = null;
     }
-  }, [input, loading, messages]);
+  }, [activeSessionId, currentHistory, input, loadSession, loading, refreshSessions]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -435,6 +602,13 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <SessionSidebar
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        onSelect={loadSession}
+        onCreate={handleCreateSession}
+      />
+
       <div className="app-container">
         <header className="app-header">
           <div className="header-left">
