@@ -15,6 +15,10 @@ import {
   Square,
   Plus,
   MessageSquare,
+  Pencil,
+  Trash2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -22,6 +26,8 @@ import "./App.css";
 
 const API_BASE = "";
 const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
+const SESSION_SIDEBAR_COLLAPSED_KEY = "chat-agent:session-sidebar-collapsed";
+const DEBUG_SIDEBAR_COLLAPSED_KEY = "chat-agent:debug-sidebar-collapsed";
 
 function makeSessionId() {
   return `session-${Date.now()}`;
@@ -40,6 +46,38 @@ function writeLastSessionId(sessionId) {
     if (sessionId) {
       window.localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
     }
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function readSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(SESSION_SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeSidebarCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(SESSION_SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function readDebugCollapsed() {
+  try {
+    return window.localStorage.getItem(DEBUG_SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeDebugCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(DEBUG_SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
   } catch {
     // Ignore localStorage failures.
   }
@@ -219,35 +257,60 @@ function DebugSidebar({ open, events, loading, onToggle, onClear }) {
   );
 }
 
-function SessionSidebar({ sessions, activeSessionId, onSelect, onCreate }) {
+function SessionSidebar({
+  sessions,
+  activeSessionId,
+  collapsed,
+  onToggleCollapsed,
+  onSelect,
+  onCreate,
+  onRename,
+  onDelete,
+}) {
   return (
-    <aside className="session-sidebar">
+    <aside className={`session-sidebar ${collapsed ? "collapsed" : ""}`}>
       <div className="session-sidebar-header">
         <div className="session-brand">
           <Bot size={20} />
-          <span>Chat Agent</span>
+          {!collapsed ? <span>Chat Agent</span> : null}
         </div>
-        <button className="session-create-btn" onClick={onCreate} title="New session">
-          <Plus size={16} />
-        </button>
+        <div className="session-sidebar-actions">
+          <button className="session-create-btn" onClick={onCreate} title="New session">
+            <Plus size={16} />
+          </button>
+          <button className="session-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? "Expand sessions" : "Collapse sessions"}>
+            {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          </button>
+        </div>
       </div>
-      <div className="session-sidebar-body">
-        {sessions.map((session) => (
-          <button
-            key={session.session_id}
-            className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
-            onClick={() => onSelect(session.session_id)}
-          >
-            <MessageSquare size={16} />
-            <div className="session-item-content">
-              <div className="session-item-title">{session.title || session.session_id}</div>
-              <div className="session-item-meta">
-                {session.task_progress?.status === "running" ? "running" : "idle"}
+      {!collapsed ? (
+        <div className="session-sidebar-body">
+          {sessions.map((session) => (
+            <div
+              key={session.session_id}
+              className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
+            >
+              <button className="session-item-main" onClick={() => onSelect(session.session_id)}>
+                <MessageSquare size={16} />
+                <div className="session-item-content">
+                  <div className="session-item-title">{session.title || session.session_id}</div>
+                  <div className="session-item-meta">
+                    {session.task_progress?.status === "running" ? "running" : "idle"}
+                  </div>
+                </div>
+              </button>
+              <div className="session-item-toolbar">
+                <button className="session-toolbar-btn" onClick={(e) => onRename(e, session)} title="Rename session">
+                  <Pencil size={14} />
+                </button>
+                <button className="session-toolbar-btn danger" onClick={(e) => onDelete(e, session)} title="Delete session">
+                  <Trash2 size={14} />
+                </button>
               </div>
             </div>
-          </button>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : null}
     </aside>
   );
 }
@@ -295,7 +358,8 @@ export default function App() {
   const [streamingText, setStreamingText] = useState("");
   const [toolEvents, setToolEvents] = useState([]);
   const [debugEvents, setDebugEvents] = useState([]);
-  const [debugOpen, setDebugOpen] = useState(true);
+  const [debugOpen, setDebugOpen] = useState(!readDebugCollapsed());
+  const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(readSidebarCollapsed);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
 
@@ -344,6 +408,14 @@ export default function App() {
   useEffect(() => {
     scrollDown();
   }, [messages, streamingText, toolEvents, scrollDown]);
+
+  useEffect(() => {
+    writeSidebarCollapsed(sessionSidebarCollapsed);
+  }, [sessionSidebarCollapsed]);
+
+  useEffect(() => {
+    writeDebugCollapsed(!debugOpen);
+  }, [debugOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -417,6 +489,50 @@ export default function App() {
     setToolEvents([]);
     setStreamingText("");
   }, [defaultAssistantMessage, loadSession, refreshSessions]);
+
+  const handleRenameSession = useCallback(async (event, session) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const currentTitle = session.title || session.session_id;
+    const nextTitle = window.prompt("Rename session", currentTitle);
+    if (!nextTitle || nextTitle.trim() === currentTitle) return;
+    const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ title: nextTitle.trim() }),
+    });
+    if (!resp.ok) return;
+    await refreshSessions();
+  }, [refreshSessions]);
+
+  const handleDeleteSession = useCallback(async (event, session) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const confirmed = window.confirm(`Delete session "${session.title || session.session_id}"?`);
+    if (!confirmed) return;
+    const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
+      method: "DELETE",
+    });
+    if (!resp.ok) return;
+
+    const nextSessions = sessions.filter((item) => item.session_id !== session.session_id);
+    setSessions(nextSessions);
+    if (session.session_id === activeSessionId) {
+      const rememberedSessionId = nextSessions[0]?.session_id || makeSessionId();
+      if (nextSessions.length) {
+        await loadSession(rememberedSessionId);
+      } else {
+        setActiveSessionId(rememberedSessionId);
+        writeLastSessionId(rememberedSessionId);
+        setMessages([defaultAssistantMessage]);
+      }
+    } else if (readLastSessionId() === session.session_id) {
+      if (nextSessions[0]?.session_id) {
+        writeLastSessionId(nextSessions[0].session_id);
+      }
+    }
+    await refreshSessions();
+  }, [activeSessionId, defaultAssistantMessage, loadSession, refreshSessions, sessions]);
 
   const handleStop = useCallback(() => {
     if (!abortRef.current) return;
@@ -591,7 +707,7 @@ export default function App() {
       setToolEvents([]);
       abortRef.current = null;
     }
-  }, [activeSessionId, currentHistory, input, loadSession, loading, refreshSessions]);
+  }, [activeSessionId, currentHistory, input, loading, refreshSessions]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -605,8 +721,12 @@ export default function App() {
       <SessionSidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
+        collapsed={sessionSidebarCollapsed}
+        onToggleCollapsed={() => setSessionSidebarCollapsed((prev) => !prev)}
         onSelect={loadSession}
         onCreate={handleCreateSession}
+        onRename={handleRenameSession}
+        onDelete={handleDeleteSession}
       />
 
       <div className="app-container">

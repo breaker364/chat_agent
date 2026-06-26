@@ -27,7 +27,7 @@ sessionss/
 # Frontend dependencies / build
 frontend/node_modules/
 frontend/dist/
-
+*.csv
 # Logs
 *.log
 *.docx

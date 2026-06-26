@@ -126,6 +126,26 @@ async def create_session(request: Request) -> JSONResponse:
     return JSONResponse(_session_payload(session))
 
 
+@app.patch("/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request) -> JSONResponse:
+    body = await request.json()
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "Title cannot be empty"}, status_code=400)
+    session = get_session_store().rename_session(session_id, title)
+    if session is None:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return JSONResponse(_session_payload(session))
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str) -> JSONResponse:
+    deleted = get_session_store().delete_session(session_id)
+    if not deleted:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return JSONResponse({"ok": True, "session_id": session_id})
+
+
 @app.post("/chat/stream")
 async def chat_stream(request: Request) -> EventSourceResponse:
     body = await request.json()

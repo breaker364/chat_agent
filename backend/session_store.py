@@ -103,6 +103,23 @@ class SessionStore:
         path = self.session_path(session["session_id"])
         path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any] | None:
+        session = self.load_session(session_id)
+        if session is None:
+            return None
+        normalized_title = re.sub(r"\s+", " ", (title or "").strip())
+        if normalized_title:
+            session["title"] = normalized_title[:MAX_SESSION_TITLE_LENGTH]
+            self.save_session(session)
+        return session
+
+    def delete_session(self, session_id: str) -> bool:
+        path = self.session_path(session_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def append_message(
         self,
         session_id: str,
