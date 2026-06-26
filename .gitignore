@@ -34,3 +34,5 @@ frontend/dist/
 # Temporary debug / test artifacts
 tmp_*
 
+tmp/
+snake-game/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -33,6 +36,9 @@ from .adapters import (
     create_fetch_adapter,
     create_search_adapter,
 )
+from .session_store import SessionStore
+from .subagent_runtime import get_subagent_manager
+from .subagents import built_in_subagents, run_subagent
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,26 @@ _MAX_FETCH_REDIRECTS = 10
 _PYTHON_RUN_TIMEOUT_SECONDS = 60
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
 _MAX_PARALLEL_SEARCH_ROUTES = 2
+_SUBAGENT_MANAGER = get_subagent_manager()
+_CURRENT_SESSION_ID_ENV = "CHAT_AGENT_SESSION_ID"
+
+
+def _run_coro_in_thread(coro: Any) -> Any:
+    queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            result = asyncio.run(coro)
+            queue.put((True, result))
+        except Exception as exc:
+            queue.put((False, exc))
+
+    thread = Thread(target=_target, daemon=True)
+    thread.start()
+    ok, value = queue.get()
+    if ok:
+        return value
+    raise value
 
 _FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -83,6 +109,10 @@ def _ensure_allowed(path: str) -> Path:
 
 def _workspace_root() -> Path:
     return Path(_ALLOWED_ROOT or os.getcwd()).resolve()
+
+
+def _current_session_id() -> str:
+    return (os.environ.get(_CURRENT_SESSION_ID_ENV) or "").strip()
 
 
 def _resolve_python_script_path(path: str) -> Path:
@@ -147,6 +177,22 @@ class RunPythonFileInput(BaseModel):
     timeout_seconds: int = Field(_PYTHON_RUN_TIMEOUT_SECONDS, description="Execution timeout in seconds.")
     working_directory: str = Field("", description="Optional working directory for the script.")
     python_executable: str = Field("", description="Optional Python executable path.")
+
+
+class AgentToolInput(BaseModel):
+    """Arguments for launching a delegated subagent."""
+
+    description: str = Field(..., description="Short task description for the subagent.")
+    prompt: str = Field(..., description="Full delegated task prompt.")
+    subagent_type: str = Field("general-purpose", description="Subagent type, e.g. general-purpose, Explore, Plan, verification.")
+    run_in_background: bool = Field(False, description="Whether to run the subagent in background mode.")
+
+
+class SendMessageInput(BaseModel):
+    """Arguments for sending a message to a background subagent."""
+
+    agent_id: str = Field(..., description="Target background subagent ID.")
+    message: str = Field(..., description="Message to deliver to the target subagent.")
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +510,106 @@ def delete_file(path: str) -> str:
         return f"Refusing to delete directory with delete_file: {target}"
     target.unlink()
     return f"Deleted file: {target}"
+
+
+@tool(args_schema=AgentToolInput)
+def Agent(
+    description: str,
+    prompt: str,
+    subagent_type: str = "general-purpose",
+    run_in_background: bool = False,
+) -> str:
+    """Launch a delegated subagent to handle a scoped task."""
+    workspace = _workspace_root()
+    normalized_type = (subagent_type or "general-purpose").strip()
+    if normalized_type not in built_in_subagents():
+        normalized_type = "general-purpose"
+
+    if run_in_background:
+        session_id = _current_session_id()
+        launched = _SUBAGENT_MANAGER.launch(
+            prompt=prompt,
+            description=description,
+            subagent_type=normalized_type,
+            workspace_dir=workspace,
+            session_id=session_id or None,
+        )
+        if session_id:
+            SessionStore(workspace).add_subagent_task(session_id, launched)
+        return json.dumps(
+            {
+                "status": "async_launched",
+                "agent_id": launched["agent_id"],
+                "description": description,
+                "subagent_type": normalized_type,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    payload = _run_coro_in_thread(
+        run_subagent(
+            prompt=prompt,
+            description=description,
+            subagent_type=normalized_type,
+            workspace_dir=workspace,
+        )
+    )
+    session_id = _current_session_id()
+    if session_id:
+        SessionStore(workspace).add_subagent_task(
+            session_id,
+            {
+                "agent_id": payload["agent_id"],
+                "status": "completed",
+                "description": description,
+                "subagent_type": normalized_type,
+                "result": payload["result"],
+                "duration_seconds": payload["duration_seconds"],
+            },
+        )
+    return json.dumps(
+        {
+            "status": "completed",
+            "agent_id": payload["agent_id"],
+            "description": description,
+            "subagent_type": normalized_type,
+            "content": payload["result"],
+            "duration_seconds": payload["duration_seconds"],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@tool
+def get_subagent_task(agent_id: str) -> str:
+    """Get the status of a background subagent task."""
+    task = _SUBAGENT_MANAGER.get_task((agent_id or "").strip(), workspace_dir=_workspace_root())
+    if task is None:
+        return json.dumps({"error": "Subagent task not found."}, ensure_ascii=False, indent=2)
+    return json.dumps(task, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=SendMessageInput)
+def SendMessage(agent_id: str, message: str) -> str:
+    """Send a message to a background subagent mailbox."""
+    ok = _SUBAGENT_MANAGER.send_message(
+        (agent_id or "").strip(),
+        (message or "").strip(),
+        workspace_dir=_workspace_root(),
+    )
+    if not ok:
+        return json.dumps({"success": False, "error": "Target subagent not found."}, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "success": True,
+            "agent_id": agent_id,
+            "message": "Message queued for subagent.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @tool(args_schema=RunPythonFileInput)
@@ -968,6 +1114,7 @@ _FILE_TOOLS: list[Any] = [
     run_python_file,
 ]
 _SEARCH_TOOLS: list[Any] = [web_search, web_fetch]
+_AGENT_TOOLS: list[Any] = [Agent, get_subagent_task, SendMessage]
 
 
 async def get_all_tools(
@@ -976,7 +1123,7 @@ async def get_all_tools(
     """Return the complete tool list: local search, file ops, and 12306 tools."""
     if workspace_dir is not None:
         set_allowed_root(workspace_dir)
-    tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS)
+    tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
     try:
         ticket_tools = await load_12306_tools(cwd=str(workspace_dir or os.getcwd()))
         tools.extend(ticket_tools)

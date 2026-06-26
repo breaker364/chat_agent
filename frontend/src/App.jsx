@@ -19,6 +19,7 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
+  RefreshCw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -257,6 +258,49 @@ function DebugSidebar({ open, events, loading, onToggle, onClear }) {
   );
 }
 
+function SubagentTaskCard({ task, onSendMessage }) {
+  const [message, setMessage] = useState("");
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="subagent-card">
+      <div className="subagent-card-header">
+        <div className="subagent-card-title">{task.description || task.agent_id}</div>
+        <div className={`subagent-status subagent-status-${task.status || "idle"}`}>{task.status || "idle"}</div>
+      </div>
+      <div className="subagent-card-meta">{task.subagent_type || "general-purpose"}</div>
+      {(task.result || task.error) ? (
+        <>
+          <button className="debug-toggle" onClick={() => setExpanded((value) => !value)}>
+            {expanded ? "hide result" : "show result"}
+          </button>
+          {expanded ? <pre className="tool-args">{task.result || task.error}</pre> : null}
+        </>
+      ) : null}
+      <div className="subagent-message-row">
+        <input
+          className="subagent-message-input"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder="Send message to subagent"
+        />
+        <button
+          className="session-toolbar-btn"
+          onClick={() => {
+            const text = message.trim();
+            if (!text) return;
+            onSendMessage(task.agent_id, text);
+            setMessage("");
+          }}
+          title="Send message"
+        >
+          <Send size={14} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SessionSidebar({
   sessions,
   activeSessionId,
@@ -358,8 +402,12 @@ export default function App() {
   const [streamingText, setStreamingText] = useState("");
   const [toolEvents, setToolEvents] = useState([]);
   const [debugEvents, setDebugEvents] = useState([]);
+  const [subagentTasks, setSubagentTasks] = useState([]);
+  const [subagentNotifications, setSubagentNotifications] = useState([]);
   const [debugOpen, setDebugOpen] = useState(!readDebugCollapsed());
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(readSidebarCollapsed);
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const chatAreaRef = useRef(null);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
 
@@ -372,8 +420,8 @@ export default function App() {
     []
   );
 
-  const scrollDown = useCallback(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const scrollDown = useCallback((behavior = "auto") => {
+    chatEndRef.current?.scrollIntoView({ behavior });
   }, []);
 
   const refreshSessions = useCallback(async () => {
@@ -389,7 +437,8 @@ export default function App() {
     }
   }, []);
 
-  const loadSession = useCallback(async (sessionId) => {
+  const loadSession = useCallback(async (sessionId, options = {}) => {
+    const { scrollToBottom = true } = options;
     try {
       const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -397,17 +446,29 @@ export default function App() {
       setActiveSessionId(data.session_id);
       writeLastSessionId(data.session_id);
       setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
+      setSubagentTasks(data.subagent_tasks || []);
+      setSubagentNotifications(data.subagent_notifications || []);
+      if (scrollToBottom) {
+        setShouldAutoScroll(true);
+        requestAnimationFrame(() => scrollDown("auto"));
+      }
       return data.session_id;
     } catch {
       setActiveSessionId(sessionId);
       writeLastSessionId(sessionId);
       return sessionId;
     }
-  }, [defaultAssistantMessage]);
+  }, [defaultAssistantMessage, scrollDown]);
+
+  const refreshActiveSession = useCallback(async () => {
+    if (!activeSessionId) return null;
+    return loadSession(activeSessionId, { scrollToBottom: false });
+  }, [activeSessionId, loadSession]);
 
   useEffect(() => {
-    scrollDown();
-  }, [messages, streamingText, toolEvents, scrollDown]);
+    if (!shouldAutoScroll) return;
+    scrollDown("auto");
+  }, [messages, streamingText, toolEvents, shouldAutoScroll, scrollDown]);
 
   useEffect(() => {
     writeSidebarCollapsed(sessionSidebarCollapsed);
@@ -416,6 +477,18 @@ export default function App() {
   useEffect(() => {
     writeDebugCollapsed(!debugOpen);
   }, [debugOpen]);
+
+  useEffect(() => {
+    if (!activeSessionId) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        await refreshActiveSession();
+      } catch {
+        // ignore polling failures
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [activeSessionId, refreshActiveSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -428,7 +501,7 @@ export default function App() {
           const matchedSession = rememberedSessionId
             ? sessionList.find((session) => session.session_id === rememberedSessionId)
             : null;
-          await loadSession((matchedSession || sessionList[0]).session_id);
+          await loadSession((matchedSession || sessionList[0]).session_id, { scrollToBottom: true });
         } else {
           const sessionId = makeSessionId();
           const resp = await fetch(`${API_BASE}/sessions`, {
@@ -438,7 +511,7 @@ export default function App() {
           });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           await refreshSessions();
-          await loadSession(sessionId);
+          await loadSession(sessionId, { scrollToBottom: true });
         }
       } catch {
         const sessionId = makeSessionId();
@@ -472,7 +545,7 @@ export default function App() {
         body: JSON.stringify({ session_id: sessionId }),
       });
       await refreshSessions();
-      await loadSession(sessionId);
+      await loadSession(sessionId, { scrollToBottom: true });
     } catch {
       setActiveSessionId(sessionId);
       setMessages([defaultAssistantMessage]);
@@ -487,6 +560,8 @@ export default function App() {
     }
     setDebugEvents([]);
     setToolEvents([]);
+    setSubagentTasks([]);
+    setSubagentNotifications([]);
     setStreamingText("");
   }, [defaultAssistantMessage, loadSession, refreshSessions]);
 
@@ -520,7 +595,7 @@ export default function App() {
     if (session.session_id === activeSessionId) {
       const rememberedSessionId = nextSessions[0]?.session_id || makeSessionId();
       if (nextSessions.length) {
-        await loadSession(rememberedSessionId);
+        await loadSession(rememberedSessionId, { scrollToBottom: true });
       } else {
         setActiveSessionId(rememberedSessionId);
         writeLastSessionId(rememberedSessionId);
@@ -552,6 +627,18 @@ export default function App() {
       },
     ]);
   }, []);
+
+  const handleSendSubagentMessage = useCallback(async (agentId, message) => {
+    const resp = await fetch(`${API_BASE}/subagents/${encodeURIComponent(agentId)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        message,
+      }),
+    });
+    if (!resp.ok) return;
+    await refreshActiveSession();
+  }, [refreshActiveSession]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -682,6 +769,7 @@ export default function App() {
         },
       ]);
       await refreshSessions();
+      await loadSession(ensuredSessionId, { scrollToBottom: false });
     } catch (err) {
       if (err.name === "AbortError") {
         setMessages((prev) => [
@@ -743,7 +831,16 @@ export default function App() {
           </div>
         </header>
 
-        <main className="chat-area">
+        <main
+          className="chat-area"
+          ref={chatAreaRef}
+          onScroll={() => {
+            const node = chatAreaRef.current;
+            if (!node) return;
+            const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+            setShouldAutoScroll(nearBottom);
+          }}
+        >
           <div className="messages-container">
             {messages.map((msg, i) => (
               <div key={i} className="message-group">
@@ -812,11 +909,43 @@ export default function App() {
 
       <DebugSidebar
         open={debugOpen}
-        events={debugEvents}
+        events={[
+          ...subagentNotifications.map((item) => ({
+            message: item.message,
+            stage: "subagent_notification",
+            elapsed_seconds: null,
+            details: item,
+          })),
+          ...debugEvents,
+        ]}
         loading={loading}
         onToggle={() => setDebugOpen((v) => !v)}
         onClear={() => setDebugEvents([])}
       />
+      {debugOpen ? (
+        <aside className="subagent-sidebar">
+          <div className="subagent-sidebar-header">
+            <div>
+              <div className="debug-sidebar-title">Subagents</div>
+              <div className="debug-sidebar-subtitle">{subagentTasks.length} tasks</div>
+            </div>
+            <button className="session-toolbar-btn" onClick={refreshActiveSession} title="Refresh subagents">
+              <RefreshCw size={14} />
+            </button>
+          </div>
+          <div className="subagent-sidebar-body">
+            {subagentTasks.length
+              ? subagentTasks.map((task) => (
+                  <SubagentTaskCard
+                    key={task.agent_id}
+                    task={task}
+                    onSendMessage={handleSendSubagentMessage}
+                  />
+                ))
+              : <div className="debug-empty">No subagent tasks yet.</div>}
+          </div>
+        </aside>
+      ) : null}
     </div>
   );
 }

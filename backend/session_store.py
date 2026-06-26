@@ -58,6 +58,8 @@ class SessionStore:
                     "updated_at": data.get("updated_at"),
                     "message_count": len(data.get("messages", [])),
                     "task_progress": data.get("task_progress", {}),
+                    "subagent_tasks": data.get("subagent_tasks", []),
+                    "subagent_notifications": data.get("subagent_notifications", []),
                 }
             )
         return sessions
@@ -71,6 +73,10 @@ class SessionStore:
             data["task_progress"] = self.default_progress()
         if "messages" not in data:
             data["messages"] = []
+        if "subagent_tasks" not in data:
+            data["subagent_tasks"] = []
+        if "subagent_notifications" not in data:
+            data["subagent_notifications"] = []
         return data
 
     def default_progress(self) -> dict[str, Any]:
@@ -94,6 +100,8 @@ class SessionStore:
             "updated_at": _now_iso(),
             "messages": [],
             "task_progress": self.default_progress(),
+            "subagent_tasks": [],
+            "subagent_notifications": [],
         }
         self.save_session(session)
         return session
@@ -170,6 +178,38 @@ class SessionStore:
         progress = session.setdefault("task_progress", self.default_progress())
         progress.update(updates)
         progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def add_subagent_task(self, session_id: str, task: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        tasks = session.setdefault("subagent_tasks", [])
+        tasks = [item for item in tasks if item.get("agent_id") != task.get("agent_id")]
+        tasks.insert(0, task)
+        session["subagent_tasks"] = tasks[:50]
+        self.save_session(session)
+        return session
+
+    def update_subagent_task(self, session_id: str, task: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        tasks = session.setdefault("subagent_tasks", [])
+        updated = False
+        for index, item in enumerate(tasks):
+            if item.get("agent_id") == task.get("agent_id"):
+                tasks[index] = {**item, **task}
+                updated = True
+                break
+        if not updated:
+            tasks.insert(0, task)
+        session["subagent_tasks"] = tasks[:50]
+        self.save_session(session)
+        return session
+
+    def add_subagent_notification(self, session_id: str, notification: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        notifications = session.setdefault("subagent_notifications", [])
+        notifications.insert(0, notification)
+        session["subagent_notifications"] = notifications[:200]
         self.save_session(session)
         return session
 
