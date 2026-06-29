@@ -11,6 +11,7 @@ LEGACY_LLM_CONFIG_PATH = Path(
     r"D:\NoobhekProject\cae-fusion-demo\code\LLM_tools\llm_provider_deepseek.json"
 )
 DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
+DEFAULT_MCD_MCP_URL = "https://mcp.mcd.cn"
 
 
 def _resolve_config_path(config_path: str | Path | None = None) -> Path:
@@ -68,6 +69,26 @@ def load_tavily_config(config_path: str | Path | None = None) -> dict[str, str |
     return {
         "base_url": base_url,
         "api_key": api_key,
+        "config_path": str(data["config_path"]),
+    }
+
+
+def load_mcd_mcp_config(config_path: str | Path | None = None) -> dict[str, str | None]:
+    """Load McDonald's MCP configuration from env or config JSON."""
+    data = load_app_config(config_path)
+    url = (
+        os.environ.get("MCD_MCP_URL")
+        or str(data.get("mcd_mcp_url", "")).strip()
+        or DEFAULT_MCD_MCP_URL
+    ).rstrip("/")
+    token = (
+        os.environ.get("MCD_MCP_TOKEN")
+        or str(data.get("mcd_mcp_token", "")).strip()
+        or None
+    )
+    return {
+        "url": url,
+        "token": token,
         "config_path": str(data["config_path"]),
     }
 

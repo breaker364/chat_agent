@@ -22,7 +22,8 @@ import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
-from langchain_mcp_adapters.sessions import StdioConnection
+from langchain_mcp_adapters.sessions import StdioConnection, StreamableHttpConnection
+from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -39,6 +40,7 @@ from .adapters import (
 from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
+from .config import load_mcd_mcp_config
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ _MAX_FETCH_REDIRECTS = 10
 _PYTHON_RUN_TIMEOUT_SECONDS = 60
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
 _MAX_PARALLEL_SEARCH_ROUTES = 2
+_DOWNLOAD_DIR_NAME = "tmp"
 _SUBAGENT_MANAGER = get_subagent_manager()
 _CURRENT_SESSION_ID_ENV = "CHAT_AGENT_SESSION_ID"
 
@@ -109,6 +112,12 @@ def _ensure_allowed(path: str) -> Path:
 
 def _workspace_root() -> Path:
     return Path(_ALLOWED_ROOT or os.getcwd()).resolve()
+
+
+def _download_dir() -> Path:
+    path = _workspace_root() / _DOWNLOAD_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _current_session_id() -> str:
@@ -193,6 +202,21 @@ class SendMessageInput(BaseModel):
 
     agent_id: str = Field(..., description="Target background subagent ID.")
     message: str = Field(..., description="Message to deliver to the target subagent.")
+
+
+class WebFetchInput(BaseModel):
+    """Arguments for fetching a webpage or downloading a file."""
+
+    url: str = Field(..., description="Public HTTP or HTTPS URL.")
+    prompt: str = Field("", description="Optional extraction prompt for textual webpage content.")
+    download: bool = Field(False, description="If true, download the URL as a file into the workspace tmp directory.")
+
+
+class RecentMcdOrdersInput(BaseModel):
+    """Arguments for querying recent McDonald's mall orders."""
+
+    last_id: int = Field(0, description="Pagination cursor. Use 0 for the latest page.")
+    size: int = Field(10, description="Number of orders to query, capped at 10.")
 
 
 # ---------------------------------------------------------------------------
@@ -961,11 +985,84 @@ def _format_fetch_redirect(redirect: RedirectInfo, prompt: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-@tool
-def web_fetch(url: str, prompt: str = "") -> str:
+def _infer_download_filename(url: str, content_type: str | None = None) -> str:
+    parsed = urlparse(url)
+    name = Path(parsed.path).name.strip()
+    extension = ""
+    if content_type:
+        lowered = content_type.lower()
+        if "pdf" in lowered:
+            extension = ".pdf"
+        elif "zip" in lowered:
+            extension = ".zip"
+        elif "json" in lowered:
+            extension = ".json"
+        elif "csv" in lowered:
+            extension = ".csv"
+        elif "png" in lowered:
+            extension = ".png"
+        elif "jpeg" in lowered or "jpg" in lowered:
+            extension = ".jpg"
+    if name:
+        if "." in name or not extension:
+            return name
+        return f"{name}{extension}"
+    return f"download-{int(time.time() * 1000)}{extension}"
+
+
+def _download_binary_url(url: str) -> str:
+    started_at = time.monotonic()
+    response = _fetch_url_with_permitted_redirects(url)
+    if isinstance(response, dict):
+        return _format_fetch_redirect(
+            RedirectInfo(
+                original_url=response["original_url"],
+                redirect_url=response["redirect_url"],
+                status_code=response["status_code"],
+            ),
+            prompt="",
+        )
+
+    response.raise_for_status()
+    content_type = response.headers.get("Content-Type", "")
+    filename = _infer_download_filename(str(response.url), content_type)
+    target = _download_dir() / filename
+    target.write_bytes(response.content)
+    payload = {
+        "url": str(response.url),
+        "code": response.status_code,
+        "code_text": response.reason,
+        "bytes": len(response.content),
+        "content_type": content_type or "application/octet-stream",
+        "downloaded": True,
+        "saved_path": str(target),
+        "duration_seconds": round(time.monotonic() - started_at, 3),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _is_safe_tool_schema(tool: Any) -> bool:
+    try:
+        schema = getattr(tool, "args_schema", None)
+        if isinstance(schema, dict):
+            payload = schema
+        elif hasattr(schema, "model_json_schema"):
+            payload = schema.model_json_schema()
+        elif hasattr(schema, "schema"):
+            payload = schema.schema()
+        else:
+            payload = {}
+        return payload.get("type") in {None, "object"}
+    except Exception:
+        return False
+
+
+@tool(args_schema=WebFetchInput)
+def web_fetch(url: str, prompt: str = "", download: bool = False) -> str:
     """Fetch a webpage, process with the prompt, and return a result.
 
     - Fetches the URL, converts HTML to text/Markdown.
+    - If `download=true`, downloads the URL as a file into the workspace `tmp/` directory.
     - If Tavily Extract is configured (TAVILY_BASE_URL), returns clean Markdown directly.
     - When `prompt` is provided, a secondary model processes the content
       to answer your prompt, and the answer is returned in the `result` field.
@@ -976,6 +1073,18 @@ def web_fetch(url: str, prompt: str = "") -> str:
     """
     if not _validate_public_url(url):
         return json.dumps({"url": url, "error": "Invalid URL."}, ensure_ascii=False, indent=2)
+
+    if download:
+        try:
+            return _download_binary_url(url)
+        except requests.Timeout:
+            return json.dumps(
+                {"url": url, "error": f"Timed out after {_FETCH_TIMEOUT_SECONDS}s while downloading the file."},
+                ensure_ascii=False,
+                indent=2,
+            )
+        except Exception as exc:
+            return json.dumps({"url": url, "error": str(exc)}, ensure_ascii=False, indent=2)
 
     # Cache check (keyed by url only — prompt variations share the same fetched content)
     cache_key = json.dumps({"url": url}, ensure_ascii=False, sort_keys=True)
@@ -1100,6 +1209,79 @@ async def load_12306_tools(
     return await load_mcp_tools(session=None, connection=connection)
 
 
+async def load_mcd_tools(
+    config_path: str | Path | None = None,
+) -> list[Any]:
+    """Connect to the McDonald's MCP server via Streamable HTTP."""
+    cfg = load_mcd_mcp_config(config_path)
+    token = (cfg.get("token") or "").strip()
+    if not token:
+        raise ValueError("MCD_MCP_TOKEN is not configured.")
+    connection: StreamableHttpConnection = {
+        "transport": "streamable_http",
+        "url": str(cfg["url"]),
+        "headers": {
+            "Authorization": f"Bearer {token}",
+        },
+    }
+    tools = await load_mcp_tools(
+        session=None,
+        connection=connection,
+        server_name="mcd-mcp",
+    )
+    safe_tools: list[Any] = []
+    for tool in tools:
+        if getattr(tool, "name", "") == "mall-order-list":
+            logger.warning("Replacing mcd MCP tool with local wrapper due to schema incompatibility: %s", tool.name)
+            continue
+        if _is_safe_tool_schema(tool):
+            safe_tools.append(tool)
+        else:
+            logger.warning("Skipping incompatible mcd MCP tool schema: %s", getattr(tool, "name", "<unknown>"))
+    return safe_tools
+
+
+async def _query_recent_mcd_orders_direct(last_id: int = 0, size: int = 10) -> dict[str, Any]:
+    cfg = load_mcd_mcp_config()
+    token = (cfg.get("token") or "").strip()
+    if not token:
+        raise ValueError("MCD_MCP_TOKEN is not configured.")
+    connection: StreamableHttpConnection = {
+        "transport": "streamable_http",
+        "url": str(cfg["url"]),
+        "headers": {
+            "Authorization": f"Bearer {token}",
+        },
+    }
+    async with create_session(connection) as session:
+        from mcp import types as mcp_types
+
+        await session.initialize()
+        result = await session.send_request(
+            mcp_types.ClientRequest(
+                mcp_types.CallToolRequest(
+                    params=mcp_types.CallToolRequestParams(
+                        name="mall-order-list",
+                        arguments={
+                            "lastId": last_id,
+                            "size": min(max(int(size), 1), 10),
+                        },
+                    )
+                )
+            ),
+            mcp_types.CallToolResult,
+        )
+        payload = result.model_dump() if hasattr(result, "model_dump") else result.dict()
+        return payload
+
+
+@tool(args_schema=RecentMcdOrdersInput)
+def query_recent_mcd_orders(last_id: int = 0, size: int = 10) -> str:
+    """Query the user's recent McDonald's mall orders."""
+    payload = _run_coro_in_thread(_query_recent_mcd_orders_direct(last_id=last_id, size=size))
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Tool collections
 # ---------------------------------------------------------------------------
@@ -1114,7 +1296,7 @@ _FILE_TOOLS: list[Any] = [
     run_python_file,
 ]
 _SEARCH_TOOLS: list[Any] = [web_search, web_fetch]
-_AGENT_TOOLS: list[Any] = [Agent, get_subagent_task, SendMessage]
+_AGENT_TOOLS: list[Any] = [Agent, get_subagent_task, SendMessage, query_recent_mcd_orders]
 
 
 async def get_all_tools(
@@ -1129,4 +1311,9 @@ async def get_all_tools(
         tools.extend(ticket_tools)
     except Exception as exc:
         logger.warning("12306 MCP tools unavailable: %s", exc)
+    try:
+        mcd_tools = await load_mcd_tools()
+        tools.extend(mcd_tools)
+    except Exception as exc:
+        logger.warning("mcd MCP tools unavailable: %s", exc)
     return tools
