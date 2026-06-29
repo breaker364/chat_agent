@@ -414,7 +414,8 @@ export default function App() {
   const defaultAssistantMessage = useMemo(
     () => ({
       role: "assistant",
-      content: "I am Chat Agent. I can search the web, inspect files, and query 12306 tickets.",
+      content:
+        "Chat Agent is ready. I can search the web, read files, and work with tools — just describe what you need.",
       tools: [],
     }),
     []
@@ -891,7 +892,7 @@ export default function App() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Type a message and press Enter..."
+              placeholder="Send a message…"
               rows={1}
               disabled={loading}
             />
