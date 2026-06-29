@@ -53,6 +53,7 @@ SYSTEM_PROMPT = (
     "- `run_python_file` accepts a workspace-relative path or an absolute path outside the workspace.\n"
     "- Pass script command-line input with the `cli_args` field, not `args`.\n"
     "- Use the `python_executable` field when a specific interpreter or virtual environment is required.\n"
+    "- 如果一个文件被占用而无法修改，则创建副本，在新的副本上进行修改.\n"
     "- Inspect the script before executing it if the runtime behavior is unclear, especially for external scripts.\n\n"
     "--- Subagents ---\n"
     "- Use `Agent` when a task is better handled as a scoped subtask with independent reasoning.\n"
