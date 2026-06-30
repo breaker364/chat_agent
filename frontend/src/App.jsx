@@ -20,6 +20,15 @@ import {
   ChevronLeft,
   ChevronRight,
   RefreshCw,
+  Zap,
+  Code,
+  PlusCircle,
+  Download,
+  Play,
+  X,
+  Sparkles,
+  Expand,
+  Minimize,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -258,8 +267,7 @@ function DebugSidebar({ open, events, loading, onToggle, onClear }) {
   );
 }
 
-function SubagentTaskCard({ task, onSendMessage }) {
-  const [message, setMessage] = useState("");
+function SubagentTaskCard({ task }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -277,26 +285,6 @@ function SubagentTaskCard({ task, onSendMessage }) {
           {expanded ? <pre className="tool-args">{task.result || task.error}</pre> : null}
         </>
       ) : null}
-      <div className="subagent-message-row">
-        <input
-          className="subagent-message-input"
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="Send message to subagent"
-        />
-        <button
-          className="session-toolbar-btn"
-          onClick={() => {
-            const text = message.trim();
-            if (!text) return;
-            onSendMessage(task.agent_id, text);
-            setMessage("");
-          }}
-          title="Send message"
-        >
-          <Send size={14} />
-        </button>
-      </div>
     </div>
   );
 }
@@ -359,6 +347,276 @@ function SessionSidebar({
   );
 }
 
+// ============================================================
+// HTML Diagram Renderer (iframe-based)
+// ============================================================
+function extractHtmlContent(text) {
+  if (!text) return null;
+  // Try to extract HTML from a markdown code block
+  const codeBlockMatch = text.match(/```html\s*\n?([\s\S]*?)```/i);
+  if (codeBlockMatch) return codeBlockMatch[1].trim();
+  // Check if the text itself starts with HTML
+  if (/^\s*<!DOCTYPE html/i.test(text) || /^\s*<html/i.test(text)) return text.trim();
+  return null;
+}
+
+function hasHtmlContent(text) {
+  return extractHtmlContent(text) !== null;
+}
+
+function DiagramIframe({ htmlContent, title }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!htmlContent) return null;
+
+  // Create blob URL for the HTML
+  const blob = new Blob([htmlContent], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+
+  return (
+    <div className={`diagram-container ${expanded ? "diagram-expanded" : ""}`}>
+      <div className="diagram-toolbar">
+        <span className="diagram-title">{title || "Architecture Diagram"}</span>
+        <div className="diagram-actions">
+          <button
+            className="diagram-action-btn"
+            onClick={() => setExpanded((v) => !v)}
+            title={expanded ? "Collapse" : "Expand"}
+          >
+            {expanded ? <Minimize size={14} /> : <Expand size={14} />}
+          </button>
+          <a
+            className="diagram-action-btn"
+            href={url}
+            download="architecture-diagram.html"
+            title="Download HTML"
+          >
+            <Download size={14} />
+          </a>
+        </div>
+      </div>
+      <div className="diagram-frame-wrapper">
+        <iframe
+          className="diagram-frame"
+          src={url}
+          title={title || "Architecture Diagram"}
+          sandbox="allow-scripts"
+          loading="lazy"
+          onLoad={(e) => {
+            // Release the blob URL after load to free memory
+            // but keep it accessible for the iframe
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Skill Popup Component
+// ============================================================
+function SkillPopup({
+  installedSkills,
+  availableSkills,
+  selectedSkill,
+  skillParams,
+  skillResult,
+  skillLoading,
+  skillTab,
+  onClose,
+  onInstall,
+  onUninstall,
+  onSelectSkill,
+  onParamChange,
+  onExecute,
+  onTabChange,
+}) {
+  if (!Array.isArray(installedSkills)) installedSkills = [];
+  if (!Array.isArray(availableSkills)) availableSkills = [];
+
+  const htmlContent = skillResult?.type === "success" ? extractHtmlContent(skillResult.content) : null;
+
+  return (
+    <div className="skill-overlay" onClick={onClose}>
+      <div className="skill-popup" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="skill-popup-header">
+          <div className="skill-popup-title">
+            <Zap size={18} />
+            <span>Skills</span>
+          </div>
+          <button className="skill-popup-close" onClick={onClose} title="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Tabs */}
+        <div className="skill-popup-tabs">
+          <button
+            className={`skill-tab ${skillTab === "installed" ? "active" : ""}`}
+            onClick={() => onTabChange("installed")}
+          >
+            <Download size={14} />
+            Installed ({installedSkills.length})
+          </button>
+          <button
+            className={`skill-tab ${skillTab === "available" ? "active" : ""}`}
+            onClick={() => onTabChange("available")}
+          >
+            <PlusCircle size={14} />
+            Available ({availableSkills.length})
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="skill-popup-body">
+          {skillTab === "installed" && (
+            <div className="skill-list">
+              {installedSkills.length === 0 ? (
+                <div className="skill-empty">No installed skills. Switch to "Available" to install one.</div>
+              ) : (
+                installedSkills.map((skill) => (
+                  <div
+                    key={skill.name}
+                    className={`skill-item ${selectedSkill?.name === skill.name ? "selected" : ""}`}
+                    onClick={() => onSelectSkill(skill)}
+                  >
+                    <div className="skill-item-icon">
+                      <Code size={16} />
+                    </div>
+                    <div className="skill-item-content">
+                      <div className="skill-item-name">{skill.name}</div>
+                      <div className="skill-item-desc">{skill.description}</div>
+                    </div>
+                    <button
+                      className="skill-item-action danger"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onUninstall(skill.name);
+                      }}
+                      title="Uninstall"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {skillTab === "available" && (
+            <div className="skill-list">
+              {availableSkills.length === 0 ? (
+                <div className="skill-empty">No additional skills available in the registry.</div>
+              ) : (
+                availableSkills.map((skill) => (
+                  <div
+                    key={skill.name}
+                    className={`skill-item ${selectedSkill?.name === skill.name ? "selected" : ""}`}
+                    onClick={() => onSelectSkill(skill)}
+                  >
+                    <div className="skill-item-icon">
+                      <Sparkles size={16} />
+                    </div>
+                    <div className="skill-item-content">
+                      <div className="skill-item-name">{skill.name}</div>
+                      <div className="skill-item-desc">{skill.description}</div>
+                    </div>
+                    <button
+                      className="skill-item-action install"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onInstall(skill.name);
+                      }}
+                      title="Install"
+                    >
+                      <PlusCircle size={14} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* Selected skill param form */}
+          {selectedSkill && (
+            <div className="skill-params-section">
+              <div className="skill-params-header">
+                <span>Execute: <strong>{selectedSkill.name}</strong></span>
+              </div>
+              {selectedSkill.params_schema?.properties &&
+                Object.entries(selectedSkill.params_schema.properties).map(([key, prop]) => {
+                  const isRequired = (selectedSkill.params_schema.required || []).includes(key);
+                  const enumValues = prop.enum;
+
+                  return (
+                    <div key={key} className="skill-param-field">
+                      <label className="skill-param-label">
+                        {key}
+                        {isRequired && <span className="skill-required">*</span>}
+                        {prop.description && (
+                          <span className="skill-param-desc"> — {prop.description}</span>
+                        )}
+                      </label>
+                      {enumValues ? (
+                        <div className="skill-param-enum-group">
+                          {enumValues.map((val) => (
+                            <button
+                              key={val}
+                              className={`skill-enum-btn ${skillParams[key] === val ? "active" : ""}`}
+                              onClick={() => onParamChange(key, val)}
+                            >
+                              {val}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <textarea
+                          className="skill-param-input"
+                          value={skillParams[key] || ""}
+                          onChange={(e) => onParamChange(key, e.target.value)}
+                          placeholder={prop.description || `Enter ${key}...`}
+                          rows={key === "system_description" ? 4 : 2}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+
+              <button
+                className="skill-execute-btn"
+                onClick={onExecute}
+                disabled={skillLoading}
+              >
+                {skillLoading ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+                {skillLoading ? "Executing..." : "Execute"}
+              </button>
+
+              {/* Result display — show rendered diagram if HTML, otherwise show text */}
+              {skillResult && (
+                <div className={`skill-result ${skillResult.type}`}>
+                  <div className="skill-result-header">
+                    {skillResult.type === "success" ? (
+                      <><Sparkles size={14} /> Result</>
+                    ) : (
+                      <><X size={14} /> Error</>
+                    )}
+                  </div>
+                  {htmlContent ? (
+                    <DiagramIframe htmlContent={htmlContent} title={selectedSkill?.name} />
+                  ) : (
+                    <pre className="skill-result-content">{skillResult.content}</pre>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function dispatchSseBlock(block, onEvent) {
   const lines = block.split(/\r?\n/);
   let eventType = "";
@@ -393,6 +651,35 @@ function parseSseChunk(buffer, onEvent) {
   return parts[parts.length - 1] || "";
 }
 
+// ============================================================
+// Custom Markdown renderer with diagram support
+// ============================================================
+function ChatMessageContent({ content }) {
+  const htmlContent = useMemo(() => extractHtmlContent(content), [content]);
+
+  // If the content is primarily an HTML diagram, render the diagram and the text
+  if (htmlContent) {
+    // Get text before and after the HTML block
+    const parts = content.split(/```html\s*\n?[\s\S]*?```/i);
+    const textBefore = parts[0]?.trim();
+    const textAfter = parts[1]?.trim();
+
+    return (
+      <div className="message-content">
+        {textBefore && <ReactMarkdown remarkPlugins={[remarkGfm]}>{textBefore}</ReactMarkdown>}
+        <DiagramIframe htmlContent={htmlContent} title="Architecture Diagram" />
+        {textAfter && <ReactMarkdown remarkPlugins={[remarkGfm]}>{textAfter}</ReactMarkdown>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="message-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    </div>
+  );
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -410,6 +697,16 @@ export default function App() {
   const chatAreaRef = useRef(null);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
+
+  // Skill system state
+  const [showSkillPopup, setShowSkillPopup] = useState(false);
+  const [installedSkills, setInstalledSkills] = useState([]);
+  const [availableSkills, setAvailableSkills] = useState([]);
+  const [selectedSkill, setSelectedSkill] = useState(null);
+  const [skillParams, setSkillParams] = useState({});
+  const [skillResult, setSkillResult] = useState(null);
+  const [skillLoading, setSkillLoading] = useState(false);
+  const [skillTab, setSkillTab] = useState("installed");
 
   const defaultAssistantMessage = useMemo(
     () => ({
@@ -629,17 +926,139 @@ export default function App() {
     ]);
   }, []);
 
-  const handleSendSubagentMessage = useCallback(async (agentId, message) => {
-    const resp = await fetch(`${API_BASE}/subagents/${encodeURIComponent(agentId)}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({
-        message,
-      }),
-    });
-    if (!resp.ok) return;
-    await refreshActiveSession();
-  }, [refreshActiveSession]);
+  // --- Skill system helpers ---
+
+  const fetchInstalledSkills = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/skills`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      setInstalledSkills(data.skills || []);
+    } catch {
+      setInstalledSkills([]);
+    }
+  }, []);
+
+  const fetchAvailableSkills = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/skills/available`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      setAvailableSkills(data.skills || []);
+    } catch {
+      setAvailableSkills([]);
+    }
+  }, []);
+
+  const handleInstallSkill = useCallback(async (name) => {
+    try {
+      const resp = await fetch(`${API_BASE}/skills/install`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ name }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      await fetchInstalledSkills();
+      await fetchAvailableSkills();
+    } catch (err) {
+      console.error("Install skill failed:", err);
+    }
+  }, [fetchInstalledSkills, fetchAvailableSkills]);
+
+  const handleUninstallSkill = useCallback(async (name) => {
+    try {
+      const resp = await fetch(`${API_BASE}/skills/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      await fetchInstalledSkills();
+      await fetchAvailableSkills();
+      setSelectedSkill((prev) => (prev?.name === name ? null : prev));
+    } catch (err) {
+      console.error("Uninstall skill failed:", err);
+    }
+  }, [fetchInstalledSkills, fetchAvailableSkills]);
+
+  const handleSelectSkill = useCallback((skill) => {
+    setSelectedSkill(skill);
+    // Initialize params with defaults from schema
+    const defaults = {};
+    if (skill.params_schema?.properties) {
+      for (const [key, prop] of Object.entries(skill.params_schema.properties)) {
+        if (prop.default !== undefined) {
+          defaults[key] = prop.default;
+        } else if (prop.type === "string" && prop.enum?.length) {
+          defaults[key] = prop.enum[0];
+        } else {
+          defaults[key] = "";
+        }
+      }
+    }
+    setSkillParams(defaults);
+    setSkillResult(null);
+  }, []);
+
+  const handleSkillParamChange = useCallback((key, value) => {
+    setSkillParams((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const handleExecuteSkill = useCallback(async () => {
+    if (!selectedSkill) return;
+    setSkillLoading(true);
+    setSkillResult(null);
+    try {
+      const resp = await fetch(`${API_BASE}/skills/${encodeURIComponent(selectedSkill.name)}/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ params: skillParams }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setSkillResult({ type: "error", content: data.error || `HTTP ${resp.status}` });
+      } else {
+        setSkillResult({ type: "success", content: data.result });
+        // Also add to chat as a skill execution message
+        const skillMsg = {
+          role: "assistant",
+          content: `**Skill: ${selectedSkill.name}**\n\n${data.result}`,
+          tools: [
+            {
+              type: "tool_call",
+              name: "skill-execute",
+              arguments: { skill: selectedSkill.name, params: skillParams },
+            },
+            {
+              type: "tool_result",
+              name: "skill-execute",
+              content: data.result,
+            },
+          ],
+        };
+        setMessages((prev) => [...prev, skillMsg]);
+      }
+    } catch (err) {
+      setSkillResult({ type: "error", content: `Request failed: ${err.message}` });
+    } finally {
+      setSkillLoading(false);
+    }
+  }, [selectedSkill, skillParams]);
+
+  const handleOpenSkillPopup = useCallback(() => {
+    setShowSkillPopup(true);
+    setSelectedSkill(null);
+    setSkillParams({});
+    setSkillResult(null);
+    fetchInstalledSkills();
+    fetchAvailableSkills();
+  }, [fetchInstalledSkills, fetchAvailableSkills]);
+
+  const handleCloseSkillPopup = useCallback(() => {
+    setShowSkillPopup(false);
+    setSelectedSkill(null);
+    setSkillParams({});
+    setSkillResult(null);
+    setSkillLoading(false);
+  }, []);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -796,10 +1215,16 @@ export default function App() {
       setToolEvents([]);
       abortRef.current = null;
     }
-  }, [activeSessionId, currentHistory, input, loading, refreshSessions]);
+  }, [activeSessionId, currentHistory, input, loading, refreshSessions, loadSession]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
+      // Detect /skill command — open popup instead of sending
+      if (input.trim().toLowerCase() === "/skill") {
+        e.preventDefault();
+        handleOpenSkillPopup();
+        return;
+      }
       e.preventDefault();
       handleSend();
     }
@@ -828,6 +1253,7 @@ export default function App() {
             <span className="badge"><Globe size={12} /> Search</span>
             <span className="badge"><FileText size={12} /> Files</span>
             <span className="badge"><Train size={12} /> 12306</span>
+            <span className="badge"><Zap size={12} /> Skills</span>
             <span className="badge"><TerminalSquare size={12} /> Debug</span>
           </div>
         </header>
@@ -849,9 +1275,7 @@ export default function App() {
                   <div className="message-avatar">
                     {msg.role === "user" ? <User size={16} /> : <Bot size={16} />}
                   </div>
-                  <div className="message-content">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                  </div>
+                  <ChatMessageContent content={msg.content} />
                 </div>
                 {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
               </div>
@@ -864,10 +1288,8 @@ export default function App() {
                 <div className="message-avatar">
                   <Bot size={16} />
                 </div>
-                <div className="message-content">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingText}</ReactMarkdown>
-                  <span className="cursor-blink">|</span>
-                </div>
+                <ChatMessageContent content={streamingText} />
+                <span className="cursor-blink">|</span>
               </div>
             )}
 
@@ -888,11 +1310,19 @@ export default function App() {
 
         <footer className="input-area">
           <div className="input-wrapper">
+            <button
+              className="skill-slash-btn"
+              onClick={handleOpenSkillPopup}
+              title="Open skills (/skill)"
+              disabled={loading}
+            >
+              <Zap size={16} />
+            </button>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Send a message…"
+              placeholder='Send a message… (type "/skill" for skills)'
               rows={1}
               disabled={loading}
             />
@@ -940,13 +1370,32 @@ export default function App() {
                   <SubagentTaskCard
                     key={task.agent_id}
                     task={task}
-                    onSendMessage={handleSendSubagentMessage}
                   />
                 ))
               : <div className="debug-empty">No subagent tasks yet.</div>}
           </div>
         </aside>
       ) : null}
+
+      {/* Skill Popup */}
+      {showSkillPopup && (
+        <SkillPopup
+          installedSkills={installedSkills}
+          availableSkills={availableSkills}
+          selectedSkill={selectedSkill}
+          skillParams={skillParams}
+          skillResult={skillResult}
+          skillLoading={skillLoading}
+          skillTab={skillTab}
+          onClose={handleCloseSkillPopup}
+          onInstall={handleInstallSkill}
+          onUninstall={handleUninstallSkill}
+          onSelectSkill={handleSelectSkill}
+          onParamChange={handleSkillParamChange}
+          onExecute={handleExecuteSkill}
+          onTabChange={setSkillTab}
+        />
+      )}
     </div>
   );
 }

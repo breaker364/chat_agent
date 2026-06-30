@@ -41,6 +41,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import load_mcd_mcp_config
+from .skills import build_skill_tools
 
 logger = logging.getLogger(__name__)
 
@@ -1305,7 +1306,9 @@ async def get_all_tools(
     """Return the complete tool list: local search, file ops, and 12306 tools."""
     if workspace_dir is not None:
         set_allowed_root(workspace_dir)
+    workspace = Path(workspace_dir or os.getcwd()).resolve()
     tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
+    tools.extend(build_skill_tools(workspace))
     try:
         ticket_tools = await load_12306_tools(cwd=str(workspace_dir or os.getcwd()))
         tools.extend(ticket_tools)

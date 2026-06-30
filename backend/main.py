@@ -19,6 +19,14 @@ from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
 from .tools import _CURRENT_SESSION_ID_ENV
+from .skills import (
+    list_installed_skills,
+    get_installed_skill,
+    install_skill_from_registry,
+    uninstall_skill,
+    get_available_skills,
+    execute_skill,
+)
 
 app = FastAPI(title="Chat Agent", docs_url="/docs")
 
@@ -58,6 +66,10 @@ def get_subagent_manager() -> Any:
     return get_runtime_subagent_manager()
 
 
+def _workspace() -> Path:
+    return Path.cwd().resolve()
+
+
 async def get_agent() -> Any:
     global _agent
     if _agent is not None:
@@ -66,7 +78,7 @@ async def get_agent() -> Any:
     async with lock:
         if _agent is not None:
             return _agent
-        workspace = Path.cwd().resolve()
+        workspace = _workspace()
         _agent = await build_agent(
             config_path=None,
             workspace_dir=workspace,
@@ -103,7 +115,7 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _refresh_session_subagent_tasks(session: dict[str, Any]) -> dict[str, Any]:
-    workspace = Path.cwd().resolve()
+    workspace = _workspace()
     tasks = []
     for item in session.get("subagent_tasks", []):
         agent_id = item.get("agent_id", "")
@@ -126,6 +138,102 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Skill endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/skills")
+async def list_skills() -> JSONResponse:
+    """List all installed skills."""
+    ws = _workspace()
+    skills = list_installed_skills(ws)
+    return JSONResponse({"skills": [s.to_dict() for s in skills]})
+
+
+@app.get("/skills/available")
+async def list_available_skills() -> JSONResponse:
+    """List skills from the built-in registry that are not yet installed."""
+    ws = _workspace()
+    skills = get_available_skills(ws)
+    return JSONResponse({"skills": [s.to_dict() for s in skills]})
+
+
+@app.get("/skills/{name:str}")
+async def get_skill_detail(name: str) -> JSONResponse:
+    """Get a single installed skill's detail including params_schema."""
+    ws = _workspace()
+    skill = get_installed_skill(ws, name)
+    if skill is None:
+        return JSONResponse({"error": f"Skill '{name}' is not installed."}, status_code=404)
+    return JSONResponse({"skill": skill.to_dict()})
+
+
+@app.post("/skills/install")
+async def install_skill_api(request: Request) -> JSONResponse:
+    """Install a skill from the built-in registry."""
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return JSONResponse({"error": "Skill name is required."}, status_code=400)
+    ws = _workspace()
+    skill = install_skill_from_registry(ws, name)
+    if skill is None:
+        return JSONResponse(
+            {"error": f"Skill '{name}' not found in the registry. Available skills: architecture-diagram-generator"},
+            status_code=404,
+        )
+    return JSONResponse({"skill": skill.to_dict(), "message": f"Skill '{name}' installed successfully."})
+
+
+@app.delete("/skills/{name:str}")
+async def uninstall_skill_api(name: str) -> JSONResponse:
+    """Uninstall a skill."""
+    ws = _workspace()
+    deleted = uninstall_skill(ws, name)
+    if not deleted:
+        return JSONResponse({"error": f"Skill '{name}' is not installed."}, status_code=404)
+    return JSONResponse({"message": f"Skill '{name}' uninstalled successfully."})
+
+
+@app.post("/skills/{name:str}/execute")
+async def execute_skill_api(name: str, request: Request) -> JSONResponse:
+    """Execute a skill with user-provided parameters.
+
+    Body: { "params": { "system_description": "...", "diagram_type": "architecture" } }
+    """
+    body = await request.json()
+    params = body.get("params", {})
+    if not isinstance(params, dict) or not params:
+        return JSONResponse({"error": "Parameters object is required (e.g. {\"system_description\": \"...\"})."}, status_code=400)
+
+    ws = _workspace()
+    skill = get_installed_skill(ws, name)
+    if skill is None:
+        return JSONResponse({"error": f"Skill '{name}' is not installed."}, status_code=404)
+
+    # Validate required params
+    schema = skill.params_schema or {}
+    required = schema.get("required", [])
+    missing = [r for r in required if r not in params or not str(params.get(r, "")).strip()]
+    if missing:
+        return JSONResponse(
+            {"error": f"Missing required parameter(s): {', '.join(missing)}"},
+            status_code=400,
+        )
+
+    try:
+        result = await execute_skill(ws, name, params)
+        return JSONResponse({"result": result, "skill": name})
+    except Exception as exc:
+        return JSONResponse({"error": f"Skill execution failed: {exc}", "skill": name}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Session & Subagent endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.get("/sessions")
 async def list_sessions() -> JSONResponse:
     return JSONResponse({"sessions": get_session_store().list_sessions()})
@@ -133,7 +241,7 @@ async def list_sessions() -> JSONResponse:
 
 @app.get("/subagents")
 async def list_subagents() -> JSONResponse:
-    subagent_dir = Path.cwd().resolve() / "sessionss" / "subagents"
+    subagent_dir = _workspace() / "sessionss" / "subagents"
     items: list[dict[str, Any]] = []
     if subagent_dir.exists():
         for path in sorted(subagent_dir.glob("*.task.json"), key=lambda item: item.stat().st_mtime, reverse=True):
@@ -146,9 +254,9 @@ async def list_subagents() -> JSONResponse:
 
 @app.get("/subagents/{agent_id}")
 async def get_subagent(agent_id: str) -> JSONResponse:
-    task = get_subagent_manager().get_task(agent_id, workspace_dir=Path.cwd().resolve())
+    task = get_subagent_manager().get_task(agent_id, workspace_dir=_workspace())
     if task is None:
-        task = read_subagent_task_state(Path.cwd().resolve(), agent_id)
+        task = read_subagent_task_state(_workspace(), agent_id)
     if task is None:
         return JSONResponse({"error": "Subagent not found"}, status_code=404)
     return JSONResponse(task)
@@ -163,11 +271,11 @@ async def send_message_to_subagent(agent_id: str, request: Request) -> JSONRespo
     ok = get_subagent_manager().send_message(
         agent_id,
         message,
-        workspace_dir=Path.cwd().resolve(),
+        workspace_dir=_workspace(),
     )
     if not ok:
         return JSONResponse({"error": "Subagent not found"}, status_code=404)
-    task = get_subagent_manager().get_task(agent_id, workspace_dir=Path.cwd().resolve())
+    task = get_subagent_manager().get_task(agent_id, workspace_dir=_workspace())
     return JSONResponse(task or {"ok": True, "agent_id": agent_id})
 
 
@@ -211,6 +319,11 @@ async def delete_session(session_id: str) -> JSONResponse:
     if not deleted:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     return JSONResponse({"ok": True, "session_id": session_id})
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.post("/chat/stream")

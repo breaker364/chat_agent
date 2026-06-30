@@ -1,0 +1,25 @@
+{
+  "name": "architecture-diagram-generator",
+  "description": "Create polished dark-themed architecture diagrams as self-contained HTML+SVG files. Use when the user asks for system, infrastructure, cloud, security, or network topology diagrams.",
+  "version": "1.1.0",
+  "author": "Cocoon AI",
+  "category": "diagram",
+  "icon": "FileText",
+  "params_schema": {
+    "type": "object",
+    "properties": {
+      "system_description": {
+        "type": "string",
+        "description": "Natural language description of the system architecture (components, relationships, data flow)"
+      },
+      "diagram_type": {
+        "type": "string",
+        "enum": ["architecture", "flowchart", "sequence", "component"],
+        "default": "architecture",
+        "description": "Type of diagram to generate"
+      }
+    },
+    "required": ["system_description"]
+  },
+  "prompt_template": "You are an architecture diagram generator. Based on the following system description, generate a **self-contained HTML file** with **inline SVG graphics** that represents the system architecture.\n\n## Output Format\nYou MUST output ONLY the HTML code inside a code block ```html ... ```. Do NOT wrap it in additional explanation. The HTML must be a fully self-contained, runnable file.\n\n## Design System\n\n### Color Palette\nUse these semantic colors for component types:\n| Component Type | Fill (rgba) | Stroke |\n|---------------|-------------|--------|\n| Frontend | rgba(8, 51, 68, 0.4) | #22d3ee (cyan-400) |\n| Backend | rgba(6, 78, 59, 0.4) | #34d399 (emerald-400) |\n| Database | rgba(76, 29, 149, 0.4) | #a78bfa (violet-400) |\n| AWS/Cloud | rgba(120, 53, 15, 0.3) | #fbbf24 (amber-400) |\n| Security | rgba(136, 19, 55, 0.4) | #fb7185 (rose-400) |\n| Message Bus | rgba(251, 146, 60, 0.3) | #fb923c (orange-400) |\n| External/Generic | rgba(30, 41, 59, 0.5) | #94a3b8 (slate-400) |\n\n### Typography\nUse JetBrains Mono for all text. Include: <link href=\"https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&display=swap\" rel=\"stylesheet\">\n\nFont sizes: 12px for component names, 9px for sublabels, 8px for annotations.\n\n### Background\nDark slate background (#020617) with subtle grid pattern using SVG patterns.\n\n### Component Styling\n- Rounded rectangles (rx=\"6\") with 1.5px stroke, semi-transparent fills\n- Security groups: Dashed stroke (stroke-dasharray=\"4,4\"), transparent fill, rose color\n- Region boundaries: Larger dashed stroke (stroke-dasharray=\"8,4\"), amber color, rx=\"12\"\n- Draw an opaque background rect before each component (fill=\"#0f172a\") to mask arrows, then draw semi-transparent styled rect on top\n\n### Arrows\nUse SVG marker for arrowheads. Draw connection arrows early in the SVG (after background grid) so they render behind component boxes.\n\n### Layout Rules\n- Standard component height: 60px for services, 80-120px for larger components\n- Minimum vertical gap between components: 40px\n- Inline connectors (message buses): Place IN the gap between components, not overlapping\n- Place legends OUTSIDE all boundary boxes, at least 20px below the lowest boundary\n\n### HTML Structure\n1. **Header** - Title with subtitle, and export toolbar\n2. **Main SVG diagram** - Contained in rounded border card\n3. **Summary cards** - Grid of 3 cards below diagram with key details\n4. **Footer** - Minimal metadata line\n\n### Export Toolbar\nInclude working Copy (PNG to clipboard), PNG Download, and PDF Download buttons.\nCDN scripts in <head>:\n- https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js\n- https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js\n\n## System Description\n{system_description}\n\n## Diagram Type\n{diagram_type}\n\nBased on the system description, create a {diagram_type} diagram. Choose the appropriate visual style:\n- **architecture**: System architecture showing components and their relationships\n- **flowchart**: Process flow or data flow\n- **sequence**: Interaction sequence between components\n- **component**: Detailed component breakdown\n\nIMPORTANT:\n1. Output ONLY the HTML code block (```html ... ```)\n2. The HTML must be self-contained with all CSS and JS inline\n3. Use the dark theme (#020617 background)\n4. Follow the color palette strictly\n5. Ensure proper spacing between components\n6. Include working export functionality"
+}
