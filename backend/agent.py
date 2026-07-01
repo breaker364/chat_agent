@@ -98,6 +98,7 @@ MAX_BACKGROUND_SUBAGENT_POLLS = 6
 MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_TOTAL_CHARS = 24_000
 MAX_HISTORY_MESSAGE_CHARS = 4_000
+HEARTBEAT_EMIT_INTERVAL_SECONDS = 3
 
 
 def estimate_tokens_from_text(text: str) -> int:
@@ -149,6 +150,7 @@ async def stream_agent_events(
     repair_passes = 0
     launched_background_subagents: list[dict[str, Any]] = []
     launched_background_subagents: list[dict[str, Any]] = []
+    last_heartbeat_emitted_at = 0.0
 
     def to_jsonable(value: Any) -> Any:
         try:
@@ -512,6 +514,10 @@ async def stream_agent_events(
                 if active_tool
                 else "Still waiting for the model to respond..."
             )
+            now = time.monotonic()
+            if now - last_heartbeat_emitted_at < HEARTBEAT_EMIT_INTERVAL_SECONDS:
+                continue
+            last_heartbeat_emitted_at = now
             yield {
                 "event": "progress",
                 "data": json.dumps(

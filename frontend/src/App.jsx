@@ -41,6 +41,7 @@ const API_BASE = "";
 const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
 const SESSION_SIDEBAR_COLLAPSED_KEY = "chat-agent:session-sidebar-collapsed";
 const DEBUG_SIDEBAR_COLLAPSED_KEY = "chat-agent:debug-sidebar-collapsed";
+const FEISHU_PANEL_COLLAPSED_KEY = "chat-agent:feishu-panel-collapsed";
 const MAX_HISTORY_ITEMS = 12;
 const MAX_HISTORY_ITEM_CHARS = 4000;
 
@@ -101,6 +102,22 @@ function compactHistoryContent(text) {
 function writeDebugCollapsed(collapsed) {
   try {
     window.localStorage.setItem(DEBUG_SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function readFeishuCollapsed() {
+  try {
+    return window.localStorage.getItem(FEISHU_PANEL_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeFeishuCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(FEISHU_PANEL_COLLAPSED_KEY, collapsed ? "1" : "0");
   } catch {
     // Ignore localStorage failures.
   }
@@ -365,6 +382,8 @@ function FeishuLoginPanel({
   loginState,
   loading,
   polling,
+  collapsed,
+  onToggleCollapsed,
   onInit,
   onRefresh,
   onLogout,
@@ -376,40 +395,53 @@ function FeishuLoginPanel({
           <QrCode size={16} />
           <span>Feishu Web Login</span>
         </div>
-        <div className={`feishu-status ${status?.logged_in ? "connected" : "disconnected"}`}>
-          {status?.logged_in ? "connected" : "not logged in"}
+        <div className="feishu-panel-header-right">
+          <button className="feishu-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? "Expand login panel" : "Collapse login panel"}>
+            {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+          </button>
+          <div className={`feishu-status ${status?.logged_in ? "connected" : "disconnected"}`}>
+            {status?.logged_in ? "connected" : "not logged in"}
+          </div>
         </div>
       </div>
-      <div className="feishu-panel-actions">
-        <button className="feishu-btn" onClick={onInit} disabled={loading || polling}>
-          <LogIn size={14} />
-          <span>{loading ? "loading..." : polling ? "waiting scan..." : "init qr"}</span>
-        </button>
-        <button className="feishu-btn" onClick={onRefresh}>
-          <RefreshCw size={14} />
-          <span>status</span>
-        </button>
-        <button className="feishu-btn danger" onClick={onLogout}>
-          <LogOut size={14} />
-          <span>logout</span>
-        </button>
-      </div>
-      {loginState?.qr_png_base64 ? (
-        <div className="feishu-qr-block">
-          <img
-            className="feishu-qr-image"
-            src={`data:image/png;base64,${loginState.qr_png_base64}`}
-            alt="Feishu login QR code"
-          />
-          <div className="feishu-qr-hint">Scan in Feishu. Backend is polling automatically.</div>
+      {!collapsed ? (
+        <>
+          <div className="feishu-panel-actions">
+            <button className="feishu-btn" onClick={onInit} disabled={loading || polling}>
+              <LogIn size={14} />
+              <span>{loading ? "loading..." : polling ? "waiting scan..." : "init qr"}</span>
+            </button>
+            <button className="feishu-btn" onClick={onRefresh}>
+              <RefreshCw size={14} />
+              <span>status</span>
+            </button>
+            <button className="feishu-btn danger" onClick={onLogout}>
+              <LogOut size={14} />
+              <span>logout</span>
+            </button>
+          </div>
+          {loginState?.qr_png_base64 ? (
+            <div className="feishu-qr-block">
+              <img
+                className="feishu-qr-image"
+                src={`data:image/png;base64,${loginState.qr_png_base64}`}
+                alt="Feishu login QR code"
+              />
+              <div className="feishu-qr-hint">Scan in Feishu. Backend is polling automatically.</div>
+            </div>
+          ) : null}
+          {loginState?.message ? <div className="feishu-panel-note">{loginState.message}</div> : null}
+          {status?.issued_at ? (
+            <div className="feishu-panel-note">
+              session issued at: {new Date(status.issued_at * 1000).toLocaleString()}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <div className="feishu-panel-collapsed-note">
+          {status?.logged_in ? "Session active" : "Expand to log in"}
         </div>
-      ) : null}
-      {loginState?.message ? <div className="feishu-panel-note">{loginState.message}</div> : null}
-      {status?.issued_at ? (
-        <div className="feishu-panel-note">
-          session issued at: {new Date(status.issued_at * 1000).toLocaleString()}
-        </div>
-      ) : null}
+      )}
     </section>
   );
 }
@@ -790,6 +822,7 @@ export default function App() {
   const [feishuLoginState, setFeishuLoginState] = useState(null);
   const [feishuLoading, setFeishuLoading] = useState(false);
   const [feishuPolling, setFeishuPolling] = useState(false);
+  const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
 
   const defaultAssistantMessage = useMemo(
@@ -826,13 +859,18 @@ export default function App() {
       if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
       if (!ok || !data) throw new Error("Invalid session status response.");
       setFeishuStatus(data);
+      if (data.logged_in) {
+        setFeishuLoginState((prev) => prev?.qr_png_base64 ? { message: "Login session is active." } : prev);
+      } else if (!feishuPolling) {
+        setFeishuLoginState((prev) => (prev?.session ? null : prev));
+      }
       return data;
     } catch {
       const fallback = { logged_in: false, has_session: false, issued_at: null, metadata: {} };
       setFeishuStatus(fallback);
       return fallback;
     }
-  }, []);
+  }, [feishuPolling]);
 
   const loadSession = useCallback(async (sessionId, options = {}) => {
     const { scrollToBottom = true } = options;
@@ -878,6 +916,10 @@ export default function App() {
   }, [debugOpen]);
 
   useEffect(() => {
+    writeFeishuCollapsed(feishuPanelCollapsed);
+  }, [feishuPanelCollapsed]);
+
+  useEffect(() => {
     if (!activeSessionId) return undefined;
     const timer = window.setInterval(async () => {
       try {
@@ -914,6 +956,12 @@ export default function App() {
           await loadSession(sessionId, { scrollToBottom: true });
         }
       } catch {
+        const fallbackSessions = await refreshSessions();
+        if (cancelled) return;
+        if (fallbackSessions?.length) {
+          await loadSession(fallbackSessions[0].session_id, { scrollToBottom: true });
+          return;
+        }
         const sessionId = makeSessionId();
         setActiveSessionId(sessionId);
         writeLastSessionId(sessionId);
@@ -925,6 +973,13 @@ export default function App() {
       cancelled = true;
     };
   }, [defaultAssistantMessage, loadSession, refreshFeishuStatus, refreshSessions]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      refreshFeishuStatus().catch(() => {});
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshFeishuStatus]);
 
   const currentHistory = useMemo(
     () =>
@@ -1263,12 +1318,22 @@ export default function App() {
     const runState = { assistantContent: "", tools: [], debug: [] };
 
     function pushToolEvent(event) {
-      runState.tools.push(event);
+      const last = runState.tools[runState.tools.length - 1];
+      if (event?.type === "progress" && last?.type === "progress") {
+        runState.tools[runState.tools.length - 1] = event;
+      } else {
+        runState.tools.push(event);
+      }
       setToolEvents([...runState.tools]);
     }
 
     function pushDebugEvent(event) {
-      runState.debug.push(event);
+      const last = runState.debug[runState.debug.length - 1];
+      if (event?.stage === "heartbeat" && last?.stage === "heartbeat") {
+        runState.debug[runState.debug.length - 1] = event;
+      } else {
+        runState.debug.push(event);
+      }
       setDebugEvents([...runState.debug]);
     }
 

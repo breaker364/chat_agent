@@ -63,9 +63,11 @@ _FETCH_CACHE_TTL_SECONDS = 900
 _FETCH_TIMEOUT_SECONDS = 15
 _MAX_FETCH_REDIRECTS = 10
 _PYTHON_RUN_TIMEOUT_SECONDS = 60
+_PYTHON_RUN_MAX_TIMEOUT_SECONDS = 120
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
 _MAX_PARALLEL_SEARCH_ROUTES = 2
 _DOWNLOAD_DIR_NAME = "tmp"
+_SUBAGENT_SYNC_TIMEOUT_SECONDS = 120
 _SUBAGENT_MANAGER = get_subagent_manager()
 _CURRENT_SESSION_ID_ENV = "CHAT_AGENT_SESSION_ID"
 
@@ -83,6 +85,27 @@ def _run_coro_in_thread(coro: Any) -> Any:
     thread = Thread(target=_target, daemon=True)
     thread.start()
     ok, value = queue.get()
+    if ok:
+        return value
+    raise value
+
+
+def _run_coro_in_thread_with_timeout(coro: Any, timeout_seconds: int) -> Any:
+    queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            result = asyncio.run(coro)
+            queue.put((True, result))
+        except Exception as exc:
+            queue.put((False, exc))
+
+    thread = Thread(target=_target, daemon=True)
+    thread.start()
+    try:
+        ok, value = queue.get(timeout=max(1, int(timeout_seconds)))
+    except Exception as exc:
+        raise TimeoutError(f"Operation exceeded {timeout_seconds} seconds.") from exc
     if ok:
         return value
     raise value
@@ -629,14 +652,27 @@ def Agent(
             indent=2,
         )
 
-    payload = _run_coro_in_thread(
-        run_subagent(
-            prompt=prompt,
-            description=description,
-            subagent_type=normalized_type,
-            workspace_dir=workspace,
+    try:
+        payload = _run_coro_in_thread_with_timeout(
+            run_subagent(
+                prompt=prompt,
+                description=description,
+                subagent_type=normalized_type,
+                workspace_dir=workspace,
+            ),
+            _SUBAGENT_SYNC_TIMEOUT_SECONDS,
         )
-    )
+    except TimeoutError as exc:
+        return json.dumps(
+            {
+                "status": "failed",
+                "description": description,
+                "subagent_type": normalized_type,
+                "error": str(exc),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     session_id = _current_session_id()
     if session_id:
         SessionStore(workspace).add_subagent_task(
@@ -714,7 +750,7 @@ def run_python_file(
         return json.dumps({"path": str(target), "error": "Only .py files can be executed."}, ensure_ascii=False, indent=2)
 
     try:
-        timeout_value = max(1, int(timeout_seconds))
+        timeout_value = min(_PYTHON_RUN_MAX_TIMEOUT_SECONDS, max(1, int(timeout_seconds)))
     except (TypeError, ValueError):
         timeout_value = _PYTHON_RUN_TIMEOUT_SECONDS
 

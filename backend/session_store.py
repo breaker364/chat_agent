@@ -9,6 +9,7 @@ from uuid import uuid4
 
 SESSION_DIR_NAME = "sessionss"
 MAX_SESSION_TITLE_LENGTH = 40
+_RESERVED_SESSION_FILENAMES = {"feishu_web_session.json"}
 
 
 def _now_iso() -> str:
@@ -39,6 +40,16 @@ class SessionStore:
     def session_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{_slugify_session_id(session_id)}.json"
 
+    def _is_reserved_session_file(self, path: Path) -> bool:
+        return path.name in _RESERVED_SESSION_FILENAMES
+
+    def _looks_like_chat_session(self, data: dict[str, Any]) -> bool:
+        return (
+            isinstance(data, dict)
+            and isinstance(data.get("session_id"), str)
+            and isinstance(data.get("messages", []), list)
+        )
+
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
         for path in sorted(
@@ -46,9 +57,13 @@ class SessionStore:
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         ):
+            if self._is_reserved_session_file(path):
+                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
+                continue
+            if not self._looks_like_chat_session(data):
                 continue
             sessions.append(
                 {
@@ -69,6 +84,8 @@ class SessionStore:
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not self._looks_like_chat_session(data):
+            return None
         if "task_progress" not in data:
             data["task_progress"] = self.default_progress()
         if "messages" not in data:

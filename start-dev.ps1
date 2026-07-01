@@ -111,6 +111,37 @@ function Test-HttpReady {
     }
 }
 
+function Test-TcpPortListening {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    return @(Get-ListeningPidsOnPort -Port $Port).Count -gt 0
+}
+
+function Wait-ForPortListening {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-TcpPortListening -Port $Port) {
+            Write-Host "$Name is listening on port $Port"
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    Write-Warning "$Name did not begin listening on port $Port within $TimeoutSeconds seconds."
+    return $false
+}
+
 function Wait-ForHttpReady {
     param(
         [Parameter(Mandatory = $true)]
@@ -163,6 +194,15 @@ function Get-ListeningPidsOnPort {
         [int]$Port
     )
 
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+                Select-Object -ExpandProperty OwningProcess -Unique)
+        } catch {
+            # Fall back to netstat below.
+        }
+    }
+
     $matches = netstat -ano -p tcp | Select-String "[:.]$Port\s+.*LISTENING\s+(\d+)$"
     $pids = @()
     foreach ($match in $matches) {
@@ -189,12 +229,30 @@ function Stop-ProcessesOnPort {
     Write-Host "Stopping existing $Name process(es) on port ${Port}: $($pids -join ', ')"
     foreach ($processId in $pids) {
         try {
-            Stop-Process -Id $processId -Force -ErrorAction Stop
+            $null = Start-Process `
+                -FilePath "taskkill.exe" `
+                -ArgumentList @("/F", "/T", "/PID", "$processId") `
+                -PassThru `
+                -WindowStyle Hidden `
+                -Wait
         } catch {
             Write-Warning "Failed to stop PID ${processId} on port ${Port}: $($_.Exception.Message)"
         }
     }
-    Start-Sleep -Seconds 1
+
+    $deadline = (Get-Date).AddSeconds(12)
+    while ((Get-Date) -lt $deadline) {
+        $remaining = @(Get-ListeningPidsOnPort -Port $Port)
+        if (-not $remaining.Count) {
+            return
+        }
+        Start-Sleep -Milliseconds 400
+    }
+
+    $remaining = @(Get-ListeningPidsOnPort -Port $Port)
+    if ($remaining.Count) {
+        Write-Warning "$Name port ${Port} is still occupied after kill attempt: $($remaining -join ', ')"
+    }
 }
 
 if (-not (Test-Path $backendDir)) {
@@ -253,7 +311,7 @@ $frontendProcess = Start-BackgroundProcess `
 Write-Host "Frontend PID: $($frontendProcess.Id)"
 
 $null = Wait-ForHttpReady -Url $backendUrl -Name "Backend" -TimeoutSeconds 30
-$frontendReady = Wait-ForHttpReady -Url $frontendUrl -Name "Frontend" -TimeoutSeconds 30
+$frontendReady = Wait-ForPortListening -Port 5173 -Name "Frontend" -TimeoutSeconds 30
 
 if ($frontendReady) {
     Write-Host "Opening browser: $frontendUrl"

@@ -1,7 +1,7 @@
 {
   "base_url": "https://api.deepseek.com",
   "api_key": "sk-5ce7c839b7004c4dbe12935e947d4b90",
-  "model": "deepseek-v4-flash",
+  "model": "deepseek-v4-pro",
   "tavily_base_url": "https://api.tavily.com",
   "tavily_api_key": "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",
   "mcd_mcp_url": "https://mcp.mcd.cn",

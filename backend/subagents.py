@@ -14,6 +14,7 @@ from .config import create_chat_deepseek, load_llm_config
 from .session_events import get_session_event_hub
 
 logger = logging.getLogger(__name__)
+SUBAGENT_MAX_RUNTIME_SECONDS = 180
 
 
 @dataclass
@@ -215,6 +216,7 @@ class AsyncSubagentManager:
         def _thread_runner() -> None:
             try:
                 from .session_store import SessionStore
+                started_at = time.monotonic()
 
                 payload = asyncio.run(
                     run_subagent(
@@ -254,6 +256,8 @@ class AsyncSubagentManager:
                             "created_at": time.time(),
                         },
                     )
+                if time.monotonic() - started_at > SUBAGENT_MAX_RUNTIME_SECONDS:
+                    state["last_notification"] = "Subagent exceeded runtime budget."
             except Exception as exc:
                 logger.exception("Subagent %s failed", agent_id)
                 state["status"] = "failed"
@@ -262,6 +266,22 @@ class AsyncSubagentManager:
 
         Thread(target=_thread_runner, daemon=True).start()
         return dict(state)
+
+    def fail_task(
+        self,
+        agent_id: str,
+        *,
+        workspace_dir: str | Path,
+        error: str,
+    ) -> bool:
+        state = self._tasks.get(agent_id)
+        if state is None:
+            return False
+        state["status"] = "failed"
+        state["error"] = error
+        state["last_notification"] = error
+        self._persist(workspace_dir, agent_id)
+        return True
 
     def get_task(self, agent_id: str, workspace_dir: str | Path | None = None) -> dict[str, Any] | None:
         task = self._tasks.get(agent_id)
