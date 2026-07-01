@@ -41,6 +41,13 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import load_mcd_mcp_config
+from .feishu_web_login import (
+    FeishuWebSessionStore,
+    build_feishu_cookies,
+    init_feishu_qr_login,
+    is_feishu_session_valid,
+    poll_feishu_qr_login,
+)
 from .skills import build_skill_tools
 
 logger = logging.getLogger(__name__)
@@ -121,8 +128,47 @@ def _download_dir() -> Path:
     return path
 
 
+def _feishu_session_store() -> FeishuWebSessionStore:
+    return FeishuWebSessionStore(_workspace_root())
+
+
 def _current_session_id() -> str:
     return (os.environ.get(_CURRENT_SESSION_ID_ENV) or "").strip()
+
+
+def _load_feishu_session_payload() -> dict[str, Any]:
+    payload = _feishu_session_store().load()
+    if not is_feishu_session_valid(payload):
+        raise RuntimeError("Feishu web session is missing or expired. Run Feishu login first.")
+    return payload or {}
+
+
+def _parse_json_object(raw: str, field_name: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must decode to a JSON object.")
+    return parsed
+
+
+def _validate_feishu_target_url(url: str) -> str:
+    normalized = (url or "").strip()
+    if not normalized:
+        raise ValueError("URL is required.")
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https":
+        raise ValueError("Feishu authenticated requests require an HTTPS URL.")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("URL hostname is required.")
+    if "feishu" not in hostname and "larksuite" not in hostname:
+        raise ValueError("Target URL must be a Feishu/Lark domain.")
+    return normalized
 
 
 def _resolve_python_script_path(path: str) -> Path:
@@ -218,6 +264,17 @@ class RecentMcdOrdersInput(BaseModel):
 
     last_id: int = Field(0, description="Pagination cursor. Use 0 for the latest page.")
     size: int = Field(10, description="Number of orders to query, capped at 10.")
+
+
+class FeishuAuthRequestInput(BaseModel):
+    """Arguments for authenticated Feishu web requests."""
+
+    method: str = Field(..., description="HTTP method: GET, POST, PUT, PATCH, or DELETE.")
+    url: str = Field(..., description="Target Feishu HTTPS URL.")
+    json_body: str = Field("", description="Optional JSON object body encoded as a string.")
+    form_body: str = Field("", description="Optional form fields encoded as a JSON object string.")
+    headers: str = Field("", description="Optional extra headers encoded as a JSON object string.")
+    timeout_seconds: int = Field(30, description="Request timeout in seconds.")
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +824,101 @@ def run_python_file(
     )
 
 
+@tool
+def feishu_login_status() -> str:
+    """Return whether a reusable Feishu web session is already stored locally."""
+    payload = _feishu_session_store().load()
+    valid = is_feishu_session_valid(payload)
+    result = {
+        "logged_in": valid,
+        "has_session": bool(payload and payload.get("session")),
+        "issued_at": payload.get("issued_at") if payload else None,
+        "metadata": payload.get("metadata", {}) if payload else {},
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@tool
+def feishu_logout() -> str:
+    """Clear the locally stored Feishu web session."""
+    _feishu_session_store().clear()
+    return json.dumps({"success": True, "message": "Feishu web session cleared."}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=FeishuAuthRequestInput)
+def feishu_web_request(
+    method: str,
+    url: str,
+    json_body: str = "",
+    form_body: str = "",
+    headers: str = "",
+    timeout_seconds: int = 30,
+) -> str:
+    """Send an authenticated Feishu web request with the locally stored web session cookie."""
+    try:
+        normalized_method = (method or "").strip().upper()
+        if normalized_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("Unsupported method. Use GET, POST, PUT, PATCH, or DELETE.")
+        target_url = _validate_feishu_target_url(url)
+        session_payload = _load_feishu_session_payload()
+        json_payload = _parse_json_object(json_body, "json_body")
+        form_payload = _parse_json_object(form_body, "form_body")
+        extra_headers = _parse_json_object(headers, "headers")
+        if json_payload and form_payload:
+            raise ValueError("Provide either json_body or form_body, not both.")
+        timeout_value = max(1, int(timeout_seconds))
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False, indent=2)
+
+    request_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.feishu.cn/",
+        **{str(key): str(value) for key, value in extra_headers.items()},
+    }
+
+    try:
+        response = requests.request(
+            normalized_method,
+            target_url,
+            cookies=build_feishu_cookies(session_payload),
+            headers=request_headers,
+            json=json_payload or None,
+            data=form_payload or None,
+            timeout=timeout_value,
+            allow_redirects=True,
+        )
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type.lower():
+            try:
+                body: Any = response.json()
+            except Exception:
+                body = response.text[:_PYTHON_OUTPUT_MAX_CHARS]
+        else:
+            body = response.text[:_PYTHON_OUTPUT_MAX_CHARS]
+        result = {
+            "success": response.ok,
+            "method": normalized_method,
+            "url": str(response.url),
+            "status_code": response.status_code,
+            "reason": response.reason,
+            "content_type": content_type,
+            "body": body,
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "method": normalized_method,
+                "url": target_url,
+                "error": str(exc),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Web search tool (adapter-based, like Claude Code)
 # ---------------------------------------------------------------------------
@@ -1297,7 +1449,15 @@ _FILE_TOOLS: list[Any] = [
     run_python_file,
 ]
 _SEARCH_TOOLS: list[Any] = [web_search, web_fetch]
-_AGENT_TOOLS: list[Any] = [Agent, get_subagent_task, SendMessage, query_recent_mcd_orders]
+_AGENT_TOOLS: list[Any] = [
+    Agent,
+    get_subagent_task,
+    SendMessage,
+    query_recent_mcd_orders,
+    feishu_login_status,
+    feishu_logout,
+    feishu_web_request,
+]
 
 
 async def get_all_tools(

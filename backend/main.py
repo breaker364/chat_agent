@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,6 +20,12 @@ from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
 from .tools import _CURRENT_SESSION_ID_ENV
+from .feishu_web_login import (
+    FeishuWebSessionStore,
+    init_feishu_qr_login,
+    is_feishu_session_valid,
+    poll_feishu_qr_login,
+)
 from .skills import (
     list_installed_skills,
     get_installed_skill,
@@ -70,6 +77,10 @@ def _workspace() -> Path:
     return Path.cwd().resolve()
 
 
+def get_feishu_session_store() -> FeishuWebSessionStore:
+    return FeishuWebSessionStore(_workspace())
+
+
 async def get_agent() -> Any:
     global _agent
     if _agent is not None:
@@ -93,24 +104,40 @@ def _merge_history(
 ) -> list[dict[str, str]]:
     if not incoming_history:
         return stored_history
-    merged = list(stored_history)
     if incoming_history == stored_history:
-        return merged
+        return list(stored_history)
     if incoming_history[: len(stored_history)] == stored_history:
         return incoming_history
-    return incoming_history
+    # Prefer canonical persisted history; only append truly new trailing items.
+    merged = list(stored_history)
+    overlap = min(len(stored_history), len(incoming_history))
+    if overlap and stored_history[-overlap:] == incoming_history[:overlap]:
+        merged.extend(incoming_history[overlap:])
+        return merged
+    return list(stored_history)
 
 
 def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
+    messages = session.get("messages", [])
+    history_messages = [
+        item for item in messages
+        if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
+    ]
+    history_chars = sum(len(item.get("content", "")) for item in history_messages)
     return {
         "session_id": session.get("session_id"),
         "title": session.get("title"),
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
-        "messages": session.get("messages", []),
+        "messages": messages,
         "task_progress": session.get("task_progress", {}),
         "subagent_tasks": session.get("subagent_tasks", []),
         "subagent_notifications": session.get("subagent_notifications", []),
+        "context_stats": {
+            "history_messages": len(history_messages),
+            "history_chars": history_chars,
+            "history_token_estimate": max(1, (history_chars + 3) // 4) if history_chars else 0,
+        },
     }
 
 
@@ -136,6 +163,70 @@ def _refresh_session_subagent_tasks(session: dict[str, Any]) -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/feishu/login/init")
+async def feishu_login_init() -> JSONResponse:
+    try:
+        state = init_feishu_qr_login()
+    except Exception as exc:
+        return JSONResponse({"error": f"Failed to initialize Feishu QR login: {exc}"}, status_code=500)
+    if not state.flow_key or not state.token:
+        return JSONResponse({"error": "Feishu QR login did not return a valid token/flow_key."}, status_code=502)
+    return JSONResponse(
+        {
+            "token": state.token,
+            "flow_key": state.flow_key,
+            "qr_content": state.qr_content,
+            "qr_png_base64": state.qr_png_base64,
+            "created_at": state.created_at,
+        }
+    )
+
+
+@app.post("/feishu/login/poll")
+async def feishu_login_poll(request: Request) -> JSONResponse:
+    body = await request.json()
+    flow_key = str(body.get("flow_key") or "").strip()
+    if not flow_key:
+        return JSONResponse({"error": "flow_key is required"}, status_code=400)
+    try:
+        result = poll_feishu_qr_login(flow_key)
+    except Exception as exc:
+        return JSONResponse({"error": f"Failed to poll Feishu QR login: {exc}"}, status_code=500)
+
+    session_value = result.get("session")
+    if session_value:
+        get_feishu_session_store().save(
+            {
+                "session": session_value,
+                "issued_at": time.time(),
+                "metadata": {
+                    "status": result.get("status"),
+                    "next_step": result.get("next_step"),
+                },
+            }
+        )
+    return JSONResponse(result)
+
+
+@app.get("/feishu/session")
+async def feishu_session_status() -> JSONResponse:
+    payload = get_feishu_session_store().load()
+    return JSONResponse(
+        {
+            "logged_in": is_feishu_session_valid(payload),
+            "has_session": bool(payload and payload.get("session")),
+            "issued_at": payload.get("issued_at") if payload else None,
+            "metadata": payload.get("metadata", {}) if payload else {},
+        }
+    )
+
+
+@app.delete("/feishu/session")
+async def feishu_session_clear() -> JSONResponse:
+    get_feishu_session_store().clear()
+    return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------------------

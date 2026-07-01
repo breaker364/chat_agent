@@ -322,6 +322,113 @@ body,
   flex-shrink: 0;
 }
 
+.top-panels {
+  padding: 12px 24px 0;
+  flex-shrink: 0;
+}
+
+.feishu-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.feishu-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.feishu-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.feishu-status {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.feishu-status.connected {
+  color: var(--success);
+}
+
+.feishu-status.disconnected {
+  color: var(--warning);
+}
+
+.feishu-panel-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.feishu-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-body);
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.feishu-btn:hover:not(:disabled) {
+  border-color: var(--border-accent);
+  color: var(--text);
+  background: var(--bg-surface-3);
+}
+
+.feishu-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.feishu-btn.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: rgba(217, 79, 79, 0.25);
+  background: var(--danger-subtle);
+}
+
+.feishu-qr-block {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.feishu-qr-image {
+  width: 160px;
+  height: 160px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+  padding: 8px;
+}
+
+.feishu-qr-hint,
+.feishu-panel-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
 .header-left {
   display: flex;
   align-items: center;

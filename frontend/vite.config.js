@@ -10,6 +10,7 @@ export default defineConfig({
       "/health": "http://127.0.0.1:8000",
       "/sessions": "http://127.0.0.1:8000",
       "/skills": "http://127.0.0.1:8000",
+      "/feishu": "http://127.0.0.1:8000",
     },
   },
 });

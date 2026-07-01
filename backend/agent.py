@@ -21,12 +21,15 @@ SYSTEM_PROMPT = (
     "3. **File Operations** - Use `list_directory`, `read_file`, `get_file_info`, `write_file`, `append_file`, and `delete_file` for local files.\n"
     "4. **Python Verification** - Use `run_python_file` to execute Python files for self-checking and validation after code changes.\n"
     "5. **Subagents** - Use `Agent` to delegate scoped tasks to a child agent such as `general-purpose`, `Explore`, `Plan`, or `verification`.\n"
-    "6. **Skills** - Skills follow a two-stage native workflow. "
+    "6. **Feishu Web Login & CRUD** - Use `feishu_login_status` to check whether a reusable Feishu web session is already available. "
+    "If Feishu web operations are needed and the session is missing, instruct the user to complete QR login from the UI first. "
+    "After login, use `feishu_web_request` for authenticated GET/POST/PUT/PATCH/DELETE requests on Feishu/Lark web endpoints, and `feishu_logout` to clear the session.\n"
+    "7. **Skills** - Skills follow a two-stage native workflow. "
     "At session start you receive a skill catalog summary. First decide from the catalog whether a skill is needed. "
     "If needed, call the skill detail tool to read the full skill definition, then call the skill execution tool. "
     "The chat interface also supports a `/skill` slash command for explicit user-driven skill execution.\n"
-    "7. **McDonald's MCP** - Use the McDonald's tools for mall orders, coupons, stores, meals, and account data. For recent orders, prefer `query_recent_mcd_orders`.\n"
-    "8. **Train Ticket Query (12306)** - Use the 12306 MCP tools to look up Chinese train tickets. "
+    "8. **McDonald's MCP** - Use the McDonald's tools for mall orders, coupons, stores, meals, and account data. For recent orders, prefer `query_recent_mcd_orders`.\n"
+    "9. **Train Ticket Query (12306)** - Use the 12306 MCP tools to look up Chinese train tickets. "
     "First resolve stations with tools such as `get-station-code-by-names`, "
     "`get-stations-code-in-city`, or `get-station-code-of-citys`; then query tickets with "
     "`get-tickets` or interline tickets with `get-interline-tickets`.\n\n"
@@ -92,6 +95,16 @@ MAX_WEB_SEARCH_CALLS = 10
 MAX_WEB_FETCH_CALLS = 5
 MAX_AGENT_REPAIR_PASSES = 2
 MAX_BACKGROUND_SUBAGENT_POLLS = 6
+MAX_HISTORY_MESSAGES = 12
+MAX_HISTORY_TOTAL_CHARS = 24_000
+MAX_HISTORY_MESSAGE_CHARS = 4_000
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    normalized = text or ""
+    if not normalized:
+        return 0
+    return max(1, (len(normalized) + 3) // 4)
 
 
 async def build_agent(
@@ -156,6 +169,34 @@ async def stream_agent_events(
         if isinstance(value, (list, tuple)):
             return [sanitize_tool_payload(item) for item in value]
         return to_jsonable(value)
+
+    def compress_history_text(text: str, limit: int = MAX_HISTORY_MESSAGE_CHARS) -> str:
+        normalized = (text or "").strip()
+        if len(normalized) <= limit:
+            return normalized
+        head = normalized[: limit // 2]
+        tail = normalized[-(limit // 3) :]
+        omitted = len(normalized) - len(head) - len(tail)
+        return f"{head}\n\n[... omitted {omitted} chars from earlier content ...]\n\n{tail}"
+
+    def trim_history(history_items: list[dict[str, str]] | None) -> list[dict[str, str]]:
+        if not history_items:
+            return []
+        trimmed: list[dict[str, str]] = []
+        total_chars = 0
+        # Keep the most recent turns first, then restore chronological order.
+        for item in reversed(history_items):
+            role = item.get("role", "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = compress_history_text(item.get("content", ""))
+            projected = total_chars + len(content)
+            if trimmed and (len(trimmed) >= MAX_HISTORY_MESSAGES or projected > MAX_HISTORY_TOTAL_CHARS):
+                break
+            trimmed.append({"role": role, "content": content})
+            total_chars = projected
+        trimmed.reverse()
+        return trimmed
 
     def build_search_fallback(payload: dict[str, Any] | None) -> str:
         """Build a fallback response. Uses web_fetch results when available,
@@ -406,8 +447,23 @@ async def stream_agent_events(
         )
     if routing_guidance:
         messages.append(SystemMessage(content=routing_guidance))
-    if history:
-        for msg in history:
+    effective_history = trim_history(history)
+    context_message_count = len(effective_history) + 2
+    context_char_count = sum(len(msg.get("content", "")) for msg in effective_history)
+    context_char_count += len(SYSTEM_PROMPT) + len(message)
+    if skill_catalog_text:
+        context_char_count += len(skill_catalog_text)
+        context_message_count += 1
+    if routing_guidance:
+        context_char_count += len(routing_guidance)
+        context_message_count += 1
+    context_token_estimate = estimate_tokens_from_text("".join(
+        [SYSTEM_PROMPT, skill_catalog_text or "", routing_guidance or "", message]
+        + [msg.get("content", "") for msg in effective_history]
+    ))
+
+    if effective_history:
+        for msg in effective_history:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "user":
@@ -432,6 +488,9 @@ async def stream_agent_events(
                 "elapsed_seconds": 0,
                 "session_id": session_id,
                 "max_steps": MAX_AGENT_STEPS,
+                "context_messages": context_message_count,
+                "context_chars": context_char_count,
+                "context_token_estimate": context_token_estimate,
             },
             ensure_ascii=False,
         ),
@@ -491,7 +550,9 @@ async def stream_agent_events(
                     ensure_ascii=False,
                 ),
             }
-            raise
+            fallback_text = collected_text.strip() or f"Agent execution failed: {exc}"
+            yield {"event": "done", "data": json.dumps(fallback_text, ensure_ascii=False)}
+            return
 
         kind = event.get("event", "")
         name = event.get("name", "")

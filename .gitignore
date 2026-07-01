@@ -33,6 +33,7 @@ frontend/dist/
 *.docx
 # Temporary debug / test artifacts
 tmp_*
-
+skills/
 tmp/
 snake-game/
+tools/

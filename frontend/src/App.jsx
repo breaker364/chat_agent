@@ -29,6 +29,9 @@ import {
   Sparkles,
   Expand,
   Minimize,
+  LogIn,
+  LogOut,
+  QrCode,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -38,6 +41,8 @@ const API_BASE = "";
 const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
 const SESSION_SIDEBAR_COLLAPSED_KEY = "chat-agent:session-sidebar-collapsed";
 const DEBUG_SIDEBAR_COLLAPSED_KEY = "chat-agent:debug-sidebar-collapsed";
+const MAX_HISTORY_ITEMS = 12;
+const MAX_HISTORY_ITEM_CHARS = 4000;
 
 function makeSessionId() {
   return `session-${Date.now()}`;
@@ -83,6 +88,14 @@ function readDebugCollapsed() {
   } catch {
     return false;
   }
+}
+
+function compactHistoryContent(text) {
+  const value = String(text || "");
+  if (value.length <= MAX_HISTORY_ITEM_CHARS) return value;
+  const head = value.slice(0, 2000);
+  const tail = value.slice(-1200);
+  return `${head}\n\n[... omitted ${value.length - head.length - tail.length} chars ...]\n\n${tail}`;
 }
 
 function writeDebugCollapsed(collapsed) {
@@ -344,6 +357,60 @@ function SessionSidebar({
         </div>
       ) : null}
     </aside>
+  );
+}
+
+function FeishuLoginPanel({
+  status,
+  loginState,
+  loading,
+  polling,
+  onInit,
+  onRefresh,
+  onLogout,
+}) {
+  return (
+    <section className="feishu-panel">
+      <div className="feishu-panel-header">
+        <div className="feishu-panel-title">
+          <QrCode size={16} />
+          <span>Feishu Web Login</span>
+        </div>
+        <div className={`feishu-status ${status?.logged_in ? "connected" : "disconnected"}`}>
+          {status?.logged_in ? "connected" : "not logged in"}
+        </div>
+      </div>
+      <div className="feishu-panel-actions">
+        <button className="feishu-btn" onClick={onInit} disabled={loading || polling}>
+          <LogIn size={14} />
+          <span>{loading ? "loading..." : polling ? "waiting scan..." : "init qr"}</span>
+        </button>
+        <button className="feishu-btn" onClick={onRefresh}>
+          <RefreshCw size={14} />
+          <span>status</span>
+        </button>
+        <button className="feishu-btn danger" onClick={onLogout}>
+          <LogOut size={14} />
+          <span>logout</span>
+        </button>
+      </div>
+      {loginState?.qr_png_base64 ? (
+        <div className="feishu-qr-block">
+          <img
+            className="feishu-qr-image"
+            src={`data:image/png;base64,${loginState.qr_png_base64}`}
+            alt="Feishu login QR code"
+          />
+          <div className="feishu-qr-hint">Scan in Feishu. Backend is polling automatically.</div>
+        </div>
+      ) : null}
+      {loginState?.message ? <div className="feishu-panel-note">{loginState.message}</div> : null}
+      {status?.issued_at ? (
+        <div className="feishu-panel-note">
+          session issued at: {new Date(status.issued_at * 1000).toLocaleString()}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -651,6 +718,18 @@ function parseSseChunk(buffer, onEvent) {
   return parts[parts.length - 1] || "";
 }
 
+async function readResponsePayload(resp) {
+  const rawText = await resp.text();
+  if (!rawText) {
+    return { ok: false, data: null, text: "" };
+  }
+  try {
+    return { ok: true, data: JSON.parse(rawText), text: rawText };
+  } catch {
+    return { ok: false, data: null, text: rawText };
+  }
+}
+
 // ============================================================
 // Custom Markdown renderer with diagram support
 // ============================================================
@@ -707,6 +786,11 @@ export default function App() {
   const [skillResult, setSkillResult] = useState(null);
   const [skillLoading, setSkillLoading] = useState(false);
   const [skillTab, setSkillTab] = useState("installed");
+  const [feishuStatus, setFeishuStatus] = useState(null);
+  const [feishuLoginState, setFeishuLoginState] = useState(null);
+  const [feishuLoading, setFeishuLoading] = useState(false);
+  const [feishuPolling, setFeishuPolling] = useState(false);
+  const [contextStats, setContextStats] = useState(null);
 
   const defaultAssistantMessage = useMemo(
     () => ({
@@ -735,6 +819,21 @@ export default function App() {
     }
   }, []);
 
+  const refreshFeishuStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/feishu/session`);
+      const { ok, data, text } = await readResponsePayload(resp);
+      if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+      if (!ok || !data) throw new Error("Invalid session status response.");
+      setFeishuStatus(data);
+      return data;
+    } catch {
+      const fallback = { logged_in: false, has_session: false, issued_at: null, metadata: {} };
+      setFeishuStatus(fallback);
+      return fallback;
+    }
+  }, []);
+
   const loadSession = useCallback(async (sessionId, options = {}) => {
     const { scrollToBottom = true } = options;
     try {
@@ -746,6 +845,7 @@ export default function App() {
       setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
       setSubagentTasks(data.subagent_tasks || []);
       setSubagentNotifications(data.subagent_notifications || []);
+      setContextStats(data.context_stats || null);
       if (scrollToBottom) {
         setShouldAutoScroll(true);
         requestAnimationFrame(() => scrollDown("auto"));
@@ -754,6 +854,7 @@ export default function App() {
     } catch {
       setActiveSessionId(sessionId);
       writeLastSessionId(sessionId);
+      setContextStats(null);
       return sessionId;
     }
   }, [defaultAssistantMessage, scrollDown]);
@@ -792,6 +893,7 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
+        await refreshFeishuStatus();
         const sessionList = await refreshSessions();
         if (cancelled) return;
         if (sessionList?.length) {
@@ -822,13 +924,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [defaultAssistantMessage, loadSession, refreshSessions]);
+  }, [defaultAssistantMessage, loadSession, refreshFeishuStatus, refreshSessions]);
 
   const currentHistory = useMemo(
     () =>
       messages
         .filter((m) => m.role === "user" || m.role === "assistant")
-        .map((m) => ({ role: m.role, content: m.content })),
+        .slice(-MAX_HISTORY_ITEMS)
+        .map((m) => ({ role: m.role, content: compactHistoryContent(m.content) })),
     [messages]
   );
 
@@ -1060,6 +1163,80 @@ export default function App() {
     setSkillLoading(false);
   }, []);
 
+  const handleFeishuInit = useCallback(async () => {
+    setFeishuLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/feishu/login/init`, { method: "POST" });
+      const { ok, data, text } = await readResponsePayload(resp);
+      if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+      if (!ok || !data) throw new Error("Invalid login init response.");
+      setFeishuLoginState({
+        ...data,
+        message: "QR created. Waiting for scan confirmation...",
+      });
+      setFeishuPolling(true);
+    } catch (err) {
+      setFeishuLoginState({ message: `Init failed: ${err.message}` });
+    } finally {
+      setFeishuLoading(false);
+    }
+  }, []);
+
+  const handleFeishuPoll = useCallback(async () => {
+    if (!feishuLoginState?.flow_key) return;
+    try {
+      const resp = await fetch(`${API_BASE}/feishu/login/poll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ flow_key: feishuLoginState.flow_key }),
+      });
+      const { ok, data, text } = await readResponsePayload(resp);
+      if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+      if (!ok || !data) throw new Error("Invalid login poll response.");
+      const nextMessage = data.session
+        ? "Login completed. Session saved locally."
+        : `Polling status: ${data.next_step || data.status || "pending"}`;
+      setFeishuLoginState((prev) => ({ ...(prev || {}), ...data, message: nextMessage }));
+      await refreshFeishuStatus();
+      if (data.session) {
+        setFeishuPolling(false);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      setFeishuLoginState((prev) => ({ ...(prev || {}), message: `Poll failed: ${err.message}` }));
+      setFeishuPolling(false);
+      return true;
+    }
+  }, [feishuLoginState, refreshFeishuStatus]);
+
+  const handleFeishuLogout = useCallback(async () => {
+    const resp = await fetch(`${API_BASE}/feishu/session`, { method: "DELETE" });
+    if (!resp.ok) {
+      const { ok, data, text } = await readResponsePayload(resp);
+      throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+    }
+    setFeishuLoginState(null);
+    setFeishuPolling(false);
+    await refreshFeishuStatus();
+  }, [refreshFeishuStatus]);
+
+  useEffect(() => {
+    if (!feishuPolling || !feishuLoginState?.flow_key) return undefined;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      if (cancelled) return;
+      const shouldStop = await handleFeishuPoll();
+      if (shouldStop) {
+        window.clearInterval(timer);
+      }
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [feishuPolling, feishuLoginState, handleFeishuPoll]);
+
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || loading) return;
@@ -1255,8 +1432,26 @@ export default function App() {
             <span className="badge"><Train size={12} /> 12306</span>
             <span className="badge"><Zap size={12} /> Skills</span>
             <span className="badge"><TerminalSquare size={12} /> Debug</span>
+            {contextStats ? (
+              <span className="badge">
+                <Code size={12} />
+                ctx {contextStats.history_messages} msg / {contextStats.history_token_estimate} tok
+              </span>
+            ) : null}
           </div>
         </header>
+
+        <div className="top-panels">
+          <FeishuLoginPanel
+            status={feishuStatus}
+            loginState={feishuLoginState}
+            loading={feishuLoading}
+            polling={feishuPolling}
+            onInit={handleFeishuInit}
+            onRefresh={refreshFeishuStatus}
+            onLogout={handleFeishuLogout}
+          />
+        </div>
 
         <main
           className="chat-area"

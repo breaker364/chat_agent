@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import subprocess
 import shutil
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Queue
@@ -261,12 +264,57 @@ def fill_prompt_template(template: str, params: dict[str, Any]) -> str:
     return result
 
 
+def _skill_runner_path(skill: SkillDefinition) -> Path | None:
+    if not skill.source_path:
+        return None
+    source = Path(skill.source_path)
+    if source.is_file():
+        source = source.parent
+    runner = source / "skill_runner.py"
+    return runner if runner.exists() else None
+
+
+def _execute_skill_runner_sync(skill: SkillDefinition, params: dict[str, Any]) -> str:
+    runner = _skill_runner_path(skill)
+    if runner is None:
+        raise FileNotFoundError(f"No skill runner found for skill '{skill.name}'.")
+
+    env = dict(os.environ)
+    env["CHAT_AGENT_SKILL_ROOT"] = str(Path(skill.source_path).resolve())
+    process = subprocess.run(
+        [sys.executable, str(runner)],
+        input=json.dumps(params, ensure_ascii=False).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(Path(skill.source_path).resolve()),
+        env=env,
+        check=False,
+    )
+    if process.returncode != 0:
+        stderr_text = process.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr_text or f"Skill runner failed with exit code {process.returncode}.")
+    stdout_text = process.stdout.decode("utf-8", errors="replace").strip()
+    if not stdout_text:
+        return ""
+    try:
+        parsed = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return stdout_text
+    if isinstance(parsed, dict) and "result" in parsed:
+        return str(parsed["result"])
+    return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+
 async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> str:
     from .config import create_chat_deepseek, load_llm_config
 
     skill = get_installed_skill(root, skill_name)
     if skill is None:
         raise ValueError(f"Skill '{skill_name}' is not installed.")
+
+    runner = _skill_runner_path(skill)
+    if runner is not None:
+        return await asyncio.to_thread(_execute_skill_runner_sync, skill, params)
 
     cfg = load_llm_config()
     llm = create_chat_deepseek(cfg, temperature=0.3, streaming=False, max_tokens=8192)
