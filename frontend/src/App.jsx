@@ -319,6 +319,85 @@ function SubagentTaskCard({ task }) {
   );
 }
 
+function TaskProgressPanel({ progress, onRefresh }) {
+  const tasks = progress?.task_items || [];
+  const pitfalls = progress?.pitfalls || [];
+  const stages = progress?.script_stages || [];
+
+  return (
+    <div className="task-progress-panel">
+      <div className="task-progress-header">
+        <div>
+          <div className="debug-sidebar-title">Task Progress</div>
+          <div className="debug-sidebar-subtitle">
+            {tasks.length} todos / {pitfalls.length} pitfalls / {stages.length} stages
+          </div>
+        </div>
+        <button className="session-toolbar-btn" onClick={onRefresh} title="Refresh task progress">
+          <RefreshCw size={14} />
+        </button>
+      </div>
+      <div className="task-progress-body">
+        {tasks.length ? (
+          <div className="progress-section">
+            <div className="progress-section-title">Todos</div>
+            {tasks.slice().reverse().map((task) => (
+              <div className="progress-card" key={task.task_id}>
+                <div className="progress-card-header">
+                  <span>{task.title || task.task_id}</span>
+                  <span className={`progress-status progress-status-${task.status || "pending"}`}>
+                    {task.status || "pending"}
+                  </span>
+                </div>
+                {task.details ? <div className="progress-card-detail">{task.details}</div> : null}
+                {task.artifact_path ? <div className="progress-card-path">{task.artifact_path}</div> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {pitfalls.length ? (
+          <div className="progress-section">
+            <div className="progress-section-title">Pitfalls</div>
+            {pitfalls.slice().reverse().map((pitfall, index) => (
+              <div className="progress-card pitfall-card" key={`${pitfall.created_at || "pitfall"}-${index}`}>
+                <div className="progress-card-header">
+                  <span>{pitfall.summary || "Pitfall"}</span>
+                </div>
+                {pitfall.impact ? <div className="progress-card-detail">Impact: {pitfall.impact}</div> : null}
+                {pitfall.resolution ? <div className="progress-card-detail">Resolution: {pitfall.resolution}</div> : null}
+                {pitfall.artifact_path ? <div className="progress-card-path">{pitfall.artifact_path}</div> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {stages.length ? (
+          <div className="progress-section">
+            <div className="progress-section-title">Script Stages</div>
+            {stages.slice(-8).reverse().map((stage, index) => (
+              <div className="progress-card" key={`${stage.created_at || "stage"}-${index}`}>
+                <div className="progress-card-header">
+                  <span>{stage.stage_name || "stage"}</span>
+                  <span className={`progress-status progress-status-${stage.status || "pending"}`}>
+                    {stage.status || "pending"}
+                  </span>
+                </div>
+                {stage.summary ? <div className="progress-card-detail">{stage.summary}</div> : null}
+                {stage.artifact_path ? <div className="progress-card-path">{stage.artifact_path}</div> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {!tasks.length && !pitfalls.length && !stages.length ? (
+          <div className="debug-empty">No saved task progress yet.</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function SessionSidebar({
   sessions,
   activeSessionId,
@@ -802,6 +881,7 @@ export default function App() {
   const [debugEvents, setDebugEvents] = useState([]);
   const [subagentTasks, setSubagentTasks] = useState([]);
   const [subagentNotifications, setSubagentNotifications] = useState([]);
+  const [taskProgress, setTaskProgress] = useState(null);
   const [debugOpen, setDebugOpen] = useState(!readDebugCollapsed());
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(readSidebarCollapsed);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
@@ -883,6 +963,7 @@ export default function App() {
       setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
       setSubagentTasks(data.subagent_tasks || []);
       setSubagentNotifications(data.subagent_notifications || []);
+      setTaskProgress(data.task_progress || null);
       setContextStats(data.context_stats || null);
       if (scrollToBottom) {
         setShouldAutoScroll(true);
@@ -892,6 +973,7 @@ export default function App() {
     } catch {
       setActiveSessionId(sessionId);
       writeLastSessionId(sessionId);
+      setTaskProgress(null);
       setContextStats(null);
       return sessionId;
     }
@@ -1018,6 +1100,7 @@ export default function App() {
     setToolEvents([]);
     setSubagentTasks([]);
     setSubagentNotifications([]);
+    setTaskProgress(null);
     setStreamingText("");
   }, [defaultAssistantMessage, loadSession, refreshSessions]);
 
@@ -1615,6 +1698,7 @@ export default function App() {
       />
       {debugOpen ? (
         <aside className="subagent-sidebar">
+          <TaskProgressPanel progress={taskProgress} onRefresh={refreshActiveSession} />
           <div className="subagent-sidebar-header">
             <div>
               <div className="debug-sidebar-title">Subagents</div>

@@ -300,6 +300,44 @@ class FeishuAuthRequestInput(BaseModel):
     timeout_seconds: int = Field(30, description="Request timeout in seconds.")
 
 
+class ScriptStageInput(BaseModel):
+    """Arguments for recording a script processing stage into the current session."""
+
+    stage_name: str = Field(..., description="Short stage name, e.g. fetch, process, write, verify.")
+    status: str = Field(..., description="Stage status: planned, running, completed, failed.")
+    summary: str = Field("", description="Short human-readable summary of what happened in this stage.")
+    artifact_path: str = Field("", description="Optional workspace path to the generated script or output artifact.")
+
+
+class TaskItemInput(BaseModel):
+    """Arguments for saving a task/todo item into the current session."""
+
+    title: str = Field(..., description="Short task title.")
+    status: str = Field("pending", description="Task status: pending, running, completed, blocked, or failed.")
+    details: str = Field("", description="Concrete progress details, next step, or acceptance criteria.")
+    task_id: str = Field("", description="Stable task id. Leave blank to create a new one.")
+    artifact_path: str = Field("", description="Optional workspace path related to this task.")
+
+
+class TaskItemUpdateInput(BaseModel):
+    """Arguments for updating an existing session task/todo item."""
+
+    task_id: str = Field(..., description="Task id returned by record_task_item.")
+    status: str = Field("", description="Updated status: pending, running, completed, blocked, or failed.")
+    title: str = Field("", description="Optional updated task title.")
+    details: str = Field("", description="Optional updated progress details.")
+    artifact_path: str = Field("", description="Optional workspace path related to this task.")
+
+
+class PitfallInput(BaseModel):
+    """Arguments for saving a pitfall or failed attempt into the current session."""
+
+    summary: str = Field(..., description="Short description of the pitfall, error, or bad assumption.")
+    impact: str = Field("", description="What this affected or why it mattered.")
+    resolution: str = Field("", description="How it was resolved or what should be tried next.")
+    artifact_path: str = Field("", description="Optional workspace path to logs, scripts, or output.")
+
+
 # ---------------------------------------------------------------------------
 # URL / network helpers
 # ---------------------------------------------------------------------------
@@ -663,12 +701,23 @@ def Agent(
             _SUBAGENT_SYNC_TIMEOUT_SECONDS,
         )
     except TimeoutError as exc:
+        session_id = _current_session_id()
+        launched = _SUBAGENT_MANAGER.launch(
+            prompt=prompt,
+            description=description,
+            subagent_type=normalized_type,
+            workspace_dir=workspace,
+            session_id=session_id or None,
+        )
+        if session_id:
+            SessionStore(workspace).add_subagent_task(session_id, launched)
         return json.dumps(
             {
-                "status": "failed",
+                "status": "timed_out_relaunched",
                 "description": description,
                 "subagent_type": normalized_type,
                 "error": str(exc),
+                "replacement_agent_id": launched["agent_id"],
             },
             ensure_ascii=False,
             indent=2,
@@ -698,6 +747,98 @@ def Agent(
         ensure_ascii=False,
         indent=2,
     )
+
+
+@tool(args_schema=ScriptStageInput)
+def record_script_stage(
+    stage_name: str,
+    status: str,
+    summary: str = "",
+    artifact_path: str = "",
+) -> str:
+    """Record a script processing stage and its result into the current session progress."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    workspace = _workspace_root()
+    payload = {
+        "stage_name": (stage_name or "").strip(),
+        "status": (status or "").strip(),
+        "summary": (summary or "").strip(),
+        "artifact_path": (artifact_path or "").strip(),
+    }
+    SessionStore(workspace).add_script_stage(session_id, payload)
+    return json.dumps({"success": True, **payload}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=TaskItemInput)
+def record_task_item(
+    title: str,
+    status: str = "pending",
+    details: str = "",
+    task_id: str = "",
+    artifact_path: str = "",
+) -> str:
+    """Save a todo/task item into the current session progress file."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    payload = {
+        "task_id": (task_id or "").strip(),
+        "title": (title or "").strip(),
+        "status": (status or "pending").strip(),
+        "details": (details or "").strip(),
+        "artifact_path": (artifact_path or "").strip(),
+    }
+    session = SessionStore(_workspace_root()).add_task_item(session_id, payload)
+    task_items = session.get("task_progress", {}).get("task_items", [])
+    saved = next((item for item in reversed(task_items) if item.get("title") == payload["title"]), task_items[-1] if task_items else payload)
+    return json.dumps({"success": True, "task": saved}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=TaskItemUpdateInput)
+def update_task_item(
+    task_id: str,
+    status: str = "",
+    title: str = "",
+    details: str = "",
+    artifact_path: str = "",
+) -> str:
+    """Update a todo/task item saved in the current session progress file."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    updates = {
+        "status": (status or "").strip() or None,
+        "title": (title or "").strip() or None,
+        "details": (details or "").strip() or None,
+        "artifact_path": (artifact_path or "").strip() or None,
+    }
+    session = SessionStore(_workspace_root()).update_task_item(session_id, task_id, **updates)
+    task_items = session.get("task_progress", {}).get("task_items", [])
+    saved = next((item for item in task_items if item.get("task_id") == task_id), None)
+    return json.dumps({"success": True, "task": saved}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=PitfallInput)
+def record_pitfall(
+    summary: str,
+    impact: str = "",
+    resolution: str = "",
+    artifact_path: str = "",
+) -> str:
+    """Save a pitfall, failed attempt, or important lesson into the current session progress file."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    payload = {
+        "summary": (summary or "").strip(),
+        "impact": (impact or "").strip(),
+        "resolution": (resolution or "").strip(),
+        "artifact_path": (artifact_path or "").strip(),
+    }
+    SessionStore(_workspace_root()).add_pitfall(session_id, payload)
+    return json.dumps({"success": True, **payload}, ensure_ascii=False, indent=2)
 
 
 @tool
@@ -1489,6 +1630,10 @@ _AGENT_TOOLS: list[Any] = [
     Agent,
     get_subagent_task,
     SendMessage,
+    record_script_stage,
+    record_task_item,
+    update_task_item,
+    record_pitfall,
     query_recent_mcd_orders,
     feishu_login_status,
     feishu_logout,

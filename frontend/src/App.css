@@ -1085,6 +1085,113 @@ body,
   gap: 8px;
 }
 
+.task-progress-panel {
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.35);
+  display: flex;
+  flex-direction: column;
+  max-height: 46%;
+  min-height: 180px;
+}
+
+.task-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  flex-shrink: 0;
+}
+
+.task-progress-body {
+  overflow-y: auto;
+  padding: 0 12px 12px;
+}
+
+.progress-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.progress-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 2px 0;
+}
+
+.progress-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  padding: 10px 12px;
+  box-shadow: var(--shadow-sm);
+}
+
+.pitfall-card {
+  border-color: rgba(196, 129, 0, 0.32);
+  background: rgba(255, 250, 235, 0.7);
+}
+
+.progress-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.progress-status {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+}
+
+.progress-status-running {
+  color: var(--debug-accent);
+  border-color: var(--debug-border);
+  background: var(--debug-surface);
+}
+
+.progress-status-completed {
+  color: var(--success);
+  border-color: rgba(46, 125, 50, 0.25);
+  background: rgba(46, 125, 50, 0.08);
+}
+
+.progress-status-blocked,
+.progress-status-failed {
+  color: var(--warning);
+  border-color: rgba(196, 129, 0, 0.25);
+  background: rgba(196, 129, 0, 0.08);
+}
+
+.progress-card-detail,
+.progress-card-path {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.progress-card-path {
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  word-break: break-all;
+}
+
 .subagent-card {
   border: 1px solid var(--debug-border);
   background: var(--debug-surface);

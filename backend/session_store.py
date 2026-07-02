@@ -103,6 +103,9 @@ class SessionStore:
             "message": "",
             "elapsed_seconds": 0,
             "last_debug_stage": "",
+            "script_stages": [],
+            "task_items": [],
+            "pitfalls": [],
             "updated_at": _now_iso(),
         }
 
@@ -194,6 +197,95 @@ class SessionStore:
         session = self.create_or_get_session(session_id)
         progress = session.setdefault("task_progress", self.default_progress())
         progress.update(updates)
+        if "script_stages" not in progress or not isinstance(progress.get("script_stages"), list):
+            progress["script_stages"] = []
+        if "task_items" not in progress or not isinstance(progress.get("task_items"), list):
+            progress["task_items"] = []
+        if "pitfalls" not in progress or not isinstance(progress.get("pitfalls"), list):
+            progress["pitfalls"] = []
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def add_task_item(self, session_id: str, task: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        tasks = progress.setdefault("task_items", [])
+        task_id = str(task.get("task_id") or "").strip() or f"task-{uuid4().hex[:8]}"
+        normalized = {
+            "task_id": task_id,
+            "title": str(task.get("title") or "").strip(),
+            "status": str(task.get("status") or "pending").strip(),
+            "details": str(task.get("details") or "").strip(),
+            "artifact_path": str(task.get("artifact_path") or "").strip(),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        tasks = [item for item in tasks if item.get("task_id") != task_id]
+        tasks.append(normalized)
+        progress["task_items"] = tasks[-200:]
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def update_task_item(self, session_id: str, task_id: str, **updates: Any) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        tasks = progress.setdefault("task_items", [])
+        normalized_id = str(task_id or "").strip()
+        updated = False
+        for index, item in enumerate(tasks):
+            if item.get("task_id") != normalized_id:
+                continue
+            next_item = dict(item)
+            for key in ("title", "status", "details", "artifact_path"):
+                if key in updates and updates[key] is not None:
+                    next_item[key] = str(updates[key]).strip()
+            next_item["updated_at"] = _now_iso()
+            tasks[index] = next_item
+            updated = True
+            break
+        if not updated:
+            tasks.append(
+                {
+                    "task_id": normalized_id or f"task-{uuid4().hex[:8]}",
+                    "title": str(updates.get("title") or "").strip(),
+                    "status": str(updates.get("status") or "pending").strip(),
+                    "details": str(updates.get("details") or "").strip(),
+                    "artifact_path": str(updates.get("artifact_path") or "").strip(),
+                    "created_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }
+            )
+        progress["task_items"] = tasks[-200:]
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def add_pitfall(self, session_id: str, pitfall: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        pitfalls = progress.setdefault("pitfalls", [])
+        pitfalls.append(
+            {
+                "summary": str(pitfall.get("summary") or "").strip(),
+                "impact": str(pitfall.get("impact") or "").strip(),
+                "resolution": str(pitfall.get("resolution") or "").strip(),
+                "artifact_path": str(pitfall.get("artifact_path") or "").strip(),
+                "created_at": _now_iso(),
+            }
+        )
+        progress["pitfalls"] = pitfalls[-200:]
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def add_script_stage(self, session_id: str, stage: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        stages = progress.setdefault("script_stages", [])
+        stages.append({**stage, "created_at": _now_iso()})
+        progress["script_stages"] = stages[-100:]
         progress["updated_at"] = _now_iso()
         self.save_session(session)
         return session
