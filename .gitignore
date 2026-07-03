@@ -33,7 +33,7 @@ frontend/dist/
 *.docx
 # Temporary debug / test artifacts
 tmp_*
-skills/
+skills/pisces-ebom-matcher
 tmp/
 snake-game/
 tools/
