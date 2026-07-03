@@ -344,6 +344,47 @@ async def stream_agent_events(
     def has_unresolved_background_subagents() -> bool:
         return any(task.get("status") not in {"completed", "idle", "failed"} for task in launched_background_subagents)
 
+    def build_tool_summary() -> str:
+        if not tool_call_names:
+            return "none"
+        counts: dict[str, int] = {}
+        for tool_name in tool_call_names:
+            counts[tool_name] = counts.get(tool_name, 0) + 1
+        return ", ".join(
+            f"{name} x{count}" if count > 1 else name
+            for name, count in sorted(counts.items())
+        )
+
+    def ensure_completion_summary(
+        final_text: str,
+        *,
+        status: str,
+        failure_reason: str = "",
+    ) -> str:
+        body = (final_text or "").strip()
+        lower_body = body.lower()
+        if "执行摘要" in body or "execution summary" in lower_body:
+            return body
+
+        elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
+        verification_note = "yes" if has_verification_evidence() else "not detected"
+        subagent_note = "yes" if has_subagent_evidence() else "not used"
+        lines = [
+            "**执行摘要**",
+            f"- 状态: {status}",
+            f"- 用时: {elapsed_seconds}s",
+            f"- 工具调用: {build_tool_summary()}",
+            f"- 子 Agent: {subagent_note}",
+            f"- 验证步骤: {verification_note}",
+        ]
+        if failure_reason:
+            lines.append(f"- 失败原因: {failure_reason}")
+        if has_unresolved_background_subagents():
+            lines.append("- 未完成项: still waiting for background subagent completion")
+
+        summary = "\n".join(lines)
+        return f"{body}\n\n{summary}" if body else summary
+
     def looks_incomplete(final_text: str) -> bool:
         normalized = (final_text or "").strip().lower()
         if not normalized:
@@ -524,7 +565,17 @@ async def stream_agent_events(
                             ensure_ascii=False,
                         ),
                     }
-                    yield {"event": "done", "data": json.dumps(fallback_message, ensure_ascii=False)}
+                    yield {
+                        "event": "done",
+                        "data": json.dumps(
+                            ensure_completion_summary(
+                                fallback_message,
+                                status="failed",
+                                failure_reason=f"web_search exceeded {MAX_WEB_SEARCH_CALLS} calls",
+                            ),
+                            ensure_ascii=False,
+                        ),
+                    }
                     return
             elif name in {"web_fetch", "fetch_webpage"}:
                 web_fetch_calls += 1
@@ -547,7 +598,17 @@ async def stream_agent_events(
                             ensure_ascii=False,
                         ),
                     }
-                    yield {"event": "done", "data": json.dumps(fallback_message, ensure_ascii=False)}
+                    yield {
+                        "event": "done",
+                        "data": json.dumps(
+                            ensure_completion_summary(
+                                fallback_message,
+                                status="failed",
+                                failure_reason=f"web_fetch exceeded {MAX_WEB_FETCH_CALLS} calls",
+                            ),
+                            ensure_ascii=False,
+                        ),
+                    }
                     return
             active_tool = name
             progress_count = 0
@@ -741,7 +802,13 @@ async def stream_agent_events(
                     ensure_ascii=False,
                 ),
             }
-            yield {"event": "done", "data": json.dumps(final_text, ensure_ascii=False)}
+            yield {
+                "event": "done",
+                "data": json.dumps(
+                    ensure_completion_summary(final_text, status="completed"),
+                    ensure_ascii=False,
+                ),
+            }
             return
 
     yield {
@@ -771,7 +838,17 @@ async def stream_agent_events(
     final_text = collected_text
     if not should_use_collected_text_as_final(final_text) and last_web_search_payload:
         final_text = build_search_fallback(last_web_search_payload)
-    yield {"event": "done", "data": json.dumps(final_text, ensure_ascii=False)}
+    yield {
+        "event": "done",
+        "data": json.dumps(
+            ensure_completion_summary(
+                final_text,
+                status="failed" if not final_text.strip() else "completed",
+                failure_reason="agent stopped before producing final text" if not final_text.strip() else "",
+            ),
+            ensure_ascii=False,
+        ),
+    }
 
 
 async def simple_chat(

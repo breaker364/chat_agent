@@ -40,7 +40,7 @@ from .adapters import (
 from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
-from .config import load_mcd_mcp_config
+from .config import get_runtime_value, load_mcd_mcp_config
 from .feishu_web_login import (
     FeishuWebSessionStore,
     build_feishu_cookies,
@@ -66,7 +66,7 @@ _PYTHON_RUN_TIMEOUT_SECONDS = 60
 _PYTHON_RUN_MAX_TIMEOUT_SECONDS = 120
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
 _MAX_PARALLEL_SEARCH_ROUTES = 2
-_DOWNLOAD_DIR_NAME = "tmp"
+_DOWNLOAD_DIR_NAME = str(get_runtime_value("paths", "download_dir", "tmp") or "tmp")
 _SUBAGENT_SYNC_TIMEOUT_SECONDS = 120
 _SUBAGENT_MANAGER = get_subagent_manager()
 _CURRENT_SESSION_ID_ENV = "CHAT_AGENT_SESSION_ID"

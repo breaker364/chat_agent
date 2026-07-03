@@ -151,14 +151,19 @@ function tryParseJson(value) {
 }
 
 function ToolCallBubble({ toolName, args }) {
+  const [expanded, setExpanded] = useState(false);
+  const text = formatValue(args);
+  const preview = text.length > 120 ? `${text.slice(0, 120)}...` : text;
+
   return (
     <div className="message tool-message">
-      <div className="tool-header">
+      <button className="tool-result-toggle" onClick={() => setExpanded((value) => !value)}>
         {iconForTool(toolName)}
         <span className="tool-name">{toolName || "tool"}</span>
         <span className="tool-status">running</span>
-      </div>
-      <pre className="tool-args">{formatValue(args)}</pre>
+        <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
+      </button>
+      {expanded ? <pre className="tool-args">{text}</pre> : <div className="tool-collapsed-preview">{preview}</div>}
     </div>
   );
 }
@@ -182,22 +187,24 @@ function ToolResultBubble({ toolName, content }) {
       </button>
       {isWebFetch && parsed ? (
         <div className="tool-result-block">
-          <pre className={expanded ? "tool-result-content tool-result-content-fetch" : "tool-result-preview"}>
-            {expanded
-              ? [
-                  parsed.url ? `url: ${parsed.url}` : null,
-                  parsed.title ? `title: ${parsed.title}` : null,
-                  parsed.code ? `code: ${parsed.code}` : null,
-                  parsed.code_text ? `status: ${parsed.code_text}` : null,
-                  parsed.prompt ? `prompt: ${parsed.prompt}` : null,
-                  parsed.duration_seconds != null ? `duration_seconds: ${parsed.duration_seconds}` : null,
-                  "",
-                  fetchPreview || text,
-                ]
-                  .filter(Boolean)
-                  .join("\n")
-              : fetchPreviewShort || preview}
-          </pre>
+          {expanded ? (
+            <pre className="tool-result-content tool-result-content-fetch">
+              {[
+                parsed.url ? `url: ${parsed.url}` : null,
+                parsed.title ? `title: ${parsed.title}` : null,
+                parsed.code ? `code: ${parsed.code}` : null,
+                parsed.code_text ? `status: ${parsed.code_text}` : null,
+                parsed.prompt ? `prompt: ${parsed.prompt}` : null,
+                parsed.duration_seconds != null ? `duration_seconds: ${parsed.duration_seconds}` : null,
+                "",
+                fetchPreview || text,
+              ]
+                .filter(Boolean)
+                .join("\n")}
+            </pre>
+          ) : (
+            <div className="tool-collapsed-preview">{fetchPreviewShort || preview}</div>
+          )}
           {expanded ? (
             <button className="tool-raw-toggle" onClick={() => setRawExpanded((v) => !v)}>
               {rawExpanded ? "hide raw json" : "show raw json"}
@@ -206,7 +213,7 @@ function ToolResultBubble({ toolName, content }) {
           {expanded && rawExpanded ? <pre className="tool-result-content tool-result-raw">{text}</pre> : null}
         </div>
       ) : (
-        <pre className={expanded ? "tool-result-content" : "tool-result-preview"}>{expanded ? text : preview}</pre>
+        expanded ? <pre className="tool-result-content">{text}</pre> : <div className="tool-collapsed-preview">{preview}</div>
       )}
     </div>
   );
@@ -225,18 +232,41 @@ function ProgressBubble({ message, elapsedSeconds }) {
 }
 
 function ToolEvents({ events }) {
+  const [expanded, setExpanded] = useState(false);
   if (!events?.length) return null;
+  const toolCalls = events.filter((event) => event.type === "tool_call").length;
+  const toolResults = events.filter((event) => event.type === "tool_result").length;
+  const progressItems = events.length - toolCalls - toolResults;
+  const latest = events[events.length - 1];
+  const latestLabel = latest?.name || latest?.message || latest?.type || "tool activity";
+
   return (
     <div className="tool-events">
-      {events.map((evt, i) => {
-        if (evt.type === "tool_call") {
-          return <ToolCallBubble key={`tc-${i}`} toolName={evt.name} args={evt.arguments} />;
-        }
-        if (evt.type === "tool_result") {
-          return <ToolResultBubble key={`tr-${i}`} toolName={evt.name} content={evt.content} />;
-        }
-        return <ProgressBubble key={`pg-${i}`} message={evt.message} elapsedSeconds={evt.elapsed_seconds} />;
-      })}
+      <div className="message tool-group-message">
+        <button className="tool-result-toggle tool-group-toggle" onClick={() => setExpanded((value) => !value)}>
+          <TerminalSquare size={14} />
+          <span className="tool-name">Tool calls</span>
+          <span className="tool-group-summary">
+            {events.length} events · {toolCalls} calls · {toolResults} results
+            {progressItems ? ` · ${progressItems} progress` : ""}
+          </span>
+          <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
+        </button>
+        <div className="tool-collapsed-preview">latest: {latestLabel}</div>
+        {expanded ? (
+          <div className="tool-group-body">
+            {events.map((evt, i) => {
+              if (evt.type === "tool_call") {
+                return <ToolCallBubble key={`tc-${i}`} toolName={evt.name} args={evt.arguments} />;
+              }
+              if (evt.type === "tool_result") {
+                return <ToolResultBubble key={`tr-${i}`} toolName={evt.name} content={evt.content} />;
+              }
+              return <ProgressBubble key={`pg-${i}`} message={evt.message} elapsedSeconds={evt.elapsed_seconds} />;
+            })}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1304,9 +1334,17 @@ export default function App() {
   const handleFeishuInit = useCallback(async () => {
     setFeishuLoading(true);
     try {
-      const resp = await fetch(`${API_BASE}/feishu/login/init`, { method: "POST" });
-      const { ok, data, text } = await readResponsePayload(resp);
-      if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+      const initPaths = ["/feishu/login/init", "/feishu/init", "/feishu/qr/init"];
+      let resp = null;
+      let lastPayload = null;
+      for (const path of initPaths) {
+        resp = await fetch(`${API_BASE}${path}`, { method: "POST" });
+        const payload = await readResponsePayload(resp);
+        lastPayload = payload;
+        if (resp.ok || resp.status !== 404) break;
+      }
+      const { ok, data, text } = lastPayload || {};
+      if (!resp?.ok) throw new Error((ok && (data?.error || data?.detail)) || text || `HTTP ${resp?.status || "unknown"}`);
       if (!ok || !data) throw new Error("Invalid login init response.");
       setFeishuLoginState({
         ...data,
@@ -1323,13 +1361,21 @@ export default function App() {
   const handleFeishuPoll = useCallback(async () => {
     if (!feishuLoginState?.flow_key) return;
     try {
-      const resp = await fetch(`${API_BASE}/feishu/login/poll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ flow_key: feishuLoginState.flow_key }),
-      });
-      const { ok, data, text } = await readResponsePayload(resp);
-      if (!resp.ok) throw new Error((ok && data?.error) || text || `HTTP ${resp.status}`);
+      const pollPaths = ["/feishu/login/poll", "/feishu/poll", "/feishu/qr/poll"];
+      let resp = null;
+      let lastPayload = null;
+      for (const path of pollPaths) {
+        resp = await fetch(`${API_BASE}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({ flow_key: feishuLoginState.flow_key }),
+        });
+        const payload = await readResponsePayload(resp);
+        lastPayload = payload;
+        if (resp.ok || resp.status !== 404) break;
+      }
+      const { ok, data, text } = lastPayload || {};
+      if (!resp?.ok) throw new Error((ok && (data?.error || data?.detail)) || text || `HTTP ${resp?.status || "unknown"}`);
       if (!ok || !data) throw new Error("Invalid login poll response.");
       const nextMessage = data.session
         ? "Login completed. Session saved locally."
@@ -1357,6 +1403,24 @@ export default function App() {
     setFeishuLoginState(null);
     setFeishuPolling(false);
     await refreshFeishuStatus();
+  }, [refreshFeishuStatus]);
+
+  const handleFeishuRefreshClick = useCallback(async () => {
+    setFeishuLoading(true);
+    try {
+      const data = await refreshFeishuStatus();
+      setFeishuLoginState((prev) => ({
+        ...(prev || {}),
+        message: data.logged_in ? "Status refreshed: session is active." : "Status refreshed: not logged in.",
+      }));
+    } catch (err) {
+      setFeishuLoginState((prev) => ({
+        ...(prev || {}),
+        message: `Status refresh failed: ${err.message}`,
+      }));
+    } finally {
+      setFeishuLoading(false);
+    }
   }, [refreshFeishuStatus]);
 
   useEffect(() => {
@@ -1596,7 +1660,7 @@ export default function App() {
             loading={feishuLoading}
             polling={feishuPolling}
             onInit={handleFeishuInit}
-            onRefresh={refreshFeishuStatus}
+            onRefresh={handleFeishuRefreshClick}
             onLogout={handleFeishuLogout}
           />
         </div>

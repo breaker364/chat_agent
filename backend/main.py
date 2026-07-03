@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .agent import build_agent, stream_agent_events
+from .config import get_runtime_value
 from .session_store import SessionStore
 from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
@@ -155,6 +157,148 @@ def _refresh_session_subagent_tasks(session: dict[str, Any]) -> dict[str, Any]:
     return session
 
 
+def _compact_summary_text(value: Any, limit: int = 500) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 80]}... [truncated {len(text) - limit + 80} chars]"
+
+
+def _tool_counts(tools: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in tools:
+        if item.get("type") != "tool_call":
+            continue
+        name = str(item.get("name") or "tool")
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _extract_artifact_paths(tools: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    path_pattern = re.compile(
+        r"(?:(?:[A-Za-z]:[\\/][^\s\"'<>|]+)|(?:tmp[\\/][^\s\"'<>|]+)|(?:sessionss[\\/][^\s\"'<>|]+)|(?:docs[\\/][^\s\"'<>|]+)|(?:frontend[\\/][^\s\"'<>|]+)|(?:backend[\\/][^\s\"'<>|]+))"
+    )
+    for item in tools:
+        args = item.get("arguments")
+        if isinstance(args, dict):
+            for key in ("path", "output_path", "artifact_path", "file_path"):
+                raw = args.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    paths.append(raw.strip())
+        content = item.get("content")
+        if isinstance(content, str):
+            paths.extend(match.group(0).rstrip(".,);]") for match in path_pattern.finditer(content))
+    unique: list[str] = []
+    seen = set()
+    for path in paths:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique[:20]
+
+
+def _infer_modifications(tools: list[dict[str, Any]]) -> list[str]:
+    modifications: list[str] = []
+    for item in tools:
+        if item.get("type") != "tool_call":
+            continue
+        name = str(item.get("name") or "")
+        args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        target = args.get("path") or args.get("artifact_path") or args.get("output_path") or ""
+        if name in {"write_file", "append_file", "delete_file"}:
+            modifications.append(f"{name}: {target}".strip())
+        elif name == "run_python_file":
+            modifications.append(f"verification/script run: {target or args.get('path', '')}".strip())
+        elif name in {"record_task_item", "update_task_item", "record_script_stage", "record_pitfall"}:
+            modifications.append(f"progress memory updated via {name}")
+    return modifications[:20]
+
+
+def _build_execution_summary(
+    *,
+    user_message: str,
+    final_text: str,
+    tools: list[dict[str, Any]],
+    status: str,
+    failure_reason: str = "",
+) -> dict[str, Any]:
+    counts = _tool_counts(tools)
+    artifact_paths = _extract_artifact_paths(tools)
+    modifications = _infer_modifications(tools)
+    verification_tools = [
+        name for name in counts
+        if name in {"run_python_file", "Agent", "get_subagent_task"} or "verification" in name.lower()
+    ]
+    return {
+        "status": status,
+        "headline": "Task completed." if status == "completed" else "Task did not complete cleanly.",
+        "user_request": _compact_summary_text(user_message, 800),
+        "final_response_preview": _compact_summary_text(final_text, 1200),
+        "tasks_completed": [
+            "Processed the user request through the agent event pipeline.",
+            "Captured tool calls and results for auditability.",
+            "Persisted an execution summary into the current session.",
+        ],
+        "modifications_or_adjustments": modifications,
+        "saved_or_downloaded": artifact_paths,
+        "tool_counts": counts,
+        "verification": verification_tools or ["not detected"],
+        "successful_methods": [
+            "Use the current session's task_progress.execution_summary to recover the latest progress.",
+            "Check task_progress.script_stages for recent execution_summary entries.",
+            "Inspect saved_or_downloaded paths before rerunning expensive or destructive steps.",
+        ],
+        "failure_reason": failure_reason,
+    }
+
+
+def _append_persisted_summary(final_text: str, summary: dict[str, Any]) -> str:
+    body = (final_text or "").strip()
+    if "Persistent Progress Summary" in body:
+        return body
+    lines = [
+        "**Persistent Progress Summary**",
+        f"- Status: {summary.get('status')}",
+        f"- Request: {summary.get('user_request')}",
+        f"- Tools: {', '.join(f'{name} x{count}' if count > 1 else name for name, count in summary.get('tool_counts', {}).items()) or 'none'}",
+    ]
+    modifications = summary.get("modifications_or_adjustments") or []
+    if modifications:
+        lines.append(f"- Modified/adjusted: {'; '.join(modifications[:5])}")
+    artifacts = summary.get("saved_or_downloaded") or []
+    if artifacts:
+        lines.append(f"- Saved/downloaded: {'; '.join(artifacts[:5])}")
+    verification = summary.get("verification") or []
+    lines.append(f"- Verification: {', '.join(verification)}")
+    if summary.get("failure_reason"):
+        lines.append(f"- Failure reason: {summary.get('failure_reason')}")
+    lines.append("- Memory: saved to this session under task_progress.execution_summary and task_progress.script_stages.")
+    return f"{body}\n\n" + "\n".join(lines) if body else "\n".join(lines)
+
+
+def _finalize_agent_response(
+    *,
+    store: SessionStore,
+    session_id: str,
+    user_message: str,
+    final_text: str,
+    tools: list[dict[str, Any]],
+    status: str = "completed",
+    failure_reason: str = "",
+) -> str:
+    summary = _build_execution_summary(
+        user_message=user_message,
+        final_text=final_text,
+        tools=tools,
+        status=status,
+        failure_reason=failure_reason,
+    )
+    final_with_summary = _append_persisted_summary(final_text, summary)
+    store.record_execution_summary(session_id, summary)
+    return final_with_summary
+
+
 # ---------------------------------------------------------------------------
 # REST endpoints
 # ---------------------------------------------------------------------------
@@ -166,6 +310,9 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/feishu/login/init")
+@app.post("/feishu/login/init/")
+@app.post("/feishu/init")
+@app.post("/feishu/qr/init")
 async def feishu_login_init() -> JSONResponse:
     try:
         state = init_feishu_qr_login()
@@ -185,6 +332,9 @@ async def feishu_login_init() -> JSONResponse:
 
 
 @app.post("/feishu/login/poll")
+@app.post("/feishu/login/poll/")
+@app.post("/feishu/poll")
+@app.post("/feishu/qr/poll")
 async def feishu_login_poll(request: Request) -> JSONResponse:
     body = await request.json()
     flow_key = str(body.get("flow_key") or "").strip()
@@ -211,6 +361,7 @@ async def feishu_login_poll(request: Request) -> JSONResponse:
 
 
 @app.get("/feishu/session")
+@app.get("/feishu/status")
 async def feishu_session_status() -> JSONResponse:
     payload = get_feishu_session_store().load()
     return JSONResponse(
@@ -224,6 +375,7 @@ async def feishu_session_status() -> JSONResponse:
 
 
 @app.delete("/feishu/session")
+@app.delete("/feishu/status")
 async def feishu_session_clear() -> JSONResponse:
     get_feishu_session_store().clear()
     return JSONResponse({"ok": True})
@@ -545,6 +697,15 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                         )
                     elif event_type == "done":
                         assistant_text = str(parsed or assistant_text)
+                        assistant_text = _finalize_agent_response(
+                            store=store,
+                            session_id=session["session_id"],
+                            user_message=message,
+                            final_text=assistant_text,
+                            tools=assistant_tools,
+                            status="completed" if assistant_text.strip() else "failed",
+                            failure_reason="" if assistant_text.strip() else "Agent returned no final text.",
+                        )
                         store.replace_last_assistant_message(session["session_id"], assistant_text, tools=assistant_tools)
                         store.update_progress(
                             session["session_id"],
@@ -618,6 +779,15 @@ async def chat_sync(request: Request) -> JSONResponse:
         else:
             os.environ[_CURRENT_SESSION_ID_ENV] = previous_session_env
 
+    final_text = _finalize_agent_response(
+        store=store,
+        session_id=session["session_id"],
+        user_message=message,
+        final_text=final_text,
+        tools=tools,
+        status="completed" if final_text.strip() else "failed",
+        failure_reason="" if final_text.strip() else "Agent returned no final text.",
+    )
     store.replace_last_assistant_message(session["session_id"], final_text, tools=tools)
     store.update_progress(
         session["session_id"],
@@ -631,4 +801,9 @@ async def chat_sync(request: Request) -> JSONResponse:
 
 
 if __name__ == "__main__":
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "backend.main:app",
+        host=str(get_runtime_value("app", "backend_bind_host", "0.0.0.0")),
+        port=int(get_runtime_value("app", "backend_port", 8000)),
+        reload=True,
+    )

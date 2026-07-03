@@ -1,6 +1,13 @@
-import requests, json, re, os
+import json
+import os
+import re
+from pathlib import Path
 
-BASE = "http://localhost:8000"
+import requests
+
+_config_path = Path(__file__).resolve().parent / "runtime_config.json"
+_config = json.loads(_config_path.read_text(encoding="utf-8")) if _config_path.exists() else {}
+BASE = os.environ.get("CHAT_AGENT_API_BASE_URL") or _config["app"]["api_base_url"]
 
 # Read the current skill definition
 r = requests.get(f"{BASE}/skills")

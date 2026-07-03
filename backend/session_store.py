@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-SESSION_DIR_NAME = "sessionss"
+from .config import get_runtime_value
+
 MAX_SESSION_TITLE_LENGTH = 40
-_RESERVED_SESSION_FILENAMES = {"feishu_web_session.json"}
+MAX_STORED_MESSAGE_CHARS = 80_000
+MAX_STORED_TOOL_CONTENT_CHARS = 16_000
+MAX_STORED_TOOL_ARGUMENT_CHARS = 8_000
+_SESSION_FILE_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -31,17 +36,59 @@ def _make_title(message: str) -> str:
     return f"{title[:MAX_SESSION_TITLE_LENGTH - 3]}..."
 
 
+def _compact_text(value: Any, limit: int) -> Any:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    head = value[: max(0, limit - 220)]
+    return f"{head}\n\n[... truncated {len(value) - len(head)} chars for session storage ...]"
+
+
+def _compact_jsonable(value: Any, limit: int) -> Any:
+    if isinstance(value, str):
+        return _compact_text(value, limit)
+    if isinstance(value, dict):
+        return {str(key): _compact_jsonable(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_compact_jsonable(item, limit) for item in value]
+    return value
+
+
+def _compact_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    item = dict(tool)
+    if "content" in item:
+        item["content"] = _compact_text(item.get("content"), MAX_STORED_TOOL_CONTENT_CHARS)
+    if "arguments" in item:
+        item["arguments"] = _compact_jsonable(item.get("arguments"), MAX_STORED_TOOL_ARGUMENT_CHARS)
+    return item
+
+
+def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
+    item = dict(message)
+    item["content"] = _compact_text(item.get("content"), MAX_STORED_MESSAGE_CHARS)
+    tools = item.get("tools", [])
+    if isinstance(tools, list):
+        item["tools"] = [_compact_tool(tool) if isinstance(tool, dict) else tool for tool in tools]
+    else:
+        item["tools"] = []
+    return item
+
+
 class SessionStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        self.sessions_dir = self.root / SESSION_DIR_NAME
+        session_dir = str(get_runtime_value("paths", "session_dir", "sessionss") or "sessionss")
+        self.sessions_dir = self.root / session_dir
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     def session_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{_slugify_session_id(session_id)}.json"
 
     def _is_reserved_session_file(self, path: Path) -> bool:
-        return path.name in _RESERVED_SESSION_FILENAMES
+        feishu_session_file = str(
+            get_runtime_value("paths", "feishu_session_file", "feishu_web_session.json")
+            or "feishu_web_session.json"
+        )
+        return path.name == feishu_session_file
 
     def _looks_like_chat_session(self, data: dict[str, Any]) -> bool:
         return (
@@ -83,7 +130,15 @@ class SessionStore:
         path = self.session_path(session_id)
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            corrupt_path = path.with_suffix(f".corrupt-{uuid4().hex[:8]}.json")
+            try:
+                path.replace(corrupt_path)
+            except Exception:
+                pass
+            return None
         if not self._looks_like_chat_session(data):
             return None
         if "task_progress" not in data:
@@ -127,9 +182,72 @@ class SessionStore:
         return session
 
     def save_session(self, session: dict[str, Any]) -> None:
-        session["updated_at"] = _now_iso()
-        path = self.session_path(session["session_id"])
-        path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+        with _SESSION_FILE_LOCK:
+            session["updated_at"] = _now_iso()
+            path = self.session_path(session["session_id"])
+            payload = dict(session)
+            messages = payload.get("messages", [])
+            if isinstance(messages, list):
+                payload["messages"] = [
+                    _compact_message(message) if isinstance(message, dict) else message
+                    for message in messages
+                ]
+            tmp_path = path.with_suffix(f".tmp-{uuid4().hex}.json")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                tmp_path.replace(path)
+            except PermissionError:
+                # Windows can transiently lock the target during rapid session polling.
+                # Fall back to remove-then-replace, then direct write as a last resort.
+                try:
+                    if path.exists():
+                        path.unlink()
+                    tmp_path.replace(path)
+                except PermissionError:
+                    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
+    def record_execution_summary(self, session_id: str, summary: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        progress["execution_summary"] = {
+            **summary,
+            "updated_at": _now_iso(),
+        }
+        stages = progress.setdefault("script_stages", [])
+        stages.append(
+            {
+                "stage_name": "execution_summary",
+                "status": str(summary.get("status") or "completed"),
+                "summary": str(summary.get("headline") or summary.get("message") or "Execution summary saved."),
+                "artifact_path": ", ".join(str(path) for path in summary.get("saved_or_downloaded", [])[:5])
+                if isinstance(summary.get("saved_or_downloaded"), list)
+                else "",
+                "created_at": _now_iso(),
+            }
+        )
+        progress["script_stages"] = stages[-100:]
+        tasks = progress.setdefault("task_items", [])
+        tasks = [item for item in tasks if item.get("task_id") != "latest-execution-summary"]
+        tasks.append(
+            {
+                "task_id": "latest-execution-summary",
+                "title": str(summary.get("headline") or "Latest execution summary"),
+                "status": str(summary.get("status") or "completed"),
+                "details": str(summary.get("final_response_preview") or ""),
+                "artifact_path": ", ".join(str(path) for path in summary.get("saved_or_downloaded", [])[:5])
+                if isinstance(summary.get("saved_or_downloaded"), list)
+                else "",
+                "created_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+        )
+        progress["task_items"] = tasks[-200:]
+        self.save_session(session)
+        return session
 
     def rename_session(self, session_id: str, title: str) -> dict[str, Any] | None:
         session = self.load_session(session_id)
@@ -332,4 +450,18 @@ class SessionStore:
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
                 history.append({"role": role, "content": content})
+        progress = session.get("task_progress", {})
+        summary = progress.get("execution_summary") if isinstance(progress, dict) else None
+        if isinstance(summary, dict):
+            memory_lines = [
+                "Session memory from previous execution:",
+                f"- Status: {summary.get('status', '')}",
+                f"- Request: {summary.get('user_request', '')}",
+                f"- Recent changes: {'; '.join(summary.get('modifications_or_adjustments') or [])}",
+                f"- Saved/downloaded: {'; '.join(summary.get('saved_or_downloaded') or [])}",
+                f"- Successful methods: {'; '.join(summary.get('successful_methods') or [])}",
+            ]
+            if summary.get("failure_reason"):
+                memory_lines.append(f"- Previous failure reason: {summary.get('failure_reason')}")
+            history.append({"role": "assistant", "content": "\n".join(memory_lines)})
         return history

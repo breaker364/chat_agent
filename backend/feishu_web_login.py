@@ -12,10 +12,11 @@ from typing import Any
 import qrcode
 import requests
 
+from .config import get_runtime_value
+
 LOGIN_INIT_URL = "https://login.feishu.cn/accounts/qrlogin/init"
 LOGIN_POLL_URL = "https://login.feishu.cn/accounts/qrlogin/polling"
 DEFAULT_REDIRECT_URL = "https://www.feishu.cn"
-SESSION_STORE_FILE = "feishu_web_session.json"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 QR_LOGIN_HEADERS = {
@@ -39,7 +40,12 @@ class FeishuQrLoginState:
 class FeishuWebSessionStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        self.path = self.root / "sessionss" / SESSION_STORE_FILE
+        session_dir = str(get_runtime_value("paths", "session_dir", "sessionss") or "sessionss")
+        session_file = str(
+            get_runtime_value("paths", "feishu_session_file", "feishu_web_session.json")
+            or "feishu_web_session.json"
+        )
+        self.path = self.root / session_dir / session_file
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> dict[str, Any] | None:

@@ -6,20 +6,58 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_CONFIG_PATH = PROJECT_ROOT / "runtime_config.json"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
-LEGACY_LLM_CONFIG_PATH = Path(
-    r"D:\NoobhekProject\cae-fusion-demo\code\LLM_tools\llm_provider_deepseek.json"
-)
 DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 DEFAULT_MCD_MCP_URL = "https://mcp.mcd.cn"
+
+
+def load_runtime_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Load deploy-time paths, ports, and local runtime settings."""
+    resolved = Path(
+        config_path
+        or os.environ.get("CHAT_AGENT_RUNTIME_CONFIG", "")
+        or RUNTIME_CONFIG_PATH
+    ).expanduser()
+    if not resolved.is_absolute():
+        resolved = PROJECT_ROOT / resolved
+    if not resolved.exists():
+        return {}
+    data = json.loads(resolved.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def get_runtime_value(section: str, key: str, default: Any = None) -> Any:
+    """Return a single runtime config value with environment override support."""
+    env_key = f"CHAT_AGENT_{section}_{key}".upper()
+    if env_key in os.environ:
+        return os.environ[env_key]
+    section_data = load_runtime_config().get(section, {})
+    if isinstance(section_data, dict) and key in section_data:
+        return section_data[key]
+    return default
+
+
+def resolve_runtime_path(value: str | Path | None, default: str | Path) -> Path:
+    raw = Path(str(value or default)).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    return (PROJECT_ROOT / raw).resolve()
 
 
 def _resolve_config_path(config_path: str | Path | None = None) -> Path:
     if config_path:
         return Path(config_path).expanduser().resolve()
-    if DEFAULT_CONFIG_PATH.exists():
-        return DEFAULT_CONFIG_PATH.resolve()
-    return LEGACY_LLM_CONFIG_PATH.resolve()
+    configured = resolve_runtime_path(
+        get_runtime_value("paths", "llm_config_path", "config.json"),
+        DEFAULT_CONFIG_PATH,
+    )
+    if configured.exists():
+        return configured
+    legacy = str(get_runtime_value("paths", "legacy_llm_config_path", "") or "").strip()
+    if legacy:
+        return Path(legacy).expanduser().resolve()
+    return DEFAULT_CONFIG_PATH.resolve()
 
 
 def load_app_config(config_path: str | Path | None = None) -> dict[str, Any]:

@@ -4,22 +4,55 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backendDir = Join-Path $root "backend"
 $frontendDir = Join-Path $root "frontend"
+$runtimeConfigPath = Join-Path $root "runtime_config.json"
+$runtimeConfig = @{}
+if (Test-Path $runtimeConfigPath) {
+    $runtimeConfig = Get-Content $runtimeConfigPath -Raw | ConvertFrom-Json
+}
+$appConfig = if ($runtimeConfig.PSObject.Properties.Name -contains "app") { $runtimeConfig.app } else { $null }
+$pathConfig = if ($runtimeConfig.PSObject.Properties.Name -contains "paths") { $runtimeConfig.paths } else { $null }
+
+function Get-ConfigValue {
+    param(
+        [Parameter(Mandatory = $false)]
+        [object]$Section,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [object]$Default
+    )
+
+    if ($null -ne $Section -and $Section.PSObject.Properties.Name -contains $Name) {
+        $value = $Section.$Name
+        if ($null -ne $value -and "$value" -ne "") {
+            return $value
+        }
+    }
+    return $Default
+}
+
+$backendHost = [string](Get-ConfigValue -Section $appConfig -Name "backend_host" -Default "127.0.0.1")
+$backendPort = [int](Get-ConfigValue -Section $appConfig -Name "backend_port" -Default 8000)
+$frontendHost = [string](Get-ConfigValue -Section $appConfig -Name "frontend_host" -Default "127.0.0.1")
+$frontendPort = [int](Get-ConfigValue -Section $appConfig -Name "frontend_port" -Default 5173)
+$healthPath = [string](Get-ConfigValue -Section $appConfig -Name "backend_health_path" -Default "/health")
+$pythonExecutable = [string](Get-ConfigValue -Section $pathConfig -Name "python_executable" -Default "")
+$envName = [string](Get-ConfigValue -Section $pathConfig -Name "python_env_name" -Default "env_311")
+$envRoot = [string](Get-ConfigValue -Section $pathConfig -Name "python_env_root" -Default "")
 $backendLogOut = Join-Path $root "backend_stdout.log"
 $backendLogErr = Join-Path $root "backend_stderr.log"
 $frontendLogOut = Join-Path $root "frontend_stdout.log"
 $frontendLogErr = Join-Path $root "frontend_stderr.log"
-$backendUrl = "http://127.0.0.1:8000/health"
-$frontendUrl = "http://127.0.0.1:5173"
-$envName = "env_311"
-$envRoot = "C:\Users\hank.yu3\.conda\envs\env_311"
+$backendUrl = "http://${backendHost}:${backendPort}${healthPath}"
+$frontendUrl = "http://${frontendHost}:${frontendPort}"
 $backendArgs = @(
     "-m",
     "uvicorn",
     "backend.main:app",
     "--host",
-    "127.0.0.1",
+    $backendHost,
     "--port",
-    "8000"
+    "$backendPort"
 )
 
 function Resolve-CommandPath {
@@ -42,19 +75,34 @@ function Resolve-PythonLauncher {
     param(
         [Parameter(Mandatory = $true)]
         [string]$ProjectRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$EnvironmentRoot,
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$PythonExecutable = "",
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$EnvironmentRoot = "",
         [Parameter(Mandatory = $true)]
         [string]$EnvironmentName
     )
 
+    if ($PythonExecutable -and (Test-Path $PythonExecutable)) {
+        return @{
+            Mode = "python"
+            FilePath = $PythonExecutable
+            BaseArguments = @()
+            Description = $PythonExecutable
+        }
+    }
+
     $candidateDirs = @(
         $EnvironmentRoot,
+        $env:CONDA_PREFIX,
+        $env:VIRTUAL_ENV,
         (Join-Path $ProjectRoot $EnvironmentName),
         (Join-Path (Split-Path -Parent $ProjectRoot) $EnvironmentName),
         (Join-Path (Split-Path -Parent (Split-Path -Parent $ProjectRoot)) $EnvironmentName),
         (Join-Path $env:USERPROFILE $EnvironmentName)
-    ) | Select-Object -Unique
+    ) | Where-Object { $_ -and "$_".Trim() } | Select-Object -Unique
 
     foreach ($dir in $candidateDirs) {
         if (-not $dir) {
@@ -75,6 +123,16 @@ function Resolve-PythonLauncher {
                 BaseArguments = @()
                 Description = $pythonPath
             }
+        }
+    }
+
+    $pythonExe = Resolve-CommandPath -Candidates @("python.exe", "python", "py.exe", "py")
+    if ($pythonExe) {
+        return @{
+            Mode = "python"
+            FilePath = $pythonExe
+            BaseArguments = @()
+            Description = "Python from PATH: $pythonExe"
         }
     }
 
@@ -263,7 +321,11 @@ if (-not (Test-Path $frontendDir)) {
     throw "Frontend directory not found: $frontendDir"
 }
 
-$pythonLauncher = Resolve-PythonLauncher -ProjectRoot $root -EnvironmentRoot $envRoot -EnvironmentName $envName
+$pythonLauncher = Resolve-PythonLauncher `
+    -ProjectRoot $root `
+    -PythonExecutable $pythonExecutable `
+    -EnvironmentRoot $envRoot `
+    -EnvironmentName $envName
 
 $npmExe = Resolve-CommandPath -Candidates @("npm.cmd", "npm")
 if (-not $npmExe) {
@@ -278,12 +340,12 @@ if (-not (Test-Path (Join-Path $backendDir "main.py"))) {
     throw "Backend entry file not found: $(Join-Path $backendDir 'main.py')"
 }
 
-Stop-ProcessesOnPort -Port 8000 -Name "backend"
-Stop-ProcessesOnPort -Port 5173 -Name "frontend"
+Stop-ProcessesOnPort -Port $backendPort -Name "backend"
+Stop-ProcessesOnPort -Port $frontendPort -Name "frontend"
 
 Write-Host "Starting backend with $($pythonLauncher.Description)..."
 $backendArgsToRun = @($pythonLauncher.BaseArguments + $backendArgs)
-$env:PYTHON_EXECUTABLE = Join-Path $envRoot "python.exe"
+$env:PYTHON_EXECUTABLE = $pythonLauncher.FilePath
 $backendProcess = Start-BackgroundProcess `
     -FilePath $pythonLauncher.FilePath `
     -ArgumentList $backendArgsToRun `
@@ -298,9 +360,9 @@ $frontendArgs = @(
     "dev",
     "--",
     "--host",
-    "127.0.0.1",
+    $frontendHost,
     "--port",
-    "5173"
+    "$frontendPort"
 )
 $frontendProcess = Start-BackgroundProcess `
     -FilePath $npmExe `
@@ -311,7 +373,7 @@ $frontendProcess = Start-BackgroundProcess `
 Write-Host "Frontend PID: $($frontendProcess.Id)"
 
 $null = Wait-ForHttpReady -Url $backendUrl -Name "Backend" -TimeoutSeconds 30
-$frontendReady = Wait-ForPortListening -Port 5173 -Name "Frontend" -TimeoutSeconds 30
+$frontendReady = Wait-ForPortListening -Port $frontendPort -Name "Frontend" -TimeoutSeconds 30
 
 if ($frontendReady) {
     Write-Host "Opening browser: $frontendUrl"

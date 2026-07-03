@@ -657,11 +657,37 @@ body,
 
 .tool-message,
 .tool-result-message,
+.tool-group-message,
 .progress-message {
   padding: 10px 14px;
   background: var(--tool-bg);
   border: 1px solid var(--tool-border);
   border-radius: var(--radius);
+}
+
+.tool-group-message {
+  display: block;
+}
+
+.tool-group-toggle {
+  width: 100%;
+}
+
+.tool-group-summary {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.tool-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.tool-group-body .message {
+  animation: none;
 }
 
 .progress-message {
@@ -708,6 +734,16 @@ body,
   padding: 10px 12px;
   line-height: 1.5;
   overflow-x: auto;
+}
+
+.tool-collapsed-preview {
+  margin-top: 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Tool result toggle */

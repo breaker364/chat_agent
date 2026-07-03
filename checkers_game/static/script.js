@@ -1,7 +1,7 @@
 /**
  * 跳棋前端游戏逻辑
  */
-const API_BASE = 'http://localhost:5000';
+const API_BASE = window.CHECKERS_API_BASE || window.location.origin;
 
 let gameState = null;
 let selectedPiece = null;  // {row, col}
