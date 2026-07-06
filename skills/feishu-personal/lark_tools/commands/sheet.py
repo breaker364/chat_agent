@@ -642,12 +642,17 @@ def _select_sheets(sheets, opts):
     if sheet_name:
         by_name = [s for s in sheets if s['name'] == sheet_name]
         if not by_name:
+            # Try numeric index
             try:
                 return [sheets[int(sheet_name)]]
             except (ValueError, IndexError):
                 pass
+            # Try sheetId match (e.g. from URL ?sheet=sdM9B5)
+            by_id = [s for s in sheets if s['sheetId'] == sheet_name]
+            if by_id:
+                return by_id
             available = ', '.join(s['name'] for s in sheets)
-            raise RuntimeError(f'Sheet not found: "{sheet_name}". Available: {available}')
+            raise RuntimeError(f'Sheet not found: "{sheet_name}". Available (by name): {available}')
         return by_name
     if opts.get('all'):
         return [s for s in sheets if not s.get('hidden')]

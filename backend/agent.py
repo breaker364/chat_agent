@@ -21,7 +21,7 @@ SYSTEM_PROMPT = load_system_prompt()
 MAX_AGENT_STEPS = 80
 MAX_WEB_SEARCH_CALLS = 10
 MAX_WEB_FETCH_CALLS = 5
-MAX_AGENT_REPAIR_PASSES = 2
+MAX_AGENT_REPAIR_PASSES = 4
 MAX_BACKGROUND_SUBAGENT_POLLS = 6
 MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_TOTAL_CHARS = 24_000
@@ -75,8 +75,8 @@ async def stream_agent_events(
     last_web_search_payload: dict[str, Any] | None = None
     last_web_fetch_results: list[str] = []
     tool_call_names: list[str] = []
+    tool_errors: list[dict[str, str]] = []
     repair_passes = 0
-    launched_background_subagents: list[dict[str, Any]] = []
     launched_background_subagents: list[dict[str, Any]] = []
     last_heartbeat_emitted_at = 0.0
 
@@ -344,6 +344,73 @@ async def stream_agent_events(
     def has_unresolved_background_subagents() -> bool:
         return any(task.get("status") not in {"completed", "idle", "failed"} for task in launched_background_subagents)
 
+    def output_indicates_tool_error(tool_name: str, output: str) -> bool:
+        text = (output or "").strip()
+        lower = text.lower()
+        if not text:
+            return False
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                if payload.get("success") is False or payload.get("error"):
+                    return True
+                if str(payload.get("status") or "").lower() in {"failed", "error", "blocked"}:
+                    return True
+        except Exception:
+            pass
+        benign_markers = {"not detected", "no debug events yet"}
+        if any(marker in lower for marker in benign_markers):
+            return False
+        error_markers = [
+            "traceback", "exception", "runtimeerror", "syntaxerror",
+            "permissionerror", "filenotfounderror", "not found", "file not found",
+            "failed", "error:", "missing required", "invalid ", "no active session",
+            "session is missing", "session expired", "404 not found",
+            "拒绝访问", "不存在", "失败", "报错",
+        ]
+        return any(marker in lower for marker in error_markers)
+
+    def requires_completion_verification(user_message: str) -> bool:
+        normalized = (user_message or "").lower()
+        patterns = [
+            "download", "save", "write", "edit", "modify", "create", "delete",
+            "fix", "implement", "run", "verify", "下载", "保存", "写入",
+            "修改", "更改", "创建", "新建", "删除", "修复", "实现", "验证",
+            "图片", "表格", "文件", "tmp",
+        ]
+        return any(pattern in normalized for pattern in patterns)
+
+    def has_completion_verification_evidence() -> bool:
+        lower_names = {name.lower() for name in tool_call_names}
+        verification_tools = {
+            "run_python_file", "get_file_info", "list_directory", "read_file",
+            "feishu_login_status", "get_subagent_task",
+        }
+        return has_verification_evidence() or bool(lower_names & verification_tools)
+
+    def build_retry_instruction(reason: str) -> str:
+        recent_errors = tool_errors[-5:]
+        if recent_errors:
+            error_lines = []
+            for item in recent_errors:
+                preview = item.get("message", "")
+                if len(preview) > 1200:
+                    preview = preview[:1200] + "\n[... truncated ...]"
+                error_lines.append(f"- Tool `{item.get('tool', 'tool')}` failed/returned error:\n{preview}")
+            errors_text = "\n".join(error_lines)
+        else:
+            errors_text = "- No structured tool error captured."
+        return (
+            "The task is not complete. Continue from the current state and fix the issue without asking the user to paste the error again.\n"
+            f"Reason: {reason}\n\n"
+            f"Recent debug/tool errors:\n{errors_text}\n\n"
+            "Required next actions:\n"
+            "1. Inspect the error and adjust the command, arguments, path, sheet/table/cell selector, or implementation.\n"
+            "2. Re-run the corrected tool call or verification step.\n"
+            "3. Do not finish until the requested output exists or a concrete blocker is proven.\n"
+            "4. If the task created/downloaded/saved/modified anything, verify it with a concrete read/list/stat/API check."
+        )
+
     def build_tool_summary() -> str:
         if not tool_call_names:
             return "none"
@@ -515,6 +582,31 @@ async def stream_agent_events(
             pending_event = None
             break
         except Exception as exc:
+            if repair_passes < MAX_AGENT_REPAIR_PASSES:
+                repair_passes += 1
+                tool_errors.append({"tool": active_tool or "agent_stream", "message": str(exc)})
+                messages.append(HumanMessage(content=build_retry_instruction(f"agent event stream raised: {exc}")))
+                event_stream = agent.astream_events(
+                    {"messages": messages},
+                    config=config,
+                    version="v2",
+                ).__aiter__()
+                pending_event = None
+                active_tool = None
+                yield {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "agent_error_retry",
+                            "message": "Agent/tool error captured; retrying with the error context.",
+                            "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                            "repair_pass": repair_passes,
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                continue
             yield {
                 "event": "error",
                 "data": json.dumps(
@@ -526,7 +618,13 @@ async def stream_agent_events(
                 ),
             }
             fallback_text = collected_text.strip() or f"Agent execution failed: {exc}"
-            yield {"event": "done", "data": json.dumps(fallback_text, ensure_ascii=False)}
+            yield {
+                "event": "done",
+                "data": json.dumps(
+                    ensure_completion_summary(fallback_text, status="failed", failure_reason=str(exc)),
+                    ensure_ascii=False,
+                ),
+            }
             return
 
         kind = event.get("event", "")
@@ -638,6 +736,8 @@ async def stream_agent_events(
             output = data.get("output", "")
             output_str = output.content if isinstance(output, BaseMessage) else str(output)
             tool_name = name or active_tool or "tool"
+            if output_indicates_tool_error(tool_name, output_str):
+                tool_errors.append({"tool": tool_name, "message": output_str[:4000]})
             if tool_name == "web_search":
                 try:
                     last_web_search_payload = json.loads(output_str)
@@ -752,25 +852,35 @@ async def stream_agent_events(
             final_text = collected_text
             if not should_use_collected_text_as_final(final_text) and last_web_search_payload:
                 final_text = build_search_fallback(last_web_search_payload)
+            verification_required = requires_completion_verification(message)
+            recent_tool_error = bool(tool_errors)
             needs_repair = (
                 repair_passes < MAX_AGENT_REPAIR_PASSES
                 and (
-                    looks_incomplete(final_text)
+                    recent_tool_error
+                    or looks_incomplete(final_text)
                     or (is_complex_build_or_fix_task(message) and not has_verification_evidence())
+                    or (verification_required and not has_completion_verification_evidence())
                     or (should_use_subagent(message) and not has_subagent_evidence())
                     or has_unresolved_background_subagents()
                 )
             )
             if needs_repair:
                 repair_passes += 1
-                repair_instruction = (
-                    "The task is not complete yet. "
-                    "Before finishing, you must verify the result concretely. "
-                    "If this is a substantial implementation or exploration request, you must use subagents proactively "
-                    "(Plan, Explore, verification) and/or run_python_file. "
-                    "Do not answer directly if the task should have been decomposed but no subagent was used. "
-                    "Do not stop until you either verify the result or clearly explain a blocking failure."
-                )
+                reasons = []
+                if recent_tool_error:
+                    reasons.append("one or more tool calls returned errors")
+                if looks_incomplete(final_text):
+                    reasons.append("final text looks incomplete")
+                if is_complex_build_or_fix_task(message) and not has_verification_evidence():
+                    reasons.append("implementation/repair task lacks verification")
+                if verification_required and not has_completion_verification_evidence():
+                    reasons.append("requested save/download/modify task lacks concrete verification")
+                if should_use_subagent(message) and not has_subagent_evidence():
+                    reasons.append("complex task lacks subagent use")
+                if has_unresolved_background_subagents():
+                    reasons.append("background subagents are unresolved")
+                repair_instruction = build_retry_instruction("; ".join(reasons) or "completion audit failed")
                 messages.append(HumanMessage(content=repair_instruction))
                 event_stream = agent.astream_events(
                     {"messages": messages},
@@ -783,13 +893,16 @@ async def stream_agent_events(
                     "data": json.dumps(
                         {
                             "stage": "completion_audit_retry",
-                            "message": "Completion audit requested another pass before finalizing.",
+                            "message": "Completion audit found unfinished/error state; retrying with debug context.",
                             "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
                             "repair_pass": repair_passes,
+                            "reasons": reasons,
+                            "tool_errors": tool_errors[-5:],
                         },
                         ensure_ascii=False,
                     ),
                 }
+                tool_errors.clear()
                 continue
             yield {
                 "event": "debug",
@@ -805,7 +918,11 @@ async def stream_agent_events(
             yield {
                 "event": "done",
                 "data": json.dumps(
-                    ensure_completion_summary(final_text, status="completed"),
+                    ensure_completion_summary(
+                        final_text,
+                        status="completed" if not tool_errors else "failed",
+                        failure_reason="; ".join(error.get("tool", "tool") for error in tool_errors) if tool_errors else "",
+                    ),
                     ensure_ascii=False,
                 ),
             }
