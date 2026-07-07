@@ -72,6 +72,16 @@ def _execute_lark_cli(skill_root: Path, request_text: str) -> str:
     if not argv:
         raise RuntimeError("Empty lark command.")
 
+    # posix=False preserves literal quote characters (e.g. --sheet "name"
+    # becomes ['--sheet', '"name"'] instead of ['--sheet', 'name']).
+    # Strip surrounding matching single/double quotes from each arg so that
+    # downstream consumers (like _select_sheets which matches by name/id)
+    # see the clean value.
+    argv = [
+        a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in ('"', "'") else a
+        for a in argv
+    ]
+
     blocked_tokens = {";", "&&", "||", "|", ">", ">>", "<"}
     if any(token in blocked_tokens for token in argv):
         raise RuntimeError("Shell operators are not allowed in lark CLI passthrough. Provide argv-style arguments only.")

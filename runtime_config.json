@@ -16,7 +16,8 @@
     "python_env_name": "env_311",
     "python_env_root": "",
     "llm_config_path": "config.json",
-    "legacy_llm_config_path": ""
+    "legacy_llm_config_path": "",
+    "deepseek_tokenizer_dir": "C:/Users/hank.yu3/Downloads/deepseek_v3_tokenizer"
   },
   "checkers_game": {
     "backend_host": "0.0.0.0",

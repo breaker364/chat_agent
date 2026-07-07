@@ -503,6 +503,32 @@ body,
   color: var(--text);
 }
 
+.cache-ring {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--accent);
+  background:
+    radial-gradient(circle at center, var(--bg-surface) 56%, transparent 58%),
+    conic-gradient(var(--accent) 0turn, var(--accent) var(--cache-hit-turn, 0turn), var(--border-light) var(--cache-hit-turn, 0turn) 1turn);
+  border: 1px solid var(--border-light);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--duration-fast) var(--ease-out), box-shadow var(--duration-fast) var(--ease-out);
+}
+
+.cache-ring:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-glow);
+}
+
 /* ============================================================
    Chat Area
    ============================================================ */
@@ -574,6 +600,37 @@ body,
   font-size: 14px;
   font-family: var(--font-body);
   color: var(--text);
+}
+
+.message-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.message-token-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.assistant-message .message-token-usage {
+  border-color: var(--tool-border);
+  background: var(--tool-bg);
+}
+
+.user-message .message-token-usage {
+  border-color: var(--border-accent);
+  background: var(--accent-subtle);
+  color: var(--accent);
 }
 
 .message-content p {

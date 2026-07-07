@@ -11,11 +11,13 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.prebuilt import create_react_agent
 
 from .config import create_chat_deepseek, load_llm_config
-from .prompts import load_system_prompt
+from .prompts import load_agent_policy, load_system_prompt
 from .skills import get_skill_catalog_text
+from .token_counter import count_text_tokens
 from .tools import get_all_tools
 
 SYSTEM_PROMPT = load_system_prompt()
+AGENT_POLICY = load_agent_policy()
 
 
 MAX_AGENT_STEPS = 80
@@ -30,10 +32,7 @@ HEARTBEAT_EMIT_INTERVAL_SECONDS = 3
 
 
 def estimate_tokens_from_text(text: str) -> int:
-    normalized = text or ""
-    if not normalized:
-        return 0
-    return max(1, (len(normalized) + 3) // 4)
+    return count_text_tokens(text or "")
 
 
 async def build_agent(
@@ -79,6 +78,8 @@ async def stream_agent_events(
     repair_passes = 0
     launched_background_subagents: list[dict[str, Any]] = []
     last_heartbeat_emitted_at = 0.0
+    current_model_usage: dict[str, int] = {}
+    accumulated_model_usage: dict[str, int] = {}
 
     def to_jsonable(value: Any) -> Any:
         try:
@@ -99,6 +100,79 @@ async def stream_agent_events(
         if isinstance(value, (list, tuple)):
             return [sanitize_tool_payload(item) for item in value]
         return to_jsonable(value)
+
+    def merge_usage_delta(target: dict[str, int], usage: dict[str, int]) -> None:
+        for key, value in usage.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            target[key] = target.get(key, 0) + value
+
+    def extract_usage_metadata(value: Any) -> dict[str, int]:
+        if value is None:
+            return {}
+        candidates: list[Any] = []
+        if isinstance(value, dict):
+            candidates.extend(
+                [
+                    value.get("usage_metadata"),
+                    value.get("response_metadata"),
+                    value.get("token_usage"),
+                    value.get("usage"),
+                    value,
+                ]
+            )
+            if isinstance(value.get("response_metadata"), dict):
+                candidates.append(value["response_metadata"].get("token_usage"))
+        else:
+            candidates.extend(
+                [
+                    getattr(value, "usage_metadata", None),
+                    getattr(value, "response_metadata", None),
+                    getattr(value, "token_usage", None),
+                    getattr(value, "usage", None),
+                ]
+            )
+        usage: dict[str, int] = {}
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if not isinstance(candidate, dict):
+                candidate = getattr(candidate, "model_dump", lambda: {})()
+            if not isinstance(candidate, dict):
+                continue
+            nested = candidate.get("token_usage") or candidate.get("usage")
+            if isinstance(nested, dict):
+                candidates.append(nested)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+            ):
+                value = candidate.get(key)
+                if isinstance(value, bool) or not isinstance(value, int):
+                    continue
+                usage[key] = max(usage.get(key, 0), value)
+        if "input_tokens" not in usage and "prompt_tokens" in usage:
+            usage["input_tokens"] = usage["prompt_tokens"]
+        if "output_tokens" not in usage and "completion_tokens" in usage:
+            usage["output_tokens"] = usage["completion_tokens"]
+        if "total_tokens" not in usage and ("input_tokens" in usage or "output_tokens" in usage):
+            usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        return usage
+
+    def build_usage_payload() -> dict[str, Any]:
+        hit = accumulated_model_usage.get("prompt_cache_hit_tokens", 0)
+        miss = accumulated_model_usage.get("prompt_cache_miss_tokens", 0)
+        cache_total = hit + miss
+        return {
+            **accumulated_model_usage,
+            "prompt_cache_total_tokens": cache_total,
+            "prompt_cache_hit_rate": (hit / cache_total) if cache_total else None,
+        }
 
     def compress_history_text(text: str, limit: int = MAX_HISTORY_MESSAGE_CHARS) -> str:
         normalized = (text or "").strip()
@@ -225,109 +299,7 @@ async def stream_agent_events(
         return "\n".join(lines)
 
     def should_use_collected_text_as_final(text: str) -> bool:
-        normalized = (text or "").strip()
-        if not normalized:
-            return False
-        weak_markers = [
-            "让我再查一下",
-            "我再查一下",
-            "我再搜索一下",
-            "让我搜索一下",
-            "let me check",
-            "let me search",
-            "let me look",
-            "i'll search",
-        ]
-        if len(normalized) < 40 and any(marker in normalized.lower() for marker in weak_markers):
-            return False
-        return True
-
-    def is_complex_build_or_fix_task(user_message: str) -> bool:
-        normalized = (user_message or "").lower()
-        patterns = [
-            "fix",
-            "bug",
-            "debug",
-            "refactor",
-            "implement",
-            "build",
-            "write a",
-            "写一个",
-            "实现",
-            "修复",
-            "增加功能",
-            "修改功能",
-            "重构",
-            "程序",
-            "应用",
-        ]
-        return any(pattern in normalized for pattern in patterns)
-
-    def is_simple_direct_task(user_message: str) -> bool:
-        normalized = (user_message or "").lower()
-        direct_patterns = [
-            "read file",
-            "open file",
-            "find function",
-            "find class",
-            "list files",
-            "read ",
-            "grep ",
-            "读取文件",
-            "打开文件",
-            "查找函数",
-            "查找类",
-            "列出文件",
-        ]
-        blocking_patterns = [
-            "fix",
-            "implement",
-            "build",
-            "refactor",
-            "write a",
-            "修复",
-            "实现",
-            "写一个",
-            "重构",
-        ]
-        return any(pattern in normalized for pattern in direct_patterns) and not any(
-            pattern in normalized for pattern in blocking_patterns
-        )
-
-    def should_use_subagent(user_message: str) -> bool:
-        if is_simple_direct_task(user_message):
-            return False
-        normalized = (user_message or "").lower()
-        broad_patterns = [
-            "analyze",
-            "architecture",
-            "design",
-            "plan",
-            "search the codebase",
-            "inspect the project",
-            "大范围",
-            "架构",
-            "设计",
-            "规划",
-            "分析",
-        ]
-        return is_complex_build_or_fix_task(user_message) or any(pattern in normalized for pattern in broad_patterns)
-
-    def build_routing_guidance(user_message: str) -> str:
-        lines: list[str] = []
-        if is_simple_direct_task(user_message):
-            lines.append(
-                "This looks like a simple directed task. Prefer direct tools such as Read, Grep, Glob, Bash, or a single focused tool call instead of spawning subagents."
-            )
-        if should_use_subagent(user_message):
-            lines.append(
-                "This task should be decomposed. Prefer a layered route: Plan first, Explore if broader inspection is needed, and verification before final completion."
-            )
-        if is_complex_build_or_fix_task(user_message):
-            lines.append(
-                "This is a non-trivial implementation or repair request. Verification is required before completion."
-            )
-        return "\n".join(lines)
+        return bool((text or "").strip())
 
     def has_subagent_evidence() -> bool:
         lower_names = {name.lower() for name in tool_call_names}
@@ -346,7 +318,6 @@ async def stream_agent_events(
 
     def output_indicates_tool_error(tool_name: str, output: str) -> bool:
         text = (output or "").strip()
-        lower = text.lower()
         if not text:
             return False
         try:
@@ -358,35 +329,7 @@ async def stream_agent_events(
                     return True
         except Exception:
             pass
-        benign_markers = {"not detected", "no debug events yet"}
-        if any(marker in lower for marker in benign_markers):
-            return False
-        error_markers = [
-            "traceback", "exception", "runtimeerror", "syntaxerror",
-            "permissionerror", "filenotfounderror", "not found", "file not found",
-            "failed", "error:", "missing required", "invalid ", "no active session",
-            "session is missing", "session expired", "404 not found",
-            "拒绝访问", "不存在", "失败", "报错",
-        ]
-        return any(marker in lower for marker in error_markers)
-
-    def requires_completion_verification(user_message: str) -> bool:
-        normalized = (user_message or "").lower()
-        patterns = [
-            "download", "save", "write", "edit", "modify", "create", "delete",
-            "fix", "implement", "run", "verify", "下载", "保存", "写入",
-            "修改", "更改", "创建", "新建", "删除", "修复", "实现", "验证",
-            "图片", "表格", "文件", "tmp",
-        ]
-        return any(pattern in normalized for pattern in patterns)
-
-    def has_completion_verification_evidence() -> bool:
-        lower_names = {name.lower() for name in tool_call_names}
-        verification_tools = {
-            "run_python_file", "get_file_info", "list_directory", "read_file",
-            "feishu_login_status", "get_subagent_task",
-        }
-        return has_verification_evidence() or bool(lower_names & verification_tools)
+        return False
 
     def build_retry_instruction(reason: str) -> str:
         recent_errors = tool_errors[-5:]
@@ -401,16 +344,52 @@ async def stream_agent_events(
         else:
             errors_text = "- No structured tool error captured."
         return (
+            f"{AGENT_POLICY}\n\n"
             "The task is not complete. Continue from the current state and fix the issue without asking the user to paste the error again.\n"
             f"Reason: {reason}\n\n"
             f"Recent debug/tool errors:\n{errors_text}\n\n"
-            "Required next actions:\n"
-            "1. Inspect the error and adjust the command, arguments, path, sheet/table/cell selector, or implementation.\n"
-            "2. Re-run the corrected tool call or verification step.\n"
-            "3. Do not finish until the requested output exists or a concrete blocker is proven.\n"
-            "4. If the task created/downloaded/saved/modified anything, verify it with a concrete read/list/stat/API check."
+            "Follow the policy above. Re-run corrected tool calls and verify concrete outputs before finalizing."
         )
 
+    def looks_incomplete(final_text: str) -> bool:
+        return not bool((final_text or "").strip())
+
+    def audit_completion_with_policy(final_text: str) -> dict[str, Any]:
+        try:
+            cfg = load_llm_config()
+            llm = create_chat_deepseek(cfg, temperature=0.0, streaming=False)
+            tool_summary = build_tool_summary()
+            error_summary = json.dumps(tool_errors[-5:], ensure_ascii=False, indent=2)
+            prompt = (
+                f"{AGENT_POLICY}\n\n"
+                "Audit the current agent run. Return only JSON with keys: "
+                "complete (boolean), reason (string), required_next_action (string), status (completed|failed|needs_retry).\n\n"
+                f"User request:\n{message}\n\n"
+                f"Final text:\n{final_text[:4000]}\n\n"
+                f"Tool summary:\n{tool_summary}\n\n"
+                f"Recent tool errors:\n{error_summary}\n"
+            )
+            response = llm.invoke([
+                SystemMessage(content="You are a strict completion auditor. Return valid JSON only."),
+                HumanMessage(content=prompt),
+            ])
+            raw = response.content if hasattr(response, "content") else str(response)
+            parsed = json.loads(str(raw).strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as exc:
+            return {
+                "complete": bool((final_text or "").strip()) and not tool_errors,
+                "reason": f"policy audit fallback after error: {exc}",
+                "required_next_action": "continue or report concrete blocker",
+                "status": "completed" if final_text.strip() and not tool_errors else "needs_retry",
+            }
+        return {
+            "complete": bool((final_text or "").strip()) and not tool_errors,
+            "reason": "policy audit returned invalid shape",
+            "required_next_action": "continue or report concrete blocker",
+            "status": "completed" if final_text.strip() and not tool_errors else "needs_retry",
+        }
     def build_tool_summary() -> str:
         if not tool_call_names:
             return "none"
@@ -469,8 +448,9 @@ async def stream_agent_events(
         ]
         return any(marker in normalized for marker in markers)
 
-    routing_guidance = build_routing_guidance(message)
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+    if AGENT_POLICY:
+        messages.append(SystemMessage(content=f"Agent behavior policy:\n{AGENT_POLICY}"))
     skill_catalog_text = get_skill_catalog_text(Path.cwd())
     if skill_catalog_text:
         messages.append(
@@ -483,8 +463,6 @@ async def stream_agent_events(
                 )
             )
         )
-    if routing_guidance:
-        messages.append(SystemMessage(content=routing_guidance))
     effective_history = trim_history(history)
     context_message_count = len(effective_history) + 2
     context_char_count = sum(len(msg.get("content", "")) for msg in effective_history)
@@ -492,11 +470,8 @@ async def stream_agent_events(
     if skill_catalog_text:
         context_char_count += len(skill_catalog_text)
         context_message_count += 1
-    if routing_guidance:
-        context_char_count += len(routing_guidance)
-        context_message_count += 1
     context_token_estimate = estimate_tokens_from_text("".join(
-        [SYSTEM_PROMPT, skill_catalog_text or "", routing_guidance or "", message]
+        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", message]
         + [msg.get("content", "") for msg in effective_history]
     ))
 
@@ -634,6 +609,9 @@ async def stream_agent_events(
         if kind == "on_chat_model_stream":
             chunk = data.get("chunk", None)
             if chunk is not None:
+                usage = extract_usage_metadata(chunk)
+                if usage:
+                    current_model_usage = usage
                 token = chunk.content if isinstance(chunk.content, str) else ""
                 if token:
                     collected_text += token
@@ -783,6 +761,7 @@ async def stream_agent_events(
             }
 
         elif kind == "on_chat_model_start":
+            current_model_usage = {}
             yield {
                 "event": "debug",
                 "data": json.dumps(
@@ -796,6 +775,24 @@ async def stream_agent_events(
             }
 
         elif kind == "on_chat_model_end":
+            usage = extract_usage_metadata(data.get("output"))
+            if usage:
+                current_model_usage = usage
+            if current_model_usage:
+                merge_usage_delta(accumulated_model_usage, current_model_usage)
+                yield {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "model_usage",
+                            "message": "Model usage received.",
+                            "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                            "usage": build_usage_payload(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                current_model_usage = {}
             yield {
                 "event": "debug",
                 "data": json.dumps(
@@ -852,16 +849,13 @@ async def stream_agent_events(
             final_text = collected_text
             if not should_use_collected_text_as_final(final_text) and last_web_search_payload:
                 final_text = build_search_fallback(last_web_search_payload)
-            verification_required = requires_completion_verification(message)
             recent_tool_error = bool(tool_errors)
+            audit = audit_completion_with_policy(final_text)
             needs_repair = (
                 repair_passes < MAX_AGENT_REPAIR_PASSES
                 and (
                     recent_tool_error
-                    or looks_incomplete(final_text)
-                    or (is_complex_build_or_fix_task(message) and not has_verification_evidence())
-                    or (verification_required and not has_completion_verification_evidence())
-                    or (should_use_subagent(message) and not has_subagent_evidence())
+                    or not bool(audit.get("complete"))
                     or has_unresolved_background_subagents()
                 )
             )
@@ -870,14 +864,8 @@ async def stream_agent_events(
                 reasons = []
                 if recent_tool_error:
                     reasons.append("one or more tool calls returned errors")
-                if looks_incomplete(final_text):
-                    reasons.append("final text looks incomplete")
-                if is_complex_build_or_fix_task(message) and not has_verification_evidence():
-                    reasons.append("implementation/repair task lacks verification")
-                if verification_required and not has_completion_verification_evidence():
-                    reasons.append("requested save/download/modify task lacks concrete verification")
-                if should_use_subagent(message) and not has_subagent_evidence():
-                    reasons.append("complex task lacks subagent use")
+                if not bool(audit.get("complete")):
+                    reasons.append(str(audit.get("reason") or "policy audit says task is incomplete"))
                 if has_unresolved_background_subagents():
                     reasons.append("background subagents are unresolved")
                 repair_instruction = build_retry_instruction("; ".join(reasons) or "completion audit failed")
@@ -983,3 +971,4 @@ async def simple_chat(
             except Exception:
                 return str(data)
     return ""
+

@@ -44,6 +44,7 @@ $backendLogErr = Join-Path $root "backend_stderr.log"
 $frontendLogOut = Join-Path $root "frontend_stdout.log"
 $frontendLogErr = Join-Path $root "frontend_stderr.log"
 $backendUrl = "http://${backendHost}:${backendPort}${healthPath}"
+$backendReadyUrl = "http://${backendHost}:${backendPort}/feishu/session"
 $frontendUrl = "http://${frontendHost}:${frontendPort}"
 $backendArgs = @(
     "-m",
@@ -372,7 +373,8 @@ $frontendProcess = Start-BackgroundProcess `
     -StdErrPath $frontendLogErr
 Write-Host "Frontend PID: $($frontendProcess.Id)"
 
-$null = Wait-ForHttpReady -Url $backendUrl -Name "Backend" -TimeoutSeconds 30
+$null = Wait-ForHttpReady -Url $backendUrl -Name "Backend health" -TimeoutSeconds 30
+$null = Wait-ForHttpReady -Url $backendReadyUrl -Name "Backend routes" -TimeoutSeconds 30
 $frontendReady = Wait-ForPortListening -Port $frontendPort -Name "Frontend" -TimeoutSeconds 30
 
 if ($frontendReady) {

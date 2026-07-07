@@ -123,6 +123,25 @@ function writeFeishuCollapsed(collapsed) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function formatPercent(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  return `${Math.round(value * 1000) / 10}%`;
+}
+
+function formatTokenCount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "0";
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function formatTurn(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "0turn";
+  return `${Math.min(1, Math.max(0, value))}turn`;
+}
+
 function iconForTool(toolName) {
   const label = (toolName || "").toLowerCase();
   if (label.includes("search")) return <Globe size={14} />;
@@ -148,6 +167,45 @@ function tryParseJson(value) {
   } catch {
     return null;
   }
+}
+
+function MessageTokenUsage({ role, usage }) {
+  if (!usage || typeof usage !== "object") return null;
+
+  if (role === "user") {
+    const contentTokens = usage.content_tokens;
+    if (typeof contentTokens !== "number" || !Number.isFinite(contentTokens)) return null;
+    return (
+      <div className="message-token-usage" title="DeepSeek tokenizer content token count">
+        tokens {formatTokenCount(contentTokens)}
+      </div>
+    );
+  }
+
+  const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
+  const outputTokens = usage.output_tokens || usage.completion_tokens || 0;
+  const cacheHitTokens = usage.prompt_cache_hit_tokens || 0;
+  const cacheMissTokens = usage.prompt_cache_miss_tokens || 0;
+  const cacheTotalTokens = usage.prompt_cache_total_tokens || cacheHitTokens + cacheMissTokens;
+  const totalTokens = usage.total_tokens || inputTokens + outputTokens;
+  const hasAny =
+    inputTokens > 0 ||
+    outputTokens > 0 ||
+    totalTokens > 0 ||
+    cacheHitTokens > 0 ||
+    cacheMissTokens > 0;
+  if (!hasAny) return null;
+
+  return (
+    <div
+      className="message-token-usage"
+      title={`Input ${formatTokenCount(inputTokens)} | Output ${formatTokenCount(outputTokens)} | Cache hit ${formatTokenCount(cacheHitTokens)} / miss ${formatTokenCount(cacheMissTokens)}`}
+    >
+      in {formatTokenCount(inputTokens)} · out {formatTokenCount(outputTokens)} · cache hit{" "}
+      {formatTokenCount(cacheHitTokens)}
+      {cacheTotalTokens ? `/${formatTokenCount(cacheTotalTokens)}` : ""} · total {formatTokenCount(totalTokens)}
+    </div>
+  );
 }
 
 function ToolCallBubble({ toolName, args }) {
@@ -1001,11 +1059,7 @@ export default function App() {
       }
       return data.session_id;
     } catch {
-      setActiveSessionId(sessionId);
-      writeLastSessionId(sessionId);
-      setTaskProgress(null);
-      setContextStats(null);
-      return sessionId;
+      return null;
     }
   }, [defaultAssistantMessage, scrollDown]);
 
@@ -1337,11 +1391,16 @@ export default function App() {
       const initPaths = ["/feishu/login/init", "/feishu/init", "/feishu/qr/init"];
       let resp = null;
       let lastPayload = null;
-      for (const path of initPaths) {
-        resp = await fetch(`${API_BASE}${path}`, { method: "POST" });
-        const payload = await readResponsePayload(resp);
-        lastPayload = payload;
-        if (resp.ok || resp.status !== 404) break;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        for (const path of initPaths) {
+          resp = await fetch(`${API_BASE}${path}`, { method: "POST" });
+          const payload = await readResponsePayload(resp);
+          lastPayload = payload;
+          if (resp.ok || resp.status !== 404) break;
+        }
+        if (resp?.ok || resp?.status !== 404) break;
+        setFeishuLoginState({ message: "Backend is still warming up Feishu routes. Retrying..." });
+        await sleep(750);
       }
       const { ok, data, text } = lastPayload || {};
       if (!resp?.ok) throw new Error((ok && (data?.error || data?.detail)) || text || `HTTP ${resp?.status || "unknown"}`);
@@ -1462,7 +1521,7 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const runState = { assistantContent: "", tools: [], debug: [] };
+    const runState = { assistantContent: "", tools: [], debug: [], usage: null };
 
     function pushToolEvent(event) {
       const last = runState.tools[runState.tools.length - 1];
@@ -1505,6 +1564,9 @@ export default function App() {
         });
       } else if (eventType === "debug") {
         const { message, elapsed_seconds, stage, ...details } = parsed || {};
+        if (stage === "model_usage" && parsed?.usage && typeof parsed.usage === "object") {
+          runState.usage = parsed.usage;
+        }
         pushDebugEvent({
           type: "debug",
           message: message || "Debug event",
@@ -1575,6 +1637,7 @@ export default function App() {
           role: "assistant",
           content: runState.assistantContent || "(no text reply)",
           tools: runState.tools,
+          usage: runState.usage || {},
         },
       ]);
       await refreshSessions();
@@ -1583,12 +1646,22 @@ export default function App() {
       if (err.name === "AbortError") {
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: runState.assistantContent || "(stopped)", tools: runState.tools },
+          {
+            role: "assistant",
+            content: runState.assistantContent || "(stopped)",
+            tools: runState.tools,
+            usage: runState.usage || {},
+          },
         ]);
       } else {
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: `Request failed: ${err.message}`, tools: runState.tools },
+          {
+            role: "assistant",
+            content: `Request failed: ${err.message}`,
+            tools: runState.tools,
+            usage: runState.usage || {},
+          },
         ]);
         pushDebugEvent({
           type: "debug",
@@ -1650,6 +1723,16 @@ export default function App() {
                 ctx {contextStats.history_messages} msg / {contextStats.history_token_estimate} tok
               </span>
             ) : null}
+            {contextStats?.usage?.prompt_cache_total_tokens ? (
+              <span
+                className="cache-ring"
+                style={{ "--cache-hit-turn": formatTurn(contextStats.usage.prompt_cache_hit_rate) }}
+                title={`Cache hit rate: ${formatPercent(contextStats.usage.prompt_cache_hit_rate)} | hit ${contextStats.usage.prompt_cache_hit_tokens || 0} / miss ${contextStats.usage.prompt_cache_miss_tokens || 0}`}
+                aria-label={`Cache hit rate ${formatPercent(contextStats.usage.prompt_cache_hit_rate)}`}
+              >
+                {formatPercent(contextStats.usage.prompt_cache_hit_rate)}
+              </span>
+            ) : null}
           </div>
         </header>
 
@@ -1682,7 +1765,10 @@ export default function App() {
                   <div className="message-avatar">
                     {msg.role === "user" ? <User size={16} /> : <Bot size={16} />}
                   </div>
-                  <ChatMessageContent content={msg.content} />
+                  <div className="message-body">
+                    <ChatMessageContent content={msg.content} />
+                    <MessageTokenUsage role={msg.role} usage={msg.usage} />
+                  </div>
                 </div>
                 {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
               </div>

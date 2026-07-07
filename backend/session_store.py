@@ -65,6 +65,8 @@ def _compact_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
     item = dict(message)
     item["content"] = _compact_text(item.get("content"), MAX_STORED_MESSAGE_CHARS)
+    usage = item.get("usage")
+    item["usage"] = usage if isinstance(usage, dict) else {}
     tools = item.get("tools", [])
     if isinstance(tools, list):
         item["tools"] = [_compact_tool(tool) if isinstance(tool, dict) else tool for tool in tools]
@@ -90,6 +92,9 @@ class SessionStore:
         )
         return path.name == feishu_session_file
 
+    def _is_archived_session_file(self, path: Path) -> bool:
+        return bool(re.search(r"\.corrupt-[0-9a-f]+\.json$", path.name, re.IGNORECASE))
+
     def _looks_like_chat_session(self, data: dict[str, Any]) -> bool:
         return (
             isinstance(data, dict)
@@ -99,12 +104,13 @@ class SessionStore:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
+        seen_session_ids: set[str] = set()
         for path in sorted(
             self.sessions_dir.glob("*.json"),
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         ):
-            if self._is_reserved_session_file(path):
+            if self._is_reserved_session_file(path) or self._is_archived_session_file(path):
                 continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -112,9 +118,13 @@ class SessionStore:
                 continue
             if not self._looks_like_chat_session(data):
                 continue
+            session_id = data.get("session_id", path.stem)
+            if session_id in seen_session_ids:
+                continue
+            seen_session_ids.add(session_id)
             sessions.append(
                 {
-                    "session_id": data.get("session_id", path.stem),
+                    "session_id": session_id,
                     "title": data.get("title", path.stem),
                     "created_at": data.get("created_at"),
                     "updated_at": data.get("updated_at"),
@@ -272,6 +282,7 @@ class SessionStore:
         role: str,
         content: str,
         tools: list[dict[str, Any]] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session = self.create_or_get_session(session_id, first_message=content if role == "user" else "")
         if role == "user" and not session.get("messages"):
@@ -281,6 +292,7 @@ class SessionStore:
                 "role": role,
                 "content": content,
                 "tools": tools or [],
+                "usage": usage or {},
                 "created_at": _now_iso(),
             }
         )
@@ -292,12 +304,14 @@ class SessionStore:
         session_id: str,
         content: str,
         tools: list[dict[str, Any]] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session = self.create_or_get_session(session_id)
         messages = session.setdefault("messages", [])
         if messages and messages[-1].get("role") == "assistant":
             messages[-1]["content"] = content
             messages[-1]["tools"] = tools or []
+            messages[-1]["usage"] = usage or {}
             messages[-1]["updated_at"] = _now_iso()
         else:
             messages.append(
@@ -305,6 +319,7 @@ class SessionStore:
                     "role": "assistant",
                     "content": content,
                     "tools": tools or [],
+                    "usage": usage or {},
                     "created_at": _now_iso(),
                 }
             )

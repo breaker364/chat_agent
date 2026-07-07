@@ -21,6 +21,7 @@ from .session_store import SessionStore
 from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
+from .token_counter import count_message_tokens, count_text_tokens, normalize_usage
 from .tools import _CURRENT_SESSION_ID_ENV
 from .feishu_web_login import (
     FeishuWebSessionStore,
@@ -126,6 +127,9 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
         if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
     ]
     history_chars = sum(len(item.get("content", "")) for item in history_messages)
+    history_token_estimate = count_message_tokens(
+        [{"role": item.get("role", "user"), "content": item.get("content", "")} for item in history_messages]
+    )
     return {
         "session_id": session.get("session_id"),
         "title": session.get("title"),
@@ -138,7 +142,8 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
         "context_stats": {
             "history_messages": len(history_messages),
             "history_chars": history_chars,
-            "history_token_estimate": max(1, (history_chars + 3) // 4) if history_chars else 0,
+            "history_token_estimate": history_token_estimate,
+            "usage": session.get("task_progress", {}).get("usage", {}),
         },
     }
 
@@ -585,7 +590,13 @@ async def chat_stream(request: Request) -> EventSourceResponse:
     merged_history = _merge_history(stored_history, history)
 
     session = store.create_or_get_session(session_id, first_message=message)
-    store.append_message(session["session_id"], "user", message, tools=[])
+    store.append_message(
+        session["session_id"],
+        "user",
+        message,
+        tools=[],
+        usage={"content_tokens": count_text_tokens(message)},
+    )
     store.update_progress(
         session["session_id"],
         status="running",
@@ -598,6 +609,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
     async def event_generator():
         assistant_text = ""
         assistant_tools: list[dict[str, Any]] = []
+        run_usage: dict[str, Any] = {}
         previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
         os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
         event_hub = get_session_event_hub()
@@ -687,6 +699,17 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             last_debug_stage="heartbeat",
                         )
                     elif event_type == "debug":
+                        if parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
+                            run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
+                        if parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
+                            run_usage = {
+                                **run_usage,
+                                **(parsed.get("usage") or {}),
+                            }
+                            store.update_progress(
+                                session["session_id"],
+                                usage=normalize_usage(run_usage, output_text=assistant_text),
+                            )
                         store.update_progress(
                             session["session_id"],
                             status="running",
@@ -706,7 +729,14 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             status="completed" if assistant_text.strip() else "failed",
                             failure_reason="" if assistant_text.strip() else "Agent returned no final text.",
                         )
-                        store.replace_last_assistant_message(session["session_id"], assistant_text, tools=assistant_tools)
+                        final_usage = normalize_usage(run_usage, output_text=assistant_text)
+                        store.replace_last_assistant_message(
+                            session["session_id"],
+                            assistant_text,
+                            tools=assistant_tools,
+                            usage=final_usage,
+                        )
+                        store.update_progress(session["session_id"], usage=final_usage)
                         store.update_progress(
                             session["session_id"],
                             status="idle",
@@ -743,7 +773,13 @@ async def chat_sync(request: Request) -> JSONResponse:
     stored_history = store.get_history(session_id)
     merged_history = _merge_history(stored_history, history)
     session = store.create_or_get_session(session_id, first_message=message)
-    store.append_message(session["session_id"], "user", message, tools=[])
+    store.append_message(
+        session["session_id"],
+        "user",
+        message,
+        tools=[],
+        usage={"content_tokens": count_text_tokens(message)},
+    )
     store.update_progress(
         session["session_id"],
         status="running",
@@ -756,6 +792,7 @@ async def chat_sync(request: Request) -> JSONResponse:
     agent = await get_agent()
     final_text = ""
     tools: list[dict[str, Any]] = []
+    run_usage: dict[str, Any] = {}
     previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
     os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
     try:
@@ -771,6 +808,13 @@ async def chat_sync(request: Request) -> JSONResponse:
                 tools.append({"type": "tool_call", "name": parsed.get("name"), "arguments": parsed.get("arguments")})
             elif event_type == "tool_result":
                 tools.append({"type": "tool_result", "name": parsed.get("name"), "content": parsed.get("content")})
+            elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
+                run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
+            elif event_type == "debug" and parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
+                run_usage = {
+                    **run_usage,
+                    **(parsed.get("usage") or {}),
+                }
             elif event_type == "done":
                 final_text = str(parsed or final_text)
     finally:
@@ -788,7 +832,8 @@ async def chat_sync(request: Request) -> JSONResponse:
         status="completed" if final_text.strip() else "failed",
         failure_reason="" if final_text.strip() else "Agent returned no final text.",
     )
-    store.replace_last_assistant_message(session["session_id"], final_text, tools=tools)
+    final_usage = normalize_usage(run_usage, output_text=final_text)
+    store.replace_last_assistant_message(session["session_id"], final_text, tools=tools, usage=final_usage)
     store.update_progress(
         session["session_id"],
         status="idle",
@@ -796,8 +841,9 @@ async def chat_sync(request: Request) -> JSONResponse:
         message="Ready to continue.",
         elapsed_seconds=0,
         last_debug_stage="done",
+        usage=final_usage,
     )
-    return JSONResponse({"reply": final_text, "session_id": session["session_id"]})
+    return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})
 
 
 if __name__ == "__main__":
