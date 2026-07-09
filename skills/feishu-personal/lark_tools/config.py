@@ -13,7 +13,7 @@ DATA_DIR = os.path.join(os.path.expanduser('~'), '.lark_cli')
 
 GATEWAY_HOST = 'internal-api-lark-api.feishu.cn'
 DOC_HOST = 'nio.feishu.cn'
-BITABLE_HOST = 'www.feishu.cn'
+BITABLE_HOST = 'nio.feishu.cn'
 DOC_IMAGE_HOST = 'internal-api-drive-stream.feishu.cn'
 # docx image upload control-flow host (prepare/blocks/finish).
 # Separate from DOC_IMAGE_HOST which is the data-flow host (merge_block).

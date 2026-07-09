@@ -13,24 +13,53 @@ Use the bundled `lark_tools` code in this skill directory to access Feishu/Lark 
 ## Agent entrypoint
 
 In this Chat Agent, `skill_runner.py` is the executable entrypoint for the `feishu-personal` skill.
-`scripts/lark_cli.py` is the manual CLI shim. The runner now exposes that CLI through an explicit passthrough form:
+It supports **two calling styles**:
+
+### Style 1: Explicit CLI commands (preferred)
 
 ```text
 lark <command> [args]
 ```
 
-Examples:
+### Style 2: Natural language (auto-routed)
+
+You can describe the operation in natural language.  The skill runner detects the
+intent and translates it to the correct CLI command automatically.
+
+| Intent | Auto-routed to |
+|--------|---------------|
+| "创建一个多维表格" / "create a base" | `lark bitable create <title>` |
+| "列出这个base的表" / "list tables" | `lark bitable tables <url>` |
+| "读取记录" / "read records" | `lark bitable records <url> --all` |
+| "添加一条记录" / "add a record" | `lark bitable add-record <url> <tableId> <field=value>...` |
+| "批量写入" / "batch write" | `lark bitable add-records-batch <url> <tableId> <json>` |
+| "添加字段" / "add a field" | `lark bitable add-field <url> <tableId> <name> --type <type>` |
+
+### Complete bitable command reference
 
 ```text
-lark doc read <docx-or-wiki-url>
-lark whiteboard read <blockToken-or-url> --format ai
-lark bitable tables <base-url>
-lark bitable records <base-url> --table <tbl...> --all
-lark sheet read <sheet-url> --range A1:D20
-lark sheet images <sheet-url> --cell E3 --download
+lark bitable create <title>                        — create a new base
+lark bitable tables <url-or-token>                  — list all tables
+lark bitable schema <url> [tableId]                 — show field schema
+lark bitable records <url> --table <tbl> --all      — read all records
+lark bitable add-field <url> <tableId> <name> [--type text|number|checkbox|url|datetime]
+lark bitable add-record <url> <tableId> <field=value>...
+lark bitable add-records-batch <url> <tableId> <json_array>
+lark bitable set-record <url> <tableId> <recordId> <field=value>...
+lark bitable delete-record <url> <tableId> <recordId>
+lark bitable rename-field <url> <tableId> <fieldId> <new_name>
+lark bitable download <url> [tableId] [--out path]
 ```
 
-Use the direct `lark ...` form whenever the request needs a capability that is not covered by the shortcut routes.
+### Standard write workflow (avoids CSRF issues)
+
+```
+1. lark bitable create <title>                     → get obj_token + url
+2. lark bitable tables <url>                        → get table_id
+3. lark bitable add-field <url> <tableId> <name>    → repeat for each field, get field IDs
+4. lark bitable add-records-batch <url> <tableId> '[{"fldXXX":"val1","fldYYY":"val2"}, ...]'
+5. lark bitable records <url> --table <tbl> --all   → verify
+```
 
 ## When to use
 

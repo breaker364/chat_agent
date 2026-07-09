@@ -408,7 +408,8 @@ function SubagentTaskCard({ task }) {
 }
 
 function TaskProgressPanel({ progress, onRefresh }) {
-  const tasks = progress?.task_items || [];
+  const planTodos = progress?.task_plan?.todos || [];
+  const tasks = planTodos.length ? planTodos : (progress?.task_items || []);
   const pitfalls = progress?.pitfalls || [];
   const stages = progress?.script_stages || [];
 
@@ -428,17 +429,17 @@ function TaskProgressPanel({ progress, onRefresh }) {
       <div className="task-progress-body">
         {tasks.length ? (
           <div className="progress-section">
-            <div className="progress-section-title">Todos</div>
+            <div className="progress-section-title">{planTodos.length ? "Task Plan" : "Todos"}</div>
             {tasks.slice().reverse().map((task) => (
-              <div className="progress-card" key={task.task_id}>
+              <div className="progress-card" key={task.task_id || task.content}>
                 <div className="progress-card-header">
-                  <span>{task.title || task.task_id}</span>
+                  <span>{task.status === "in_progress" ? (task.activeForm || task.content) : (task.content || task.title || task.task_id)}</span>
                   <span className={`progress-status progress-status-${task.status || "pending"}`}>
                     {task.status || "pending"}
                   </span>
                 </div>
                 {task.details ? <div className="progress-card-detail">{task.details}</div> : null}
-                {task.artifact_path ? <div className="progress-card-path">{task.artifact_path}</div> : null}
+                {task.result_ref || task.artifact_path ? <div className="progress-card-path">{task.result_ref || task.artifact_path}</div> : null}
               </div>
             ))}
           </div>
@@ -1653,6 +1654,9 @@ export default function App() {
             usage: runState.usage || {},
           },
         ]);
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+        await refreshSessions();
+        await loadSession(ensuredSessionId, { scrollToBottom: false });
       } else {
         setMessages((prev) => [
           ...prev,

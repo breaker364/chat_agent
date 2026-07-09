@@ -30,15 +30,50 @@ def _load_payload() -> dict[str, Any]:
 
 def _load_session_cookie(skill_root: Path) -> str:
     session_file = skill_root.parent.parent / "sessionss" / "feishu_web_session.json"
+    if not session_file.exists():
+        raise RuntimeError(
+            f"Feishu session file not found at {session_file}. "
+            "Run Feishu QR login first (use feishu_login_status to check, then trigger login flow)."
+        )
     payload = json.loads(session_file.read_text(encoding="utf-8"))
     session = str(payload.get("session") or "").strip()
     if not session:
-        raise RuntimeError(f"Missing session cookie in {session_file}")
+        raise RuntimeError(
+            f"Missing session cookie in {session_file}. "
+            "The session file exists but contains no valid session cookie. Run Feishu QR login again."
+        )
     return session
 
 
 def _load_cookies(skill_root: Path) -> list[dict[str, str]]:
     return [{"name": "session", "value": _load_session_cookie(skill_root), "domain": ".feishu.cn"}]
+
+
+def _validate_cookies(skill_root: Path, cookies: list[dict[str, str]]) -> None:
+    """Validate that the session cookie is still accepted by the Feishu server.
+
+    Raises RuntimeError with a clear diagnostic if the session is invalid,
+    so the agent gets immediate feedback instead of a cryptic CSRF/403 error
+    from a downstream HTTP call.
+    """
+    try:
+        from lark_tools.auth import check_auth
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Cannot import lark_tools.auth to validate session: {exc}"
+        ) from exc
+
+    if check_auth(cookies):
+        return
+
+    raise RuntimeError(
+        "Feishu session is NOT valid on the server. "
+        "The stored session cookie has been rejected by the Feishu server "
+        "(CSRF token may have been rotated, session expired server-side, or cookie revoked). "
+        "DO NOT retry with the same session. "
+        "The user must complete a new QR login via feishu_login_status and the QR login flow. "
+        "Also call feishu_logout first to remove the stale session file."
+    )
 
 
 def _patch_requests_no_proxy() -> None:
@@ -168,6 +203,132 @@ def _extract_bitable_target(request_text: str) -> str:
     raise RuntimeError("No Feishu Base URL or base token found in the request.")
 
 
+# ---------------------------------------------------------------------------
+# Shortcut route detectors — map natural-language requests to CLI commands
+# ---------------------------------------------------------------------------
+
+def _detect_bitable_route(request_text: str) -> str | None:
+    """Return a ``lark bitable ...`` CLI command string, or None.
+
+    These detectors let the agent use natural language (e.g. "创建一个多维表格")
+    instead of remembering the exact CLI syntax.  Each detector returns the
+    full CLI command that should be executed.
+    """
+    raw = request_text or ""
+    lowered = raw.lower()
+    target = ""
+    try:
+        target = _extract_bitable_target(raw)
+    except RuntimeError:
+        pass  # some operations (like create) don't need a target
+
+    # --- Create a new base ---
+    if not target and _has_bitable_create_intent(raw):
+        name_match = re.search(
+            r"(?:名为|叫做|标题[是为]?|title\s*[:=]?\s*)([^\s，。；;]+)", raw, re.I,
+        )
+        title = name_match.group(1).strip() if name_match else "新多维表格"
+        return f"lark bitable create {title}"
+
+    # --- List tables in a base ---
+    if target and _has_bitable_list_intent(raw):
+        return f"lark bitable tables {target}"
+
+    # --- Read records ---
+    if target and _has_bitable_read_intent(raw):
+        table_match = re.search(r"(?:table|表)\s*[:=]?\s*([A-Za-z0-9]+)", raw, re.I)
+        table_id = table_match.group(1) if table_match else ""
+        cmd = f"lark bitable records {target} --all"
+        if table_id:
+            cmd += f" --table {table_id}"
+        return cmd
+
+    # --- Add a single record ---
+    if target and _has_bitable_add_record_intent(raw):
+        table_match = re.search(r"(?:table|表)\s*[:=]?\s*([A-Za-z0-9]+)", raw, re.I)
+        table_id = table_match.group(1) if table_match else ""
+        kv_match = re.findall(r"([^\s=]+)=([^\s,，]+)", raw)
+        if kv_match:
+            pairs = " ".join(f"{k}={v}" for k, v in kv_match)
+            if table_id:
+                return f"lark bitable add-record {target} {table_id} {pairs}"
+            else:
+                return f"lark bitable add-record {target} tblTODO {pairs}"
+        return None
+
+    # --- Batch add records ---
+    if target and _has_bitable_batch_intent(raw):
+        table_match = re.search(r"(?:table|表)\s*[:=]?\s*([A-Za-z0-9]+)", raw, re.I)
+        table_id = table_match.group(1) if table_match else "tblTODO"
+        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if json_match:
+            records_json = json_match.group(0)
+            return f"lark bitable add-records-batch {target} {table_id} {records_json}"
+        return None
+
+    # --- Add fields ---
+    if target and _has_bitable_add_field_intent(raw):
+        table_match = re.search(r"(?:table|表)\s*[:=]?\s*([A-Za-z0-9]+)", raw, re.I)
+        table_id = table_match.group(1) if table_match else ""
+        name_match = re.findall(r"(?:字段|field|列)\s*[:=]?\s*([^\s,，;；]+)", raw, re.I)
+        if name_match:
+            fname = name_match[0]
+            type_match = re.search(r"(?:type|类型)\s*[:=]?\s*([A-Za-z]+)", raw, re.I)
+            ftype = type_match.group(1) if type_match else "text"
+            if table_id:
+                return f"lark bitable add-field {target} {table_id} {fname} --type {ftype}"
+            else:
+                return f"lark bitable add-field {target} tblTODO {fname} --type {ftype}"
+        return None
+
+    return None
+
+
+# --- Intent detectors ---
+
+def _has_bitable_create_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("多维表格", "数据表", "bitable", "base"))
+    verbs = any(m in raw for m in ("新建", "创建", "创建一个", "create", "new"))
+    return nouns and verbs
+
+
+def _has_bitable_list_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("表", "表格", "table", "tables"))
+    verbs = any(m in raw for m in ("列出", "查看", "list", "show", "有哪些"))
+    return nouns and verbs
+
+
+def _has_bitable_read_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("记录", "数据", "record", "records"))
+    verbs = any(m in raw for m in ("读取", "查看", "读出", "read", "get", "fetch"))
+    return nouns and verbs
+
+
+def _has_bitable_add_record_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("记录", "数据", "record"))
+    verbs = any(m in raw for m in ("添加", "新增", "写入", "add", "write", "insert"))
+    single = not any(m in low for m in ("批量", "batch", "多条", "多行", "add-records-batch"))
+    return nouns and verbs and single
+
+
+def _has_bitable_batch_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("记录", "数据", "record"))
+    batch = any(m in raw for m in ("批量", "batch", "多条", "多行"))
+    return nouns and batch
+
+
+def _has_bitable_add_field_intent(text: str) -> bool:
+    raw, low = text or "", (text or "").lower()
+    nouns = any(m in raw for m in ("字段", "列", "field", "column"))
+    verbs = any(m in raw for m in ("添加", "新增", "add", "create", "加"))
+    return nouns and verbs
+
+
 def _execute_bitable_add_table(skill_root: Path, request_text: str) -> str:
     from lark_tools.auth import get_current_user_id, load_user_name
     from lark_tools.commands.bitable_write import cmd_bitable_add_table
@@ -248,17 +409,44 @@ def main() -> int:
     payload = _load_payload()
     request_text = str(payload.get("request") or "").strip()
 
+    # ---- Route 1: explicit lark / lark_cli command (highest priority) ----
     if _looks_like_lark_cli_request(request_text):
         result = _execute_lark_cli(skill_root, request_text)
+
+    # ---- Route 2: bitable shortcut routes (auto-detect intent) ----
+    elif (bitable_cmd := _detect_bitable_route(request_text)) is not None:
+        result = _execute_lark_cli(skill_root, bitable_cmd)
+
+    # ---- Route 3: add-table to existing base (deprecated shortcut) ----
     elif _looks_like_bitable_add_table_request(request_text):
+        cookies = _load_cookies(skill_root)
+        _validate_cookies(skill_root, cookies)
         result = _execute_bitable_add_table(skill_root, request_text)
+
+    # ---- Route 4: whiteboard read ----
     elif _looks_like_whiteboard_read_request(request_text):
+        cookies = _load_cookies(skill_root)
+        _validate_cookies(skill_root, cookies)
         result = _execute_whiteboard_read(skill_root, request_text)
+
+    # ---- Route 5: doc/wiki read ----
     elif _looks_like_doc_read_request(request_text):
+        cookies = _load_cookies(skill_root)
+        _validate_cookies(skill_root, cookies)
         result = _execute_doc_read(skill_root, request_text)
+
     else:
         raise RuntimeError(
-            "feishu-personal supports explicit `lark ...` passthrough plus Feishu doc/wiki read, whiteboard read, and Base add-table shortcuts."
+            "feishu-personal: could not determine the requested operation.\n"
+            "Use the explicit `lark ...` form:\n"
+            "  lark bitable create <title>              — create a new base\n"
+            "  lark bitable tables <url>                 — list tables\n"
+            "  lark bitable records <url> --all          — read all records\n"
+            "  lark bitable add-field <url> <tableId> <name> [--type text]\n"
+            "  lark bitable add-record <url> <tableId> <field=value>...\n"
+            "  lark bitable add-records-batch <url> <tableId> <json_array>\n"
+            "  lark doc read <url>                       — read a doc/wiki\n"
+            "  lark whiteboard read <url> --format ai    — read a whiteboard"
         )
 
     sys.stdout.write(json.dumps({"result": result}, ensure_ascii=False))

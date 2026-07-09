@@ -37,6 +37,7 @@ from lark_tools.commands.bitable import (
 from lark_tools.commands.bitable_write import (
     cmd_bitable_create, cmd_bitable_set_record, cmd_bitable_add_record,
     cmd_bitable_delete_record, cmd_bitable_add_field, cmd_bitable_rename_field,
+    cmd_bitable_add_records_batch,
 )
 from lark_tools.commands.calendar import cmd_calendar_list, cmd_calendar_events, cmd_calendar_detail
 from lark_tools.commands.minutes import (
@@ -505,6 +506,21 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             kv_pairs = filtered_args[4:]
             with audit_write('bitable.add-record', target=bt_token, extra={'table_id': table_id}):
                 cmd_bitable_add_record(cookies, token_arg, table_id, kv_pairs)
+        elif sub == 'add-records-batch':
+            # bitable add-records-batch <token|url> <tableId> <records_json>
+            # records_json: [{"fldXXX":"val1","fldYYY":"val2"}, ...]
+            if len(filtered_args) < 4:
+                print(json.dumps({'error': 'Usage: bitable add-records-batch <token|url> <tableId> <records_json>'})); sys.exit(1)
+            table_id = filtered_args[3]
+            raw_json = filtered_args[4] if len(filtered_args) > 4 else '[]'
+            try:
+                records = json.loads(raw_json)
+            except json.JSONDecodeError as exc:
+                print(json.dumps({'error': f'Invalid JSON for records: {exc}'})); sys.exit(1)
+            if not isinstance(records, list):
+                print(json.dumps({'error': 'records_json must be a JSON array of objects'})); sys.exit(1)
+            with audit_write('bitable.add-records-batch', target=bt_token, extra={'table_id': table_id, 'count': len(records)}):
+                cmd_bitable_add_records_batch(cookies, token_arg, table_id, records)
         elif sub == 'delete-record':
             # bitable delete-record <token|url> <tableId> <recordId>
             if len(filtered_args) < 5:

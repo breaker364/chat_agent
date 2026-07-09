@@ -22,11 +22,12 @@ from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
 from .token_counter import count_message_tokens, count_text_tokens, normalize_usage
-from .tools import _CURRENT_SESSION_ID_ENV
+from .tools import _CURRENT_RUN_ID_ENV, _CURRENT_SESSION_ID_ENV, clear_tool_dedupe_cache
 from .feishu_web_login import (
     FeishuWebSessionStore,
+    bootstrap_feishu_session,
+    feishu_session_status_payload,
     init_feishu_qr_login,
-    is_feishu_session_valid,
     poll_feishu_qr_login,
 )
 from .skills import (
@@ -47,6 +48,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def bootstrap_feishu_auth_on_startup() -> None:
+    status = bootstrap_feishu_session(get_feishu_session_store())
+    print(
+        "[feishu] startup session status: "
+        f"logged_in={status.get('logged_in')} reason={status.get('reason')} "
+        f"source={status.get('source')} path={status.get('path')}"
+    )
 
 # ---------------------------------------------------------------------------
 # Agent singleton (lazy init on first request)
@@ -146,6 +157,7 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
             "usage": session.get("task_progress", {}).get("usage", {}),
         },
     }
+
 
 
 def _refresh_session_subagent_tasks(session: dict[str, Any]) -> dict[str, Any]:
@@ -292,6 +304,7 @@ def _finalize_agent_response(
     status: str = "completed",
     failure_reason: str = "",
 ) -> str:
+    unfinished_todos = store.get_unfinished_task_plan_todos(session_id)
     summary = _build_execution_summary(
         user_message=user_message,
         final_text=final_text,
@@ -301,6 +314,24 @@ def _finalize_agent_response(
     )
     final_with_summary = _append_persisted_summary(final_text, summary)
     store.record_execution_summary(session_id, summary)
+    store.append_tool_event(
+        session_id,
+        event_type="turn_result",
+        tool_name="assistant_final",
+        arguments={"status": status, "tool_counts": summary.get("tool_counts", {})},
+        content=final_with_summary,
+    )
+    store.append_task_journal(
+        session_id,
+        {
+            "event": "turn_end",
+            "status": status,
+            "failure_reason": failure_reason,
+            "tool_counts": summary.get("tool_counts", {}),
+            "final_response_preview": summary.get("final_response_preview", ""),
+            "unfinished_todos": unfinished_todos,
+        },
+    )
     return final_with_summary
 
 
@@ -357,6 +388,7 @@ async def feishu_login_poll(request: Request) -> JSONResponse:
                 "session": session_value,
                 "issued_at": time.time(),
                 "metadata": {
+                    "source": "qr_login",
                     "status": result.get("status"),
                     "next_step": result.get("next_step"),
                 },
@@ -368,15 +400,8 @@ async def feishu_login_poll(request: Request) -> JSONResponse:
 @app.get("/feishu/session")
 @app.get("/feishu/status")
 async def feishu_session_status() -> JSONResponse:
-    payload = get_feishu_session_store().load()
-    return JSONResponse(
-        {
-            "logged_in": is_feishu_session_valid(payload),
-            "has_session": bool(payload and payload.get("session")),
-            "issued_at": payload.get("issued_at") if payload else None,
-            "metadata": payload.get("metadata", {}) if payload else {},
-        }
-    )
+    status = bootstrap_feishu_session(get_feishu_session_store())
+    return JSONResponse(status)
 
 
 @app.delete("/feishu/session")
@@ -586,10 +611,10 @@ async def chat_stream(request: Request) -> EventSourceResponse:
 
     agent = await get_agent()
     store = get_session_store()
-    stored_history = store.get_history(session_id)
+    session = store.create_or_get_session(session_id, first_message=message)
+    stored_history = store.get_history(session["session_id"])
     merged_history = _merge_history(stored_history, history)
 
-    session = store.create_or_get_session(session_id, first_message=message)
     store.append_message(
         session["session_id"],
         "user",
@@ -610,8 +635,13 @@ async def chat_stream(request: Request) -> EventSourceResponse:
         assistant_text = ""
         assistant_tools: list[dict[str, Any]] = []
         run_usage: dict[str, Any] = {}
+        turn_finalized = False
+        interrupted = False
         previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
+        previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
+        run_id = f"{session['session_id']}:{uuid4().hex}"
         os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
+        os.environ[_CURRENT_RUN_ID_ENV] = run_id
         event_hub = get_session_event_hub()
         event_queue = event_hub.subscribe(session["session_id"])
         try:
@@ -667,6 +697,12 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                                 "arguments": parsed.get("arguments"),
                             }
                         )
+                        store.append_tool_event(
+                            session["session_id"],
+                            event_type="tool_call",
+                            tool_name=str(parsed.get("name") or "tool"),
+                            arguments=parsed.get("arguments"),
+                        )
                         store.update_progress(
                             session["session_id"],
                             status="running",
@@ -681,6 +717,12 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                                 "name": parsed.get("name", "tool"),
                                 "content": parsed.get("content"),
                             }
+                        )
+                        store.append_tool_event(
+                            session["session_id"],
+                            event_type="tool_result",
+                            tool_name=str(parsed.get("name") or "tool"),
+                            content=parsed.get("content"),
                         )
                         store.update_progress(
                             session["session_id"],
@@ -745,16 +787,56 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             elapsed_seconds=0,
                             last_debug_stage="done",
                         )
+                        turn_finalized = True
 
                     if await request.is_disconnected():
+                        interrupted = True
                         break
                     yield event
         finally:
+            if not turn_finalized and (assistant_text.strip() or assistant_tools):
+                partial_text = assistant_text.strip() or "(stopped before text reply)"
+                failure_reason = (
+                    "Client disconnected before the agent finished. "
+                    "Continue from persisted task_plan and task_outputs instead of restarting."
+                    if interrupted
+                    else "Agent stream ended before a final done event. Continue from persisted context."
+                )
+                partial_text = _finalize_agent_response(
+                    store=store,
+                    session_id=session["session_id"],
+                    user_message=message,
+                    final_text=partial_text,
+                    tools=assistant_tools,
+                    status="blocked",
+                    failure_reason=failure_reason,
+                )
+                partial_usage = normalize_usage(run_usage, output_text=partial_text)
+                store.replace_last_assistant_message(
+                    session["session_id"],
+                    partial_text,
+                    tools=assistant_tools,
+                    usage=partial_usage,
+                )
+                store.update_progress(
+                    session["session_id"],
+                    status="blocked",
+                    active_tool=None,
+                    message=failure_reason,
+                    elapsed_seconds=0,
+                    last_debug_stage="interrupted",
+                    usage=partial_usage,
+                )
             event_hub.unsubscribe(session["session_id"], event_queue)
             if previous_session_env is None:
                 os.environ.pop(_CURRENT_SESSION_ID_ENV, None)
             else:
                 os.environ[_CURRENT_SESSION_ID_ENV] = previous_session_env
+            if previous_run_env is None:
+                os.environ.pop(_CURRENT_RUN_ID_ENV, None)
+            else:
+                os.environ[_CURRENT_RUN_ID_ENV] = previous_run_env
+            clear_tool_dedupe_cache(run_id)
 
     return EventSourceResponse(event_generator())
 
@@ -770,9 +852,10 @@ async def chat_sync(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Message cannot be empty"}, status_code=400)
 
     store = get_session_store()
-    stored_history = store.get_history(session_id)
-    merged_history = _merge_history(stored_history, history)
     session = store.create_or_get_session(session_id, first_message=message)
+    stored_history = store.get_history(session["session_id"])
+    merged_history = _merge_history(stored_history, history)
+
     store.append_message(
         session["session_id"],
         "user",
@@ -794,7 +877,10 @@ async def chat_sync(request: Request) -> JSONResponse:
     tools: list[dict[str, Any]] = []
     run_usage: dict[str, Any] = {}
     previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
+    previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
+    run_id = f"{session['session_id']}:{uuid4().hex}"
     os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
+    os.environ[_CURRENT_RUN_ID_ENV] = run_id
     try:
         async for event in stream_agent_events(agent, message, session["session_id"], merged_history):
             event_type = event["event"]
@@ -806,8 +892,20 @@ async def chat_sync(request: Request) -> JSONResponse:
                 final_text += str(parsed)
             elif event_type == "tool_call":
                 tools.append({"type": "tool_call", "name": parsed.get("name"), "arguments": parsed.get("arguments")})
+                store.append_tool_event(
+                    session["session_id"],
+                    event_type="tool_call",
+                    tool_name=str(parsed.get("name") or "tool"),
+                    arguments=parsed.get("arguments"),
+                )
             elif event_type == "tool_result":
                 tools.append({"type": "tool_result", "name": parsed.get("name"), "content": parsed.get("content")})
+                store.append_tool_event(
+                    session["session_id"],
+                    event_type="tool_result",
+                    tool_name=str(parsed.get("name") or "tool"),
+                    content=parsed.get("content"),
+                )
             elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
                 run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
             elif event_type == "debug" and parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
@@ -822,6 +920,11 @@ async def chat_sync(request: Request) -> JSONResponse:
             os.environ.pop(_CURRENT_SESSION_ID_ENV, None)
         else:
             os.environ[_CURRENT_SESSION_ID_ENV] = previous_session_env
+        if previous_run_env is None:
+            os.environ.pop(_CURRENT_RUN_ID_ENV, None)
+        else:
+            os.environ[_CURRENT_RUN_ID_ENV] = previous_run_env
+        clear_tool_dedupe_cache(run_id)
 
     final_text = _finalize_agent_response(
         store=store,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool, tool
 from langchain_mcp_adapters.sessions import StdioConnection, StreamableHttpConnection
 from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -45,6 +46,7 @@ from .feishu_web_login import (
     FeishuWebSessionStore,
     build_feishu_cookies,
     init_feishu_qr_login,
+    is_feishu_session_server_valid,
     is_feishu_session_valid,
     poll_feishu_qr_login,
 )
@@ -70,6 +72,44 @@ _DOWNLOAD_DIR_NAME = str(get_runtime_value("paths", "download_dir", "tmp") or "t
 _SUBAGENT_SYNC_TIMEOUT_SECONDS = 120
 _SUBAGENT_MANAGER = get_subagent_manager()
 _CURRENT_SESSION_ID_ENV = "CHAT_AGENT_SESSION_ID"
+_CURRENT_RUN_ID_ENV = "CHAT_AGENT_RUN_ID"
+_TOOL_DEDUPE_CACHE: dict[str, dict[str, str]] = {}
+_TOOL_DEDUPE_PENDING: dict[str, Any] = {}  # per-run_id -> per-key asyncio.Event + result
+_TOOL_DEDUPE_CACHE_MAX_RUNS = 32
+_TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
+    "list_directory": 300,
+    "read_file": 3600,
+    "get_file_info": 300,
+    "web_search": 900,
+    "web_fetch": 900,
+    "fetch_webpage": 900,
+    "get_subagent_task": 30,
+    "feishu_login_status": 60,
+}
+_TOOL_SIDE_EFFECT_NAMES = {
+    "Agent",
+    "write_file",
+    "append_file",
+    "delete_file",
+    "record_script_stage",
+    "update_task_plan",
+    "record_task_item",
+    "update_task_item",
+    "record_pitfall",
+    "SendMessage",
+    "feishu_logout",
+}
+_TOOL_SIDE_EFFECT_PREFIXES = (
+    "write_",
+    "append_",
+    "delete_",
+    "create_",
+    "update_",
+    "send_",
+    "record_",
+)
+_TOOL_DEFAULT_CACHE_TTL_SECONDS = 0
+_TOOL_FAILED_CACHE_TTL_SECONDS = 10
 
 
 def _run_coro_in_thread(coro: Any) -> Any:
@@ -109,6 +149,510 @@ def _run_coro_in_thread_with_timeout(coro: Any, timeout_seconds: int) -> Any:
     if ok:
         return value
     raise value
+
+
+def _canonical_json(payload: Any) -> str:
+    try:
+        return json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(payload)
+
+
+def _normalize_task_plan_todo(value: Any, index: int) -> dict[str, str]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    if isinstance(value, dict):
+        item = value
+    else:
+        raw = str(value or "")
+        item = {
+            key: match
+            for key, match in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)='([^']*)'", raw)
+        }
+    task_id = str(item.get("task_id") or f"step_{index}").strip()
+    content = str(item.get("content") or task_id).strip()
+    active_form = str(item.get("activeForm") or item.get("active_form") or content).strip()
+    return {
+        "task_id": task_id,
+        "content": content,
+        "activeForm": active_form,
+        "status": str(item.get("status") or "pending").strip(),
+        "details": str(item.get("details") or "").strip(),
+        "result_ref": str(item.get("result_ref") or "").strip(),
+    }
+
+
+def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
+    if tool_name != "update_task_plan" or not isinstance(payload, dict):
+        return payload
+    todos = payload.get("todos")
+    if not isinstance(todos, list):
+        todos = []
+    return {
+        "todos": [
+            _normalize_task_plan_todo(todo, index)
+            for index, todo in enumerate(todos, 1)
+        ],
+        "source": str(payload.get("source") or "model").strip(),
+        "reason": str(payload.get("reason") or "").strip(),
+    }
+
+
+def _dedupe_key(tool_name: str, payload: Any) -> str:
+    return f"{tool_name}:{_canonical_json(_normalize_tool_payload_for_key(tool_name, payload))}"
+
+
+def _arguments_hash(payload: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _current_run_id() -> str:
+    return os.environ.get(_CURRENT_RUN_ID_ENV, "").strip()
+
+
+def _current_session_id() -> str:
+    return os.environ.get(_CURRENT_SESSION_ID_ENV, "").strip()
+
+
+def _tool_policy(tool_name: str) -> dict[str, Any]:
+    side_effect = tool_name in _TOOL_SIDE_EFFECT_NAMES or any(
+        tool_name.startswith(prefix) for prefix in _TOOL_SIDE_EFFECT_PREFIXES
+    )
+    ttl_seconds = 0 if side_effect else _TOOL_CACHEABLE_TTL_SECONDS.get(tool_name, _TOOL_DEFAULT_CACHE_TTL_SECONDS)
+    return {
+        "cacheable": ttl_seconds > 0 and not side_effect,
+        "ttl_seconds": ttl_seconds,
+        "side_effect": side_effect,
+    }
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _cache_entry_is_reusable(entry: dict[str, Any] | None, policy: dict[str, Any]) -> bool:
+    if not entry or not policy.get("cacheable"):
+        return False
+    if entry.get("status") != "success":
+        return False
+    expires_at_ms = entry.get("expires_at_ms")
+    if isinstance(expires_at_ms, (int, float)) and _now_ms() > int(expires_at_ms):
+        return False
+    return isinstance(entry.get("content"), str)
+
+
+def _session_store_for_runtime() -> SessionStore | None:
+    session_id = _current_session_id()
+    if not session_id:
+        return None
+    try:
+        return SessionStore(_workspace_root())
+    except Exception as exc:
+        logger.debug("Tool result cache store unavailable: %s", exc)
+        return None
+
+
+def _append_tool_audit(
+    *,
+    action: str,
+    tool_name: str,
+    arguments: Any,
+    call_key: str,
+    dedupe_scope: str = "",
+    reused_from_tool_call_id: str = "",
+    content: str = "",
+    error: str = "",
+    latency_ms: int | None = None,
+) -> None:
+    session_id = _current_session_id()
+    if not session_id:
+        return
+    store = _session_store_for_runtime()
+    if store is None:
+        return
+    payload = {
+        "action": action,
+        "call_key": call_key,
+        "arguments_hash": _arguments_hash(arguments),
+        "dedupe_scope": dedupe_scope,
+        "reused_from_tool_call_id": reused_from_tool_call_id,
+        "latency_ms": latency_ms,
+        "error": error,
+        "content_preview": content[:500],
+    }
+    try:
+        store.append_tool_event(
+            session_id,
+            event_type=f"tool_runtime_{action}",
+            tool_name=tool_name,
+            arguments=arguments,
+            content=payload,
+        )
+    except Exception as exc:
+        logger.debug("Failed to append tool audit event: %s", exc)
+
+
+def _load_conversation_cache_result(tool_name: str, arguments: Any, call_key: str, policy: dict[str, Any]) -> str | None:
+    if not policy.get("cacheable"):
+        return None
+    session_id = _current_session_id()
+    store = _session_store_for_runtime()
+    if not session_id or store is None:
+        return None
+    entry = store.get_tool_result_cache_entry(session_id, call_key)
+    if not _cache_entry_is_reusable(entry, policy):
+        return None
+    content = str(entry.get("content") or "")
+    _append_tool_audit(
+        action="reused",
+        tool_name=tool_name,
+        arguments=arguments,
+        call_key=call_key,
+        dedupe_scope="conversation_cache",
+        reused_from_tool_call_id=str(entry.get("tool_call_id") or ""),
+        content=content,
+    )
+    return content
+
+
+def _load_side_effect_repeat_block(tool_name: str, arguments: Any, call_key: str, policy: dict[str, Any]) -> str | None:
+    if not policy.get("side_effect"):
+        return None
+    session_id = _current_session_id()
+    store = _session_store_for_runtime()
+    if not session_id or store is None:
+        return None
+    entry = store.get_tool_result_cache_entry(session_id, call_key)
+    if not entry or entry.get("status") != "success" or not entry.get("side_effect"):
+        return None
+    content = _side_effect_repeat_message(tool_name, call_key)
+    _append_tool_audit(
+        action="blocked",
+        tool_name=tool_name,
+        arguments=arguments,
+        call_key=call_key,
+        dedupe_scope="conversation_side_effect",
+        reused_from_tool_call_id=str(entry.get("tool_call_id") or ""),
+        content=content,
+    )
+    return content
+
+
+def _save_conversation_cache_result(
+    *,
+    tool_name: str,
+    arguments: Any,
+    call_key: str,
+    policy: dict[str, Any],
+    content: str,
+    status: str,
+    error_type: str = "",
+) -> None:
+    if not policy.get("cacheable") and not policy.get("side_effect") and status == "success":
+        return
+    session_id = _current_session_id()
+    store = _session_store_for_runtime()
+    if not session_id or store is None:
+        return
+    ttl_seconds = int(policy.get("ttl_seconds") or 0)
+    if status != "success":
+        ttl_seconds = _TOOL_FAILED_CACHE_TTL_SECONDS
+    if ttl_seconds <= 0 and not policy.get("side_effect"):
+        return
+    created_at_ms = _now_ms()
+    run_id = _current_run_id()
+    entry = {
+        "call_key": call_key,
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "content": content,
+        "tool_call_id": f"{run_id}:{tool_name}" if run_id else tool_name,
+        "created_at_ms": created_at_ms,
+        "expires_at_ms": created_at_ms + ttl_seconds * 1000 if ttl_seconds > 0 else None,
+        "source_turn_id": run_id,
+        "side_effect": bool(policy.get("side_effect")),
+        "status": status,
+        "error_type": error_type,
+    }
+    try:
+        store.set_tool_result_cache_entry(session_id, call_key, entry)
+    except Exception as exc:
+        logger.debug("Failed to save tool result cache: %s", exc)
+
+
+def _side_effect_repeat_message(tool_name: str, call_key: str) -> str:
+    return json.dumps(
+        {
+            "blocked": True,
+            "reason": "duplicate_side_effect_tool_call",
+            "tool": tool_name,
+            "call_key": call_key,
+            "message": (
+                "Runtime blocked a repeated side-effect tool call with identical arguments. "
+                "Ask for explicit confirmation before executing this action again."
+            ),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _run_cache_for_current_request() -> dict[str, str] | None:
+    run_id = _current_run_id()
+    if not run_id:
+        return None
+    if run_id not in _TOOL_DEDUPE_CACHE:
+        if len(_TOOL_DEDUPE_CACHE) >= _TOOL_DEDUPE_CACHE_MAX_RUNS:
+            oldest = next(iter(_TOOL_DEDUPE_CACHE), None)
+            if oldest:
+                _TOOL_DEDUPE_CACHE.pop(oldest, None)
+                _TOOL_DEDUPE_PENDING.pop(oldest, None)
+        _TOOL_DEDUPE_CACHE[run_id] = {}
+    return _TOOL_DEDUPE_CACHE[run_id]
+
+
+def _pending_for_current_request() -> dict[str, asyncio.Event] | None:
+    run_id = _current_run_id()
+    if not run_id:
+        return None
+    if run_id not in _TOOL_DEDUPE_PENDING:
+        _TOOL_DEDUPE_PENDING[run_id] = {}
+    return _TOOL_DEDUPE_PENDING[run_id]
+
+
+def clear_tool_dedupe_cache(run_id: str | None) -> None:
+    if run_id:
+        _TOOL_DEDUPE_CACHE.pop(run_id, None)
+        _TOOL_DEDUPE_PENDING.pop(run_id, None)
+
+
+def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
+    tool_name = str(getattr(tool_obj, "name", "") or "")
+    if not tool_name:
+        return tool_obj
+    policy = _tool_policy(tool_name)
+
+    def cached_func(**kwargs: Any) -> str:
+        cache = _run_cache_for_current_request()
+        cache_key = _dedupe_key(tool_name, kwargs)
+        if cache is not None and cache_key in cache:
+            result_text = cache[cache_key]
+            if policy.get("side_effect"):
+                result_text = _side_effect_repeat_message(tool_name, cache_key)
+                _append_tool_audit(
+                    action="blocked",
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    call_key=cache_key,
+                    dedupe_scope="same_run_side_effect",
+                    content=result_text,
+                )
+                return result_text
+            _append_tool_audit(
+                action="deduped",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                dedupe_scope="same_run",
+                content=result_text,
+            )
+            return cache[cache_key]
+
+        cached_result = _load_conversation_cache_result(tool_name, kwargs, cache_key, policy)
+        if cached_result is not None:
+            if cache is not None:
+                cache[cache_key] = cached_result
+            return cached_result
+        blocked_result = _load_side_effect_repeat_block(tool_name, kwargs, cache_key, policy)
+        if blocked_result is not None:
+            if cache is not None:
+                cache[cache_key] = blocked_result
+            return blocked_result
+
+        started_at = time.monotonic()
+        try:
+            result = tool_obj.invoke(kwargs)
+            result_text = result if isinstance(result, str) else str(result)
+            latency_ms = int((time.monotonic() - started_at) * 1000)
+            if cache is not None:
+                cache[cache_key] = result_text
+            _save_conversation_cache_result(
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                policy=policy,
+                content=result_text,
+                status="success",
+            )
+            _append_tool_audit(
+                action="executed",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                content=result_text,
+                latency_ms=latency_ms,
+            )
+            return result_text
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started_at) * 1000)
+            _save_conversation_cache_result(
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                policy=policy,
+                content=str(exc),
+                status="failed",
+                error_type=type(exc).__name__,
+            )
+            _append_tool_audit(
+                action="failed",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                error=str(exc),
+                latency_ms=latency_ms,
+            )
+            raise
+
+    async def cached_coroutine(**kwargs: Any) -> str:
+        cache = _run_cache_for_current_request()
+        cache_key = _dedupe_key(tool_name, kwargs)
+
+        # Fast path: result already cached from a previous call in this run.
+        if cache is not None and cache_key in cache:
+            result_text = cache[cache_key]
+            if policy.get("side_effect"):
+                result_text = _side_effect_repeat_message(tool_name, cache_key)
+                _append_tool_audit(
+                    action="blocked",
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    call_key=cache_key,
+                    dedupe_scope="same_run_side_effect",
+                    content=result_text,
+                )
+                return result_text
+            _append_tool_audit(
+                action="deduped",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                dedupe_scope="same_run",
+                content=result_text,
+            )
+            return result_text
+
+        # Pending check: if another task is already executing this exact call,
+        # wait for it to complete and reuse its result instead of sending a
+        # duplicate request. This prevents parallel duplicates from the same
+        # model turn (e.g. calling get-current-date twice simultaneously).
+        pending_map = _pending_for_current_request()
+        if pending_map is not None and cache_key in pending_map:
+            event: asyncio.Event = pending_map[cache_key]
+            await event.wait()
+            # After the first caller finishes, the result should be in cache.
+            if cache is not None and cache_key in cache:
+                result_text = cache[cache_key]
+                if policy.get("side_effect"):
+                    result_text = _side_effect_repeat_message(tool_name, cache_key)
+                    _append_tool_audit(
+                        action="blocked",
+                        tool_name=tool_name,
+                        arguments=kwargs,
+                        call_key=cache_key,
+                        dedupe_scope="same_response_side_effect",
+                        content=result_text,
+                    )
+                    return result_text
+                _append_tool_audit(
+                    action="deduped",
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    call_key=cache_key,
+                    dedupe_scope="same_response",
+                    content=result_text,
+                )
+                return result_text
+            # Fall through and execute if somehow the result wasn't cached.
+
+        cached_result = _load_conversation_cache_result(tool_name, kwargs, cache_key, policy)
+        if cached_result is not None:
+            if cache is not None:
+                cache[cache_key] = cached_result
+            return cached_result
+        blocked_result = _load_side_effect_repeat_block(tool_name, kwargs, cache_key, policy)
+        if blocked_result is not None:
+            if cache is not None:
+                cache[cache_key] = blocked_result
+            return blocked_result
+
+        # Register this call as in-flight so parallel callers can wait.
+        if pending_map is not None:
+            pending_map[cache_key] = asyncio.Event()
+
+        started_at = time.monotonic()
+        try:
+            result = await tool_obj.ainvoke(kwargs)
+            result_text = result if isinstance(result, str) else str(result)
+            if cache is not None:
+                cache[cache_key] = result_text
+            latency_ms = int((time.monotonic() - started_at) * 1000)
+            _save_conversation_cache_result(
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                policy=policy,
+                content=result_text,
+                status="success",
+            )
+            _append_tool_audit(
+                action="executed",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                content=result_text,
+                latency_ms=latency_ms,
+            )
+            return result_text
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started_at) * 1000)
+            _save_conversation_cache_result(
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                policy=policy,
+                content=str(exc),
+                status="failed",
+                error_type=type(exc).__name__,
+            )
+            _append_tool_audit(
+                action="failed",
+                tool_name=tool_name,
+                arguments=kwargs,
+                call_key=cache_key,
+                error=str(exc),
+                latency_ms=latency_ms,
+            )
+            raise
+        finally:
+            if pending_map is not None and cache_key in pending_map:
+                pending_map[cache_key].set()
+                pending_map.pop(cache_key, None)
+
+    wrapped = StructuredTool.from_function(
+        func=cached_func,
+        coroutine=cached_coroutine,
+        name=tool_name,
+        description=getattr(tool_obj, "description", "") or "",
+        args_schema=getattr(tool_obj, "args_schema", None),
+        return_direct=getattr(tool_obj, "return_direct", False),
+    )
+    wrapped.metadata = {
+        **(getattr(tool_obj, "metadata", None) or {}),
+        "dedupe_wrapped": True,
+        "dedupe_original_name": tool_name,
+    }
+    return wrapped
 
 _FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -289,17 +833,6 @@ class RecentMcdOrdersInput(BaseModel):
     size: int = Field(10, description="Number of orders to query, capped at 10.")
 
 
-class FeishuAuthRequestInput(BaseModel):
-    """Arguments for authenticated Feishu web requests."""
-
-    method: str = Field(..., description="HTTP method: GET, POST, PUT, PATCH, or DELETE.")
-    url: str = Field(..., description="Target Feishu HTTPS URL.")
-    json_body: str = Field("", description="Optional JSON object body encoded as a string.")
-    form_body: str = Field("", description="Optional form fields encoded as a JSON object string.")
-    headers: str = Field("", description="Optional extra headers encoded as a JSON object string.")
-    timeout_seconds: int = Field(30, description="Request timeout in seconds.")
-
-
 class ScriptStageInput(BaseModel):
     """Arguments for recording a script processing stage into the current session."""
 
@@ -307,6 +840,28 @@ class ScriptStageInput(BaseModel):
     status: str = Field(..., description="Stage status: planned, running, completed, failed.")
     summary: str = Field("", description="Short human-readable summary of what happened in this stage.")
     artifact_path: str = Field("", description="Optional workspace path to the generated script or output artifact.")
+
+
+class TaskPlanTodoInput(BaseModel):
+    """One item in the complete task plan snapshot."""
+
+    task_id: str = Field(..., description="Stable snake_case id, e.g. fetch_data or verify_output.")
+    content: str = Field(..., description="Imperative description of what needs to be done.")
+    activeForm: str = Field(..., description="Present-progress wording shown while this task is active.")
+    status: str = Field("pending", description="Status: pending, in_progress, completed, failed, or blocked.")
+    details: str = Field("", description="Optional concise status details.")
+    result_ref: str = Field("", description="Optional result reference such as a file path, URL, tool name, or record id.")
+
+
+class TaskPlanInput(BaseModel):
+    """Arguments for replacing the current session task plan with a full snapshot."""
+
+    todos: list[TaskPlanTodoInput] = Field(..., description="Complete ordered todo list snapshot.")
+    source: str = Field("model", description="Plan source label.")
+    reason: str = Field(
+        "",
+        description='Use "plan_changed" only when task IDs must be added, removed, split, or renamed.',
+    )
 
 
 class TaskItemInput(BaseModel):
@@ -771,6 +1326,67 @@ def record_script_stage(
     return json.dumps({"success": True, **payload}, ensure_ascii=False, indent=2)
 
 
+@tool(args_schema=TaskPlanInput)
+def update_task_plan(todos: list[TaskPlanTodoInput], source: str = "model", reason: str = "") -> str:
+    """Save or advance the current session task plan with a complete todo snapshot.
+
+    Use this at the start of complex tasks to create the full ordered task list.
+    Once a plan exists, the task list is fixed: later calls may only update the
+    latest unfinished todo's status/details/result_ref. Completed todos are
+    preserved and cannot be downgraded or deleted by later snapshots.
+    """
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+
+    normalized: list[dict[str, Any]] = []
+    in_progress_count = 0
+    for index, todo in enumerate(todos, 1):
+        item = todo.model_dump() if hasattr(todo, "model_dump") else dict(todo)
+        task_id = str(item.get("task_id") or f"step_{index}").strip()
+        status = str(item.get("status") or "pending").strip()
+        if status == "in_progress":
+            in_progress_count += 1
+        normalized.append(
+            {
+                "task_id": task_id,
+                "content": str(item.get("content") or task_id).strip(),
+                "activeForm": str(item.get("activeForm") or item.get("content") or task_id).strip(),
+                "status": status,
+                "details": str(item.get("details") or "").strip(),
+                "result_ref": str(item.get("result_ref") or "").strip(),
+            }
+        )
+
+    if len(normalized) >= 2 and in_progress_count > 1:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "At most one todo may be in_progress.",
+                "in_progress_count": in_progress_count,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    session = SessionStore(_workspace_root()).set_task_plan(
+        session_id,
+        normalized,
+        source=source or "model",
+        reason=reason,
+    )
+    plan = session.get("task_progress", {}).get("task_plan", {})
+    return json.dumps(
+        {
+            "success": True,
+            "task_plan": plan,
+            "message": "Task plan snapshot saved. Continue with the pending or in_progress task.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
 @tool(args_schema=TaskItemInput)
 def record_task_item(
     title: str,
@@ -1003,15 +1619,35 @@ def run_python_file(
 
 @tool
 def feishu_login_status() -> str:
-    """Return whether a reusable Feishu web session is already stored locally."""
+    """Return whether a reusable Feishu web session is stored locally and actually valid on the server.
+
+    This performs a real HTTP probe against the Feishu server to verify the
+    session cookie is still accepted. A purely local timestamp check would
+    give false positives for server-side expired/revoked sessions.
+    """
     payload = _feishu_session_store().load()
-    valid = is_feishu_session_valid(payload)
+    local_valid = is_feishu_session_valid(payload)
+    has_session = bool(payload and payload.get("session"))
+    server = {"checked": False, "valid": False, "reason": "skipped"}
+    if has_session:
+        try:
+            server = is_feishu_session_server_valid(payload)
+        except Exception as exc:
+            server = {"checked": True, "valid": False, "reason": f"probe_exception: {exc}"}
+    logged_in = has_session and local_valid and server.get("valid", False)
     result = {
-        "logged_in": valid,
-        "has_session": bool(payload and payload.get("session")),
+        "logged_in": logged_in,
+        "has_session": has_session,
         "issued_at": payload.get("issued_at") if payload else None,
         "metadata": payload.get("metadata", {}) if payload else {},
+        "local_check": {"valid": local_valid, "reason": "timestamp_check" if local_valid else "expired_or_missing"},
+        "server_check": server,
     }
+    if not logged_in and server.get("valid") is False and server.get("reason", "").startswith("server_"):
+        result["action_required"] = (
+            "The Feishu session is invalid on the server side (e.g. CSRF token was rotated, session was revoked, "
+            "or the cookie expired server-side). Run Feishu QR login again to obtain a fresh session."
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -1020,80 +1656,6 @@ def feishu_logout() -> str:
     """Clear the locally stored Feishu web session."""
     _feishu_session_store().clear()
     return json.dumps({"success": True, "message": "Feishu web session cleared."}, ensure_ascii=False, indent=2)
-
-
-@tool(args_schema=FeishuAuthRequestInput)
-def feishu_web_request(
-    method: str,
-    url: str,
-    json_body: str = "",
-    form_body: str = "",
-    headers: str = "",
-    timeout_seconds: int = 30,
-) -> str:
-    """Send an authenticated Feishu web request with the locally stored web session cookie."""
-    try:
-        normalized_method = (method or "").strip().upper()
-        if normalized_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise ValueError("Unsupported method. Use GET, POST, PUT, PATCH, or DELETE.")
-        target_url = _validate_feishu_target_url(url)
-        session_payload = _load_feishu_session_payload()
-        json_payload = _parse_json_object(json_body, "json_body")
-        form_payload = _parse_json_object(form_body, "form_body")
-        extra_headers = _parse_json_object(headers, "headers")
-        if json_payload and form_payload:
-            raise ValueError("Provide either json_body or form_body, not both.")
-        timeout_value = max(1, int(timeout_seconds))
-    except Exception as exc:
-        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False, indent=2)
-
-    request_headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.feishu.cn/",
-        **{str(key): str(value) for key, value in extra_headers.items()},
-    }
-
-    try:
-        response = requests.request(
-            normalized_method,
-            target_url,
-            cookies=build_feishu_cookies(session_payload),
-            headers=request_headers,
-            json=json_payload or None,
-            data=form_payload or None,
-            timeout=timeout_value,
-            allow_redirects=True,
-        )
-        content_type = response.headers.get("Content-Type", "")
-        if "application/json" in content_type.lower():
-            try:
-                body: Any = response.json()
-            except Exception:
-                body = response.text[:_PYTHON_OUTPUT_MAX_CHARS]
-        else:
-            body = response.text[:_PYTHON_OUTPUT_MAX_CHARS]
-        result = {
-            "success": response.ok,
-            "method": normalized_method,
-            "url": str(response.url),
-            "status_code": response.status_code,
-            "reason": response.reason,
-            "content_type": content_type,
-            "body": body,
-        }
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        return json.dumps(
-            {
-                "success": False,
-                "method": normalized_method,
-                "url": target_url,
-                "error": str(exc),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1631,13 +2193,13 @@ _AGENT_TOOLS: list[Any] = [
     get_subagent_task,
     SendMessage,
     record_script_stage,
+    update_task_plan,
     record_task_item,
     update_task_item,
     record_pitfall,
     query_recent_mcd_orders,
     feishu_login_status,
     feishu_logout,
-    feishu_web_request,
 ]
 
 
@@ -1660,4 +2222,4 @@ async def get_all_tools(
         tools.extend(mcd_tools)
     except Exception as exc:
         logger.warning("mcd MCP tools unavailable: %s", exc)
-    return tools
+    return [_wrap_tool_with_run_dedupe(item) for item in tools]

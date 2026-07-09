@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,9 @@ MAX_SESSION_TITLE_LENGTH = 40
 MAX_STORED_MESSAGE_CHARS = 80_000
 MAX_STORED_TOOL_CONTENT_CHARS = 16_000
 MAX_STORED_TOOL_ARGUMENT_CHARS = 8_000
+MAX_STORED_TASK_OUTPUT_CHARS = 12_000
+MAX_TASK_OUTPUT_EVENTS = 40
+MAX_TOOL_RESULT_CACHE_ENTRIES = 200
 _SESSION_FILE_LOCK = threading.RLock()
 
 
@@ -83,7 +87,28 @@ class SessionStore:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     def session_path(self, session_id: str) -> Path:
+        return self.session_dir_path(session_id) / "session.json"
+
+    def legacy_session_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{_slugify_session_id(session_id)}.json"
+
+    def session_dir_path(self, session_id: str) -> Path:
+        return self.sessions_dir / _slugify_session_id(session_id)
+
+    def task_journal_path(self, session_id: str) -> Path:
+        return self.session_dir_path(session_id) / "task_plan.jsonl"
+
+    def legacy_task_journal_path(self, session_id: str) -> Path:
+        return self.sessions_dir / f"{_slugify_session_id(session_id)}.task_plan.jsonl"
+
+    def tool_events_path(self, session_id: str) -> Path:
+        return self.session_dir_path(session_id) / "tool_events.jsonl"
+
+    def legacy_tool_events_path(self, session_id: str) -> Path:
+        return self.sessions_dir / f"{_slugify_session_id(session_id)}.tool_events.jsonl"
+
+    def tool_result_cache_path(self, session_id: str) -> Path:
+        return self.session_dir_path(session_id) / "tool_result_cache.json"
 
     def _is_reserved_session_file(self, path: Path) -> bool:
         feishu_session_file = str(
@@ -102,14 +127,29 @@ class SessionStore:
             and isinstance(data.get("messages", []), list)
         )
 
+    def _migrate_legacy_sidecars(self, session_id: str) -> None:
+        for legacy_path, folder_path in (
+            (self.legacy_task_journal_path(session_id), self.task_journal_path(session_id)),
+            (self.legacy_tool_events_path(session_id), self.tool_events_path(session_id)),
+        ):
+            if not legacy_path.exists() or folder_path.exists():
+                continue
+            try:
+                folder_path.parent.mkdir(parents=True, exist_ok=True)
+                folder_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                continue
+
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
         seen_session_ids: set[str] = set()
-        for path in sorted(
-            self.sessions_dir.glob("*.json"),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        ):
+        candidate_paths = [
+            path / "session.json"
+            for path in self.sessions_dir.iterdir()
+            if path.is_dir() and (path / "session.json").exists()
+        ]
+        candidate_paths.extend(self.sessions_dir.glob("*.json"))
+        for path in sorted(candidate_paths, key=lambda item: item.stat().st_mtime, reverse=True):
             if self._is_reserved_session_file(path) or self._is_archived_session_file(path):
                 continue
             try:
@@ -138,6 +178,12 @@ class SessionStore:
 
     def load_session(self, session_id: str) -> dict[str, Any] | None:
         path = self.session_path(session_id)
+        loaded_from_legacy = False
+        if not path.exists():
+            legacy_path = self.legacy_session_path(session_id)
+            if legacy_path.exists():
+                path = legacy_path
+                loaded_from_legacy = True
         if not path.exists():
             return None
         try:
@@ -159,6 +205,9 @@ class SessionStore:
             data["subagent_tasks"] = []
         if "subagent_notifications" not in data:
             data["subagent_notifications"] = []
+        if loaded_from_legacy:
+            self.save_session(data)
+            self._migrate_legacy_sidecars(data.get("session_id") or session_id)
         return data
 
     def default_progress(self) -> dict[str, Any]:
@@ -168,6 +217,8 @@ class SessionStore:
             "message": "",
             "elapsed_seconds": 0,
             "last_debug_stage": "",
+            "task_plan": {"todos": [], "updated_at": _now_iso()},
+            "task_outputs": {},
             "script_stages": [],
             "task_items": [],
             "pitfalls": [],
@@ -195,6 +246,12 @@ class SessionStore:
         with _SESSION_FILE_LOCK:
             session["updated_at"] = _now_iso()
             path = self.session_path(session["session_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for stale_tmp in path.parent.glob("session.tmp-*.json"):
+                try:
+                    stale_tmp.unlink()
+                except Exception:
+                    pass
             payload = dict(session)
             messages = payload.get("messages", [])
             if isinstance(messages, list):
@@ -202,23 +259,13 @@ class SessionStore:
                     _compact_message(message) if isinstance(message, dict) else message
                     for message in messages
                 ]
-            tmp_path = path.with_suffix(f".tmp-{uuid4().hex}.json")
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            try:
-                tmp_path.replace(path)
-            except PermissionError:
-                # Windows can transiently lock the target during rapid session polling.
-                # Fall back to remove-then-replace, then direct write as a last resort.
+            # Direct write avoids accumulating locked session.tmp-* files on Windows.
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            for stale_tmp in path.parent.glob("session.tmp-*.json"):
                 try:
-                    if path.exists():
-                        path.unlink()
-                    tmp_path.replace(path)
-                except PermissionError:
-                    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                    try:
-                        tmp_path.unlink()
-                    except Exception:
-                        pass
+                    stale_tmp.unlink()
+                except Exception:
+                    pass
 
     def record_execution_summary(self, session_id: str, summary: dict[str, Any]) -> dict[str, Any]:
         session = self.create_or_get_session(session_id)
@@ -270,11 +317,20 @@ class SessionStore:
         return session
 
     def delete_session(self, session_id: str) -> bool:
-        path = self.session_path(session_id)
-        if not path.exists():
-            return False
-        path.unlink()
-        return True
+        deleted = False
+        folder = self.session_dir_path(session_id)
+        if folder.exists() and folder.is_dir():
+            shutil.rmtree(folder)
+            deleted = True
+        for path in (
+            self.legacy_session_path(session_id),
+            self.legacy_task_journal_path(session_id),
+            self.legacy_tool_events_path(session_id),
+        ):
+            if path.exists():
+                path.unlink()
+                deleted = True
+        return deleted
 
     def append_message(
         self,
@@ -330,6 +386,10 @@ class SessionStore:
         session = self.create_or_get_session(session_id)
         progress = session.setdefault("task_progress", self.default_progress())
         progress.update(updates)
+        if "task_plan" not in progress or not isinstance(progress.get("task_plan"), dict):
+            progress["task_plan"] = {"todos": [], "updated_at": _now_iso()}
+        if "task_outputs" not in progress or not isinstance(progress.get("task_outputs"), dict):
+            progress["task_outputs"] = {}
         if "script_stages" not in progress or not isinstance(progress.get("script_stages"), list):
             progress["script_stages"] = []
         if "task_items" not in progress or not isinstance(progress.get("task_items"), list):
@@ -339,6 +399,521 @@ class SessionStore:
         progress["updated_at"] = _now_iso()
         self.save_session(session)
         return session
+
+    def set_task_plan(
+        self,
+        session_id: str,
+        todos: list[dict[str, Any]],
+        source: str = "auto",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Save a task plan snapshot.
+
+        First call: the model's plan is accepted as the authoritative baseline.
+        Subsequent calls: task IDs, order, content, and activeForm are LOCKED.
+        Only status, details, and result_ref may be updated. Completed todos
+        are never downgraded. New/removed/renamed task IDs are rejected with
+        a warning and the original IDs are preserved.
+        """
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        now = _now_iso()
+
+        # Normalize incoming todos
+        incoming: list[dict[str, Any]] = []
+        for index, todo in enumerate(todos, 1):
+            task_id = str(todo.get("task_id") or f"step-{index}").strip()
+            incoming.append(
+                {
+                    "task_id": task_id,
+                    "content": str(todo.get("content") or task_id).strip(),
+                    "activeForm": str(todo.get("activeForm") or todo.get("content") or task_id).strip(),
+                    "status": str(todo.get("status") or "pending").strip(),
+                    "details": str(todo.get("details") or "").strip(),
+                    "result_ref": str(todo.get("result_ref") or "").strip(),
+                    "created_at": str(todo.get("created_at") or now),
+                    "updated_at": now,
+                }
+            )
+
+        existing_plan = progress.get("task_plan") if isinstance(progress.get("task_plan"), dict) else {}
+        existing_todos: list[dict[str, Any]] = existing_plan.get("todos", []) if isinstance(existing_plan, dict) else []
+        existing_todos = [item for item in existing_todos if isinstance(item, dict)]
+        warnings: list[str] = []
+
+        # --- First plan: accept as-is (authoritative baseline) ---
+        if not existing_todos:
+            progress["task_plan"] = {
+                "todos": incoming,
+                "source": source,
+                "reason": reason,
+                "warnings": [],
+                "created_at": now,
+                "updated_at": now,
+            }
+            progress["updated_at"] = now
+            self.save_session(session)
+            self.append_task_journal(
+                session_id,
+                {
+                    "event": "task_plan_snapshot",
+                    "source": source,
+                    "reason": reason,
+                    "warnings": [],
+                    "todos": incoming,
+                },
+            )
+            return session
+
+        # --- Subsequent calls: task IDs and content are LOCKED ---
+        existing_by_id: dict[str, dict[str, Any]] = {
+            str(item.get("task_id") or ""): item for item in existing_todos
+        }
+        incoming_by_id: dict[str, dict[str, Any]] = {
+            str(item.get("task_id") or ""): item for item in incoming
+        }
+        existing_ids = list(existing_by_id.keys())
+        incoming_ids = list(incoming_by_id.keys())
+
+        # Detect structural changes
+        new_ids = [tid for tid in incoming_ids if tid not in existing_by_id]
+        removed_ids = [tid for tid in existing_ids if tid not in incoming_by_id]
+        reordered = incoming_ids != existing_ids
+
+        if new_ids:
+            warnings.append(
+                f"Rejected new task IDs {new_ids} — plan is locked after first snapshot. "
+                f"Existing IDs: {existing_ids}"
+            )
+        if removed_ids:
+            warnings.append(
+                f"Preserved removed task IDs {removed_ids} — plan is locked after first snapshot."
+            )
+        if reordered and not new_ids and not removed_ids:
+            warnings.append(
+                "Ignored reordering — plan order is locked after first snapshot."
+            )
+
+        for existing in existing_todos:
+            task_id = str(existing.get("task_id") or "")
+            incoming_item = incoming_by_id.get(task_id)
+            if incoming_item is None:
+                continue
+            for field in ("content", "activeForm", "status", "details", "result_ref"):
+                incoming_value = str(incoming_item.get(field) or "").strip()
+                existing_value = str(existing.get(field) or "").strip()
+                if incoming_value and incoming_value != existing_value:
+                    warnings.append(
+                        f"Ignored `{field}` change for `{task_id}` because todo snapshot is locked after first call."
+                    )
+
+        progress["task_plan"] = {
+            "todos": existing_todos,
+            "source": existing_plan.get("source") if isinstance(existing_plan, dict) else source,
+            "reason": existing_plan.get("reason") if isinstance(existing_plan, dict) else reason,
+            "warnings": warnings,
+            "created_at": existing_plan.get("created_at") or now if isinstance(existing_plan, dict) else now,
+            "updated_at": existing_plan.get("updated_at") or now if isinstance(existing_plan, dict) else now,
+        }
+        self.save_session(session)
+        self.append_task_journal(
+            session_id,
+            {
+                "event": "task_plan_snapshot_ignored",
+                "source": source,
+                "reason": reason,
+                "warnings": warnings,
+                "incoming_todos": incoming,
+                "todos": existing_todos,
+            },
+        )
+        return session
+
+        # Build merged todos: preserve original IDs/order/content, only apply status updates
+        final_todos: list[dict[str, Any]] = []
+        for existing in existing_todos:
+            task_id = str(existing.get("task_id") or "")
+            incoming_item = incoming_by_id.get(task_id)
+            merged = dict(existing)
+            merged["updated_at"] = now
+
+            if incoming_item is None:
+                # Task ID removed by model — keep it
+                final_todos.append(merged)
+                continue
+
+            # --- Content / activeForm are LOCKED ---
+            incoming_content = str(incoming_item.get("content") or "").strip()
+            existing_content = str(existing.get("content") or "").strip()
+            if incoming_content and incoming_content != existing_content:
+                warnings.append(
+                    f"Ignored content change for `{task_id}` — content is locked after first snapshot."
+                )
+
+            incoming_active = str(incoming_item.get("activeForm") or "").strip()
+            existing_active = str(existing.get("activeForm") or "").strip()
+            if incoming_active and incoming_active != existing_active:
+                warnings.append(
+                    f"Ignored activeForm change for `{task_id}` — activeForm is locked after first snapshot."
+                )
+
+            # --- Status: only update forward (pending → in_progress → completed) ---
+            incoming_status = str(incoming_item.get("status") or existing.get("status") or "pending").strip()
+            existing_status = str(existing.get("status") or "pending").strip()
+
+            if existing_status == "completed" and incoming_status != "completed":
+                warnings.append(
+                    f"Preserved completed status for `{task_id}` (model sent `{incoming_status}`)."
+                )
+                # Keep completed
+            elif incoming_status != existing_status:
+                merged["status"] = incoming_status
+
+            # --- Details / result_ref: allow updates ---
+            incoming_details = str(incoming_item.get("details") or "").strip()
+            if incoming_details:
+                merged["details"] = incoming_details[:1200]
+            incoming_ref = str(incoming_item.get("result_ref") or "").strip()
+            if incoming_ref:
+                merged["result_ref"] = incoming_ref[:500]
+
+            final_todos.append(merged)
+
+        # Also preserve any removed todos at their original position
+        # (they were already kept above via existing_todos iteration)
+
+        progress["task_plan"] = {
+            "todos": final_todos,
+            "source": source,
+            "reason": reason,
+            "warnings": warnings,
+            "created_at": existing_plan.get("created_at") or now if isinstance(existing_plan, dict) else now,
+            "updated_at": now,
+        }
+        progress["updated_at"] = now
+        self.save_session(session)
+        self.append_task_journal(
+            session_id,
+            {
+                "event": "task_plan_snapshot",
+                "source": source,
+                "reason": reason,
+                "warnings": warnings,
+                "todos": final_todos,
+            },
+        )
+        return session
+
+    def update_task_plan_todo(
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        status: str | None = None,
+        details: str | None = None,
+        result_ref: str | None = None,
+    ) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        plan = progress.setdefault("task_plan", {"todos": [], "updated_at": _now_iso()})
+        todos = plan.setdefault("todos", [])
+        now = _now_iso()
+        normalized_id = str(task_id or "").strip()
+        matched = False
+        for todo in todos:
+            if not isinstance(todo, dict) or todo.get("task_id") != normalized_id:
+                continue
+            matched = True
+            if status:
+                next_status = str(status).strip()
+                if todo.get("status") == "completed" and next_status != "completed":
+                    todo["details"] = (
+                        str(todo.get("details") or "")
+                        + f"\nIgnored downgrade attempt to `{next_status}`."
+                    ).strip()[:1200]
+                else:
+                    todo["status"] = next_status
+            if details is not None:
+                todo["details"] = str(details).strip()[:1200]
+            if result_ref is not None:
+                todo["result_ref"] = str(result_ref).strip()[:500]
+            todo["updated_at"] = now
+            break
+        if not matched:
+            self.append_task_journal(
+                session_id,
+                {
+                    "event": "task_plan_todo_update_ignored",
+                    "task_id": normalized_id,
+                    "status": status,
+                    "details": details,
+                    "result_ref": result_ref,
+                    "reason": "task_id not found in fixed task_plan",
+                },
+            )
+            return session
+        plan["updated_at"] = now
+        progress["updated_at"] = now
+        self.save_session(session)
+        self.append_task_journal(
+            session_id,
+            {
+                "event": "task_plan_todo_update",
+                "task_id": normalized_id,
+                "status": status,
+                "details": details,
+                "result_ref": result_ref,
+                "todos": todos,
+            },
+        )
+        return session
+
+    def recover_task_plan_from_journal(self, session_id: str) -> dict[str, Any] | None:
+        path = self.task_journal_path(session_id)
+        if not path.exists():
+            legacy_path = self.legacy_task_journal_path(session_id)
+            if legacy_path.exists():
+                path = legacy_path
+        if not path.exists():
+            return None
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return None
+        for line in reversed(lines):
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or payload.get("event") != "task_plan_snapshot":
+                continue
+            todos = payload.get("todos")
+            if not isinstance(todos, list) or not any(isinstance(item, dict) for item in todos):
+                continue
+            now = _now_iso()
+            return {
+                "todos": [item for item in todos if isinstance(item, dict)],
+                "source": payload.get("source") or "journal_recovery",
+                "reason": payload.get("reason") or "recovered_from_task_plan_journal",
+                "warnings": payload.get("warnings") if isinstance(payload.get("warnings"), list) else [],
+                "created_at": payload.get("created_at") or now,
+                "updated_at": now,
+                "recovered_from_journal": True,
+            }
+        return None
+
+    def ensure_task_plan_recovered(self, session_id: str) -> dict[str, Any] | None:
+        session = self.load_session(session_id)
+        if session is None:
+            return None
+        progress = session.setdefault("task_progress", self.default_progress())
+        plan = progress.get("task_plan") if isinstance(progress, dict) else None
+        todos = plan.get("todos") if isinstance(plan, dict) else None
+        if isinstance(todos, list) and todos:
+            return session
+        recovered = self.recover_task_plan_from_journal(session_id)
+        if recovered is None:
+            return session
+        progress["task_plan"] = recovered
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        self.append_task_journal(
+            session_id,
+            {
+                "event": "task_plan_recovered",
+                "reason": "session task_plan was empty; restored last non-empty snapshot",
+                "todos": recovered.get("todos", []),
+            },
+        )
+        return session
+
+    def append_task_journal(self, session_id: str, event: dict[str, Any]) -> None:
+        path = self.task_journal_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": _now_iso(),
+            **event,
+        }
+        with _SESSION_FILE_LOCK:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    def read_task_journal_tail(self, session_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        path = self.task_journal_path(session_id)
+        if not path.exists():
+            legacy_path = self.legacy_task_journal_path(session_id)
+            if legacy_path.exists():
+                path = legacy_path
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        events: list[dict[str, Any]] = []
+        for line in lines[-max(1, limit):]:
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
+
+    def _current_task_id_from_progress(self, progress: dict[str, Any]) -> str:
+        plan = progress.get("task_plan") if isinstance(progress, dict) else None
+        todos = plan.get("todos", []) if isinstance(plan, dict) else []
+        if isinstance(todos, list):
+            for todo in todos:
+                if not isinstance(todo, dict):
+                    continue
+                if str(todo.get("status") or "pending") != "completed":
+                    return str(todo.get("task_id") or "").strip()
+        return ""
+
+    def append_tool_event(
+        self,
+        session_id: str,
+        *,
+        event_type: str,
+        tool_name: str,
+        arguments: Any | None = None,
+        content: Any | None = None,
+    ) -> dict[str, Any]:
+        session = self.ensure_task_plan_recovered(session_id) or self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        if "task_outputs" not in progress or not isinstance(progress.get("task_outputs"), dict):
+            progress["task_outputs"] = {}
+        now = _now_iso()
+        task_id = self._current_task_id_from_progress(progress) or "unassigned"
+        payload = {
+            "created_at": now,
+            "event": str(event_type or "").strip() or "tool_event",
+            "task_id": task_id,
+            "tool_name": str(tool_name or "tool").strip() or "tool",
+            "arguments": _compact_jsonable(arguments, MAX_STORED_TOOL_ARGUMENT_CHARS),
+            "content": _compact_jsonable(content, MAX_STORED_TASK_OUTPUT_CHARS),
+        }
+
+        outputs = progress.setdefault("task_outputs", {})
+        task_output = outputs.setdefault(
+            task_id,
+            {
+                "task_id": task_id,
+                "events": [],
+                "updated_at": now,
+            },
+        )
+        events = task_output.setdefault("events", [])
+        if isinstance(events, list):
+            events.append(payload)
+            task_output["events"] = events[-MAX_TASK_OUTPUT_EVENTS:]
+        else:
+            task_output["events"] = [payload]
+        task_output["updated_at"] = now
+        outputs[task_id] = task_output
+        progress["updated_at"] = now
+        self.save_session(session)
+
+        path = self.tool_events_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _SESSION_FILE_LOCK:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        return session
+
+    def read_tool_events_tail(self, session_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        path = self.tool_events_path(session_id)
+        if not path.exists():
+            legacy_path = self.legacy_tool_events_path(session_id)
+            if legacy_path.exists():
+                path = legacy_path
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        events: list[dict[str, Any]] = []
+        for line in lines[-max(1, limit):]:
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
+
+    def load_tool_result_cache(self, session_id: str) -> dict[str, dict[str, Any]]:
+        path = self.tool_result_cache_path(session_id)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        entries = data.get("entries", data)
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in entries.items()
+            if isinstance(value, dict)
+        }
+
+    def save_tool_result_cache(self, session_id: str, entries: dict[str, dict[str, Any]]) -> None:
+        path = self.tool_result_cache_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = _now_iso()
+        clean_entries = {
+            str(key): _compact_jsonable(value, MAX_STORED_TOOL_CONTENT_CHARS)
+            for key, value in entries.items()
+            if isinstance(value, dict)
+        }
+        ordered = sorted(
+            clean_entries.items(),
+            key=lambda item: float(item[1].get("created_at_ms") or 0),
+            reverse=True,
+        )[:MAX_TOOL_RESULT_CACHE_ENTRIES]
+        payload = {
+            "updated_at": now,
+            "entries": dict(ordered),
+        }
+        with _SESSION_FILE_LOCK:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    def get_tool_result_cache_entry(self, session_id: str, call_key: str) -> dict[str, Any] | None:
+        if not session_id or not call_key:
+            return None
+        return self.load_tool_result_cache(session_id).get(call_key)
+
+    def set_tool_result_cache_entry(
+        self,
+        session_id: str,
+        call_key: str,
+        entry: dict[str, Any],
+    ) -> None:
+        if not session_id or not call_key or not isinstance(entry, dict):
+            return
+        entries = self.load_tool_result_cache(session_id)
+        entries[call_key] = entry
+        self.save_tool_result_cache(session_id, entries)
+
+    def get_unfinished_task_plan_todos(self, session_id: str) -> list[dict[str, Any]]:
+        session = self.ensure_task_plan_recovered(session_id)
+        if session is None:
+            return []
+        progress = session.get("task_progress", {})
+        plan = progress.get("task_plan") if isinstance(progress, dict) else None
+        todos = plan.get("todos", []) if isinstance(plan, dict) else []
+        if not isinstance(todos, list):
+            return []
+        return [
+            todo for todo in todos
+            if isinstance(todo, dict) and str(todo.get("status") or "pending") != "completed"
+        ]
 
     def add_task_item(self, session_id: str, task: dict[str, Any]) -> dict[str, Any]:
         session = self.create_or_get_session(session_id)
@@ -456,7 +1031,7 @@ class SessionStore:
         return session
 
     def get_history(self, session_id: str) -> list[dict[str, str]]:
-        session = self.load_session(session_id)
+        session = self.ensure_task_plan_recovered(session_id)
         if session is None:
             return []
         history: list[dict[str, str]] = []
@@ -466,6 +1041,78 @@ class SessionStore:
             if role in {"user", "assistant"} and isinstance(content, str):
                 history.append({"role": role, "content": content})
         progress = session.get("task_progress", {})
+        plan = progress.get("task_plan") if isinstance(progress, dict) else None
+        if isinstance(plan, dict) and isinstance(plan.get("todos"), list) and plan.get("todos"):
+            todo_lines = []
+            for todo in plan.get("todos", []):
+                if not isinstance(todo, dict):
+                    continue
+                todo_lines.append(
+                    "- {task_id}: {status} | {content} | details={details} | result={result_ref}".format(
+                        task_id=todo.get("task_id", ""),
+                        status=todo.get("status", "pending"),
+                        content=todo.get("content", ""),
+                        details=str(todo.get("details") or "")[:300],
+                        result_ref=str(todo.get("result_ref") or "")[:180],
+                    )
+                )
+            if todo_lines:
+                journal_events = self.read_task_journal_tail(session_id, limit=5)
+                journal_lines = []
+                for event in journal_events:
+                    journal_lines.append(
+                        "- {created_at} {event}: {summary}".format(
+                            created_at=event.get("created_at", ""),
+                            event=event.get("event", ""),
+                            summary=str(event.get("task_id") or event.get("reason") or event.get("warnings") or "")[:240],
+                        )
+                    )
+                content = (
+                    "Previous task_plan state from session memory (advisory). "
+                    "Use this for context but the model owns the current plan.\n"
+                    + "\n".join(todo_lines)
+                )
+                if journal_lines:
+                    content += "\nRecent task_plan journal:\n" + "\n".join(journal_lines)
+                history.append({"role": "assistant", "content": content})
+        task_outputs = progress.get("task_outputs") if isinstance(progress, dict) else None
+        if isinstance(task_outputs, dict) and task_outputs:
+            output_lines = [
+                "Persisted task outputs from previous execution. Use these results directly; do not rerun completed tool work unless the user asks or the saved output is insufficient."
+            ]
+            current_task_id = self._current_task_id_from_progress(progress)
+            preferred_ids = [current_task_id] if current_task_id else []
+            preferred_ids.extend(task_id for task_id in task_outputs if task_id not in preferred_ids)
+            for task_id in preferred_ids[:4]:
+                output = task_outputs.get(task_id)
+                if not isinstance(output, dict):
+                    continue
+                events = output.get("events") if isinstance(output.get("events"), list) else []
+                if not events:
+                    continue
+                output_lines.append(f"Task `{task_id}` recent tool outputs:")
+                for event in events[-6:]:
+                    if not isinstance(event, dict):
+                        continue
+                    preview = event.get("content")
+                    if not isinstance(preview, str):
+                        try:
+                            preview = json.dumps(preview, ensure_ascii=False, default=str)
+                        except Exception:
+                            preview = str(preview)
+                    preview = (preview or "").strip()
+                    if len(preview) > 900:
+                        preview = preview[:900] + "\n[... truncated persisted tool output ...]"
+                    output_lines.append(
+                        "- {created_at} {event} `{tool}`: {preview}".format(
+                            created_at=event.get("created_at", ""),
+                            event=event.get("event", ""),
+                            tool=event.get("tool_name", "tool"),
+                            preview=preview,
+                        )
+                    )
+            if len(output_lines) > 1:
+                history.append({"role": "assistant", "content": "\n".join(output_lines)})
         summary = progress.get("execution_summary") if isinstance(progress, dict) else None
         if isinstance(summary, dict):
             memory_lines = [

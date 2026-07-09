@@ -19,6 +19,9 @@
     "legacy_llm_config_path": "",
     "deepseek_tokenizer_dir": "C:/Users/hank.yu3/Downloads/deepseek_v3_tokenizer"
   },
+  "feishu": {
+    "session_cookie": ""
+  },
   "checkers_game": {
     "backend_host": "0.0.0.0",
     "backend_port": 5000,

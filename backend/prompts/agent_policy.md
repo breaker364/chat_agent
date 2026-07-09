@@ -17,6 +17,9 @@ Do not finalize if:
 
 When a tool returns an error:
 
+- If a task plan exists, keep completed todos completed and work only on failed, blocked, pending, or in_progress todos.
+- Do not rename, delete, or replace existing task IDs during recovery unless the task structure genuinely changed and you call `update_task_plan` with `reason="plan_changed"`.
+- A response is not complete while any task_plan todo remains pending, in_progress, failed, or blocked. Report a concrete blocker instead of marking the task completed.
 - Read the error and retry with a changed approach.
 - Correct paths, command names, arguments, table IDs, sheet names, field names, cells, endpoints, or payload shape as needed.
 - Inspect schema/list/status output before retrying writes when selectors may be wrong.

@@ -55,6 +55,68 @@ def resolve_wiki_to_bitable(cookies, wiki_token: str) -> str:
 # fetch_bitable_schema
 # ---------------------------------------------------------------------------
 
+# Headers that match what the Feishu web UI sends for API calls.  The write
+# path (rce/messages) uses these and works reliably without CSRF errors;
+# applying them to the read path (tablesv3) fixes the intermittent CSRF
+# failures that occur with the minimal header set.
+_BITABLE_API_HEADERS = {
+    "Origin": "https://nio.feishu.cn",
+    "x-command-version": "7.65.0",
+    "x-web-version": "7.65.0",
+    "x-lgw-terminal-type": "2",
+    "x-lgw-os-type": "3",
+    "X-Source": "web",
+    "locale": "zh_CN",
+}
+
+_MAX_CSRF_RETRIES = 1
+
+
+def _is_csrf_error(payload) -> bool:
+    """Return True if the server response indicates a CSRF / auth rejection."""
+    if not isinstance(payload, dict):
+        text = str(payload).lower()
+        return "csrf" in text or "token error" in text
+    msg = str(payload.get("msg", "") or "").lower()
+    code_msg = str(payload.get("code", "") or "")
+    return "csrf" in msg or "token error" in msg or "csrf" in code_msg
+
+
+def _bitable_post_with_csrf_fallback(cookies, host, url_path, body, extra_headers=None):
+    """POST to a bitable endpoint with CSRF-aware retry.
+
+    On the first attempt uses the full browser-matching header set (Origin,
+    x-web-version, locale, etc.).  If the server still returns a CSRF error
+    the call is retried once with a stripped cookie (domain-less) before
+    giving up with a clear diagnostic.
+    """
+    headers = {**_BITABLE_API_HEADERS, **(extra_headers or {})}
+    res = http_post_with_cookies(cookies, host, url_path, body, headers)
+    payload = res.get("data")
+
+    if _is_csrf_error(payload):
+        # Retry once: strip the domain attribute from cookies, which can
+        # sometimes resolve cross-subdomain CSRF mismatches.
+        retry_cookies = []
+        for c in cookies:
+            c2 = dict(c)
+            c2.pop("domain", None)
+            retry_cookies.append(c2)
+        res = http_post_with_cookies(retry_cookies, host, url_path, body, headers)
+        payload = res.get("data")
+
+    if _is_csrf_error(payload):
+        raise RuntimeError(
+            "Feishu API returned CSRF token error. "
+            "The session cookie may have been invalidated. "
+            "Run feishu QR login again to obtain a fresh session, "
+            "then retry the operation. "
+            f"Server response: {payload!r}"
+        )
+
+    return res
+
+
 def fetch_bitable_schema(cookies, token: str, table_id: str = None) -> dict:
     if not table_id:
         url = (f'/space/api/v1/bitable/{token}/clientvars?tableID=&viewID='
@@ -83,7 +145,7 @@ def fetch_bitable_schema(cookies, token: str, table_id: str = None) -> dict:
             'tablePartitionForNoRankFlagList': [],
             'encodingProtocol': {'compression': 1, 'serialization': 0},
         }
-        res = http_post_with_cookies(cookies, BITABLE_HOST, url, body)
+        res = _bitable_post_with_csrf_fallback(cookies, BITABLE_HOST, url, body)
         payload = res.get('data')
         if not isinstance(payload, dict) or payload.get('code') != 0:
             raise RuntimeError(f"Failed to fetch table schema: payload={payload!r}")
@@ -235,7 +297,7 @@ def fetch_bitable_field_map_batch(cookies, token: str, table_ids: list) -> dict:
         'tablePartitionForNoRankFlagList': [],
         'encodingProtocol': {'compression': 1, 'serialization': 0},
     }
-    res = http_post_with_cookies(cookies, BITABLE_HOST, url, body)
+    res = _bitable_post_with_csrf_fallback(cookies, BITABLE_HOST, url, body)
     payload = res.get('data')
     if not isinstance(payload, dict) or payload.get('code') != 0:
         raise RuntimeError(f"Failed to fetch table schemas: payload={payload!r}")

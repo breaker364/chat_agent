@@ -14,7 +14,7 @@ from .config import create_chat_deepseek, load_llm_config
 from .prompts import load_agent_policy, load_system_prompt
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
-from .tools import get_all_tools
+from .tools import get_all_tools, _normalize_tool_payload_for_key
 
 SYSTEM_PROMPT = load_system_prompt()
 AGENT_POLICY = load_agent_policy()
@@ -23,7 +23,7 @@ AGENT_POLICY = load_agent_policy()
 MAX_AGENT_STEPS = 80
 MAX_WEB_SEARCH_CALLS = 10
 MAX_WEB_FETCH_CALLS = 5
-MAX_AGENT_REPAIR_PASSES = 4
+MAX_AGENT_REPAIR_PASSES = 2
 MAX_BACKGROUND_SUBAGENT_POLLS = 6
 MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_TOTAL_CHARS = 24_000
@@ -75,6 +75,11 @@ async def stream_agent_events(
     last_web_fetch_results: list[str] = []
     tool_call_names: list[str] = []
     tool_errors: list[dict[str, str]] = []
+    tool_successes: list[dict[str, str]] = []
+    step_states: dict[str, dict[str, str]] = {}
+    tool_call_history: list[dict[str, Any]] = []  # persists across repair passes
+    emitted_tool_call_keys: set[str] = set()
+    tool_result_suppression_queue: dict[str, list[bool]] = {}
     repair_passes = 0
     launched_background_subagents: list[dict[str, Any]] = []
     last_heartbeat_emitted_at = 0.0
@@ -100,6 +105,64 @@ async def stream_agent_events(
         if isinstance(value, (list, tuple)):
             return [sanitize_tool_payload(item) for item in value]
         return to_jsonable(value)
+
+    def runtime_tool_call_key(tool_name: str, arguments: Any) -> str:
+        try:
+            normalized_arguments = _normalize_tool_payload_for_key(tool_name, arguments)
+            normalized = json.dumps(
+                normalized_arguments or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except Exception:
+            normalized = str(arguments)
+        return f"{tool_name}:{normalized}"
+
+    def step_for_tool(tool_name: str) -> str:
+        lowered = (tool_name or "").lower()
+        if lowered in {"get-current-date", "get-station-code-of-citys", "get-station-code-by-names", "get-tickets"}:
+            return "data_query"
+        if lowered == "feishu_login_status" or "feishu" in lowered or "lark" in lowered:
+            return "target_write"
+        if lowered in {"read_skill_detail", "use_skill"}:
+            return "context_gathering"
+        if lowered in {"read_file", "list_directory", "get_file_info", "web_search", "web_fetch", "fetch_webpage"}:
+            return "context_gathering"
+        if lowered in {"write_file", "append_file", "delete_file", "run_python_file"}:
+            return "target_write" if lowered != "run_python_file" else "verification"
+        return lowered or "tool_work"
+
+    def mark_step(step: str, status: str, detail: str = "") -> None:
+        step_states[step] = {
+            "status": status,
+            "detail": detail[:800],
+        }
+
+    def completed_step_summary() -> str:
+        completed = [
+            f"- {name}: {state.get('detail') or 'completed'}"
+            for name, state in sorted(step_states.items())
+            if state.get("status") == "completed"
+        ]
+        return "\n".join(completed) if completed else "- No completed subtasks recorded yet."
+
+    def failed_step_summary() -> str:
+        failed = [
+            f"- {name}: {state.get('detail') or 'failed'}"
+            for name, state in sorted(step_states.items())
+            if state.get("status") in {"failed", "blocked"}
+        ]
+        return "\n".join(failed) if failed else "- No failed subtasks recorded."
+
+    def unfinished_step_summary() -> str:
+        unfinished = [
+            f"- {name}: {state.get('status')} - {state.get('detail') or ''}"
+            for name, state in sorted(step_states.items())
+            if state.get("status") != "completed"
+        ]
+        return "\n".join(unfinished) if unfinished else "- No unfinished subtasks recorded."
 
     def merge_usage_delta(target: dict[str, int], usage: dict[str, int]) -> None:
         for key, value in usage.items():
@@ -343,12 +406,45 @@ async def stream_agent_events(
             errors_text = "\n".join(error_lines)
         else:
             errors_text = "- No structured tool error captured."
+
+        # Build a concrete inventory of every tool already called this run,
+        # so the model can SEE what it already did and avoid restarting.
+        history_lines: list[str] = []
+        seen_tools: dict[str, int] = {}
+        seen_results: dict[str, str] = {}
+        for entry in tool_call_history:
+            tname = entry.get("tool", "tool")
+            if entry.get("phase") == "start":
+                seen_tools[tname] = seen_tools.get(tname, 0) + 1
+            elif entry.get("phase") == "end":
+                key = f"{tname}:{entry.get('ok', True)}"
+                preview = str(entry.get("result_preview", ""))[:200]
+                if preview and preview not in seen_results:
+                    seen_results[key] = preview
+
+        if seen_tools:
+            history_lines.append("Already-completed tool calls (DO NOT re-run these exact calls):")
+            for tname, count in sorted(seen_tools.items()):
+                history_lines.append(f"  - {tname}: called {count} time(s)")
+        if seen_results:
+            history_lines.append("Key results you already have (reuse, do not re-query):")
+            for key, preview in sorted(seen_results.items()):
+                history_lines.append(f"  - {key}: {preview}")
+
+        inventory = "\n".join(history_lines) if history_lines else "- No tool call history recorded for this run."
+
         return (
             f"{AGENT_POLICY}\n\n"
-            "The task is not complete. Continue from the current state and fix the issue without asking the user to paste the error again.\n"
-            f"Reason: {reason}\n\n"
+            "IMPORTANT: You are in a CONTINUATION pass. Do NOT restart from scratch. "
+            "Continue exactly where you left off. Only fix the FAILED subtask(s); "
+            "do NOT repeat completed work or re-run successful tool calls.\n\n"
+            f"Reason for continuation: {reason}\n\n"
+            f"{inventory}\n\n"
+            f"Completed subtasks that must be reused, not repeated:\n{completed_step_summary()}\n\n"
+            f"Only these unfinished subtasks may be worked on:\n{unfinished_step_summary()}\n\n"
+            f"Failed or blocked subtasks to repair:\n{failed_step_summary()}\n\n"
             f"Recent debug/tool errors:\n{errors_text}\n\n"
-            "Follow the policy above. Re-run corrected tool calls and verify concrete outputs before finalizing."
+            "Follow the policy above. Re-run only corrected calls for the failed subtask and verify concrete outputs before finalizing."
         )
 
     def looks_incomplete(final_text: str) -> bool:
@@ -619,7 +715,15 @@ async def stream_agent_events(
 
         elif kind == "on_tool_start":
             input_data = sanitize_tool_payload(data.get("input", {}))
+            display_key = runtime_tool_call_key(name, input_data)
+            is_duplicate_display_call = display_key in emitted_tool_call_keys
+            tool_result_suppression_queue.setdefault(name, []).append(is_duplicate_display_call)
+            if not is_duplicate_display_call:
+                emitted_tool_call_keys.add(display_key)
             tool_call_names.append(name)
+            tool_call_history.append(
+                {"phase": "start", "tool": name, "arguments": input_data, "at": time.monotonic()}
+            )
             if name == "web_search":
                 web_search_calls += 1
                 if web_search_calls > MAX_WEB_SEARCH_CALLS:
@@ -689,19 +793,24 @@ async def stream_agent_events(
             active_tool = name
             progress_count = 0
             elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
-            yield {
-                "event": "tool_call",
-                "data": json.dumps(
-                    {"name": name, "arguments": input_data},
-                    ensure_ascii=False,
-                ),
-            }
+            if not is_duplicate_display_call:
+                yield {
+                    "event": "tool_call",
+                    "data": json.dumps(
+                        {"name": name, "arguments": input_data},
+                        ensure_ascii=False,
+                    ),
+                }
             yield {
                 "event": "debug",
                 "data": json.dumps(
                     {
-                        "stage": "tool_start",
-                        "message": f"Calling tool `{name}`.",
+                        "stage": "tool_duplicate_suppressed" if is_duplicate_display_call else "tool_start",
+                        "message": (
+                            f"Suppressed duplicate tool event for `{name}`; runtime will reuse or block as needed."
+                            if is_duplicate_display_call
+                            else f"Calling tool `{name}`."
+                        ),
                         "elapsed_seconds": elapsed_seconds,
                         "tool": name,
                         "arguments": input_data,
@@ -714,8 +823,24 @@ async def stream_agent_events(
             output = data.get("output", "")
             output_str = output.content if isinstance(output, BaseMessage) else str(output)
             tool_name = name or active_tool or "tool"
-            if output_indicates_tool_error(tool_name, output_str):
+            is_error = output_indicates_tool_error(tool_name, output_str)
+            if is_error:
                 tool_errors.append({"tool": tool_name, "message": output_str[:4000]})
+                mark_step(step_for_tool(tool_name), "failed", f"`{tool_name}` failed: {output_str[:400]}")
+            else:
+                tool_successes.append({"tool": tool_name, "message": output_str[:800]})
+                mark_step(step_for_tool(tool_name), "completed", f"`{tool_name}` succeeded")
+            # Record result into history so repair passes can reference it
+            result_preview = output_str[:500] if output_str else "(empty)"
+            tool_call_history.append(
+                {
+                    "phase": "end",
+                    "tool": tool_name,
+                    "ok": not is_error,
+                    "result_preview": result_preview,
+                    "at": time.monotonic(),
+                }
+            )
             if tool_name == "web_search":
                 try:
                     last_web_search_payload = json.loads(output_str)
@@ -739,19 +864,28 @@ async def stream_agent_events(
             active_tool = None
             progress_count = 0
             elapsed_seconds = max(0, int(time.monotonic() - run_started_at))
-            yield {
-                "event": "tool_result",
-                "data": json.dumps(
-                    {"name": tool_name, "content": output_str},
-                    ensure_ascii=False,
-                ),
-            }
+            suppression_queue = tool_result_suppression_queue.get(tool_name, [])
+            suppress_result = bool(suppression_queue.pop(0)) if suppression_queue else False
+            if not suppression_queue:
+                tool_result_suppression_queue.pop(tool_name, None)
+            if not suppress_result:
+                yield {
+                    "event": "tool_result",
+                    "data": json.dumps(
+                        {"name": tool_name, "content": output_str},
+                        ensure_ascii=False,
+                    ),
+                }
             yield {
                 "event": "debug",
                 "data": json.dumps(
                     {
-                        "stage": "tool_end",
-                        "message": f"Tool `{tool_name}` returned.",
+                        "stage": "tool_duplicate_result_suppressed" if suppress_result else "tool_end",
+                        "message": (
+                            f"Suppressed duplicate result event for `{tool_name}`."
+                            if suppress_result
+                            else f"Tool `{tool_name}` returned."
+                        ),
                         "elapsed_seconds": elapsed_seconds,
                         "tool": tool_name,
                         "content_preview": output_str[:300],
@@ -886,6 +1020,8 @@ async def stream_agent_events(
                             "repair_pass": repair_passes,
                             "reasons": reasons,
                             "tool_errors": tool_errors[-5:],
+                            "completed_subtasks": completed_step_summary(),
+                            "failed_subtasks": failed_step_summary(),
                         },
                         ensure_ascii=False,
                     ),

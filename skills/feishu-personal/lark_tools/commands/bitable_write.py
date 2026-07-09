@@ -39,6 +39,7 @@ from ..bitable_base_ot import (
 from .bitable import (
     resolve_bitable_token, resolve_wiki_to_bitable,
     fetch_bitable_schema, build_field_map,
+    _bitable_post_with_csrf_fallback,
 )
 
 
@@ -121,56 +122,118 @@ def _resolve(cookies, token_or_url: str) -> str:
 
 
 def _load_field_map(cookies, base_token: str, table_id: str) -> dict:
-    """Return {fieldId: {name, type, optionMap}} for a table."""
-    schema = fetch_bitable_schema(cookies, base_token, table_id)
-    return build_field_map(schema)
+    """Return {fieldId: {name, type, optionMap}} for a table.
+
+    Uses the CSRF-fixed tablesv3 POST path.  On failure returns an empty
+    dict so writes can still proceed with raw field IDs.
+    """
+    try:
+        schema = fetch_bitable_schema(cookies, base_token, table_id)
+        return build_field_map(schema)
+    except Exception as exc:
+        print(
+            f"[bitable_write] Could not load field map (tablesv3 POST failed): {exc}",
+            file=sys.stderr,
+        )
+        return {}
 
 
 def _load_field_descriptor(cookies, base_token: str, table_id: str, field_id: str) -> dict:
     """Return the full raw FieldDescriptor for a field, or None."""
-    schema = fetch_bitable_schema(cookies, base_token, table_id)
+    try:
+        schema = fetch_bitable_schema(cookies, base_token, table_id)
+    except Exception:
+        return None
     fm = ((schema.get('data') or {}).get('table') or {}).get('fieldMap') or {}
     return fm.get(field_id)
 
 
 def _load_table_layout(cookies, base_token: str, table_id: str) -> dict:
-    """Fetch raw tablesv3 payload and return {field_count, view_ids}.
+    """Fetch table layout and return {field_count, view_ids}.
 
-    Used by add-field — the OT op needs `total` (field count after add)
-    and `indexes: {viewId: order}` for every view in the table.
+    Tries tablesv3 POST (with CSRF fix).  On failure falls back to a
+    minimal layout derived from clientvars so add-field can still proceed.
     """
     import base64, zlib
     from ..config import BITABLE_HOST
-    from ..http_utils import http_post_with_cookies
-    res = http_post_with_cookies(
-        cookies, BITABLE_HOST, f'/space/api/bitable/{base_token}/tablesv3/',
-        {
-            'tableIDList': [table_id],
-            'tablePartitionFlagList': [0],
-            'tablePartitionForNoRankFlagList': [],
-            'encodingProtocol': {'compression': 1, 'serialization': 0},
-        },
+
+    # Try tablesv3 POST first (with CSRF fallback)
+    try:
+        res = _bitable_post_with_csrf_fallback(
+            cookies, BITABLE_HOST,
+            f'/space/api/bitable/{base_token}/tablesv3/',
+            {
+                'tableIDList': [table_id],
+                'tablePartitionFlagList': [0],
+                'tablePartitionForNoRankFlagList': [],
+                'encodingProtocol': {'compression': 1, 'serialization': 0},
+            },
+        )
+        encoded = (res.get('data') or {}).get('data', {}).get(table_id)
+        if encoded:
+            table_data = json.loads(zlib.decompress(base64.b64decode(encoded), 47))
+            field_count = len(table_data.get('fieldMap') or {})
+            view_ids = list(table_data.get('views') or [])
+            if view_ids:
+                return {'field_count': field_count, 'view_ids': view_ids}
+    except Exception as exc:
+        print(
+            f"[bitable_write] tablesv3 POST failed, falling back to clientvars: {exc}",
+            file=sys.stderr,
+        )
+
+    # Fallback: derive layout from clientvars GET (table-level view info)
+    from ..http_utils import http_get
+    clientvars_url = (
+        f'/space/api/v1/bitable/{base_token}/clientvars'
+        f'?tableID={table_id}&viewID=&recordLimit=0&needBase=true'
+        f'&viewLazyLoad=true&ondemandVer=2&openType=1'
     )
-    encoded = (res.get('data') or {}).get('data', {}).get(table_id)
-    if not encoded:
-        raise RuntimeError(f'tablesv3: no payload for table {table_id}')
-    table_data = json.loads(zlib.decompress(base64.b64decode(encoded), 47))
-    field_count = len(table_data.get('fieldMap') or {})
-    view_ids = list(table_data.get('views') or [])
+    res = http_get(cookies, BITABLE_HOST, clientvars_url)
+    payload = res.get('data')
+    if not isinstance(payload, dict) or payload.get('code') != 0:
+        raise RuntimeError(f"Failed to fetch clientvars for layout: payload={payload!r}")
+    client_data = payload.get('data') or {}
+    base_str = client_data.get('base')
+    if not base_str:
+        raise RuntimeError('No base field in clientvars response')
+    base_json = json.loads(zlib.decompress(base64.b64decode(base_str), 47))
+    # The base JSON's top-level 'views' array contains view IDs for the
+    # current table when tableID is specified.
+    view_ids = base_json.get('views') or []
     if not view_ids:
-        raise RuntimeError(f'tablesv3: no views found in table {table_id}')
+        raise RuntimeError(
+            f'Cannot determine view_ids for table {table_id}. '
+            'The table may have no views. Please open the base in Feishu first.'
+        )
+    field_count = len(base_json.get('fieldMap') or {})
+
     return {'field_count': field_count, 'view_ids': view_ids}
 
 
 def _resolve_field_name_to_id(field_map: dict, name_or_id: str) -> tuple:
-    """Return (field_id, field_info) given a name or id. Raises if not found."""
+    """Return (field_id, field_info) given a name or id.
+
+    If ``name_or_id`` is already a field ID (starts with ``fld``), return
+    it directly — no schema lookup needed.  This allows writing records
+    without a successful tablesv3 POST.
+    """
     if name_or_id in field_map:
         return name_or_id, field_map[name_or_id]
+    # Direct field ID passthrough (e.g. "fld14Vw7y1")
+    if name_or_id.startswith('fld') and len(name_or_id) >= 10:
+        return name_or_id, {'name': name_or_id, 'type': 1}
     # match by name
     for fid, info in field_map.items():
         if info.get('name') == name_or_id:
             return fid, info
-    raise RuntimeError(f'Field not found: {name_or_id!r}. Known: {[i["name"] for i in field_map.values()]}')
+    # If field_map is empty (tablesv3 failed), treat as raw field ID
+    if not field_map and name_or_id.startswith('fld'):
+        return name_or_id, {'name': name_or_id, 'type': 1}
+    known = [i.get("name", fid) for fid, i in field_map.items()]
+    raise RuntimeError(
+        f'Field not found: {name_or_id!r}. Known fields: {known}'
+    )
 
 
 def _parse_kv_pairs(pairs: list) -> dict:
@@ -257,6 +320,45 @@ def cmd_bitable_add_record(cookies, token_or_url: str, table_id: str, kv_pairs: 
         'record_id': new_rid,
         'rev': (resp.get('data') or {}).get('rev'),
         'fields': list(kv.keys()),
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_bitable_add_records_batch(cookies, token_or_url: str, table_id: str,
+                                   records: list[dict[str, str]]):
+    """Add multiple records in a single OT operation.
+
+    Standard workflow (avoids tablesv3 POST entirely):
+      1. Create base → get obj_token
+      2. clientvars GET → get table_id
+      3. rce/messages AddField × N → get field IDs
+      4. rce/messages AddRecordsV2 (batch) → write all records at once
+      5. records GET → verify
+
+    Each record dict maps field ID (``fldXXXXXXXXXX``) → value string.
+    No schema lookup is performed — values are encoded as text (type 1).
+    Pass field IDs directly from the AddField responses.
+    """
+    base_token = _resolve(cookies, token_or_url)
+    operations = []
+    for record in records:
+        cell_data = {}
+        for fid, raw_value in record.items():
+            cell_data[fid] = encode_text_value(str(raw_value))
+        new_rid = new_record_id()
+        operations.append(op_add_record(table_id, new_rid, cell_data))
+
+    if not operations:
+        print(json.dumps({'success': False, 'error': 'No records provided'}))
+        return
+
+    resp = submit_operations(cookies, base_token, table_id, operations)
+    rev = (resp.get('data') or {}).get('rev', '?')
+    print(json.dumps({
+        'success': True,
+        'obj_token': base_token,
+        'table_id': table_id,
+        'records_written': len(operations),
+        'rev': rev,
     }, indent=2, ensure_ascii=False))
 
 
