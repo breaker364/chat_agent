@@ -23,6 +23,7 @@ export default defineConfig({
       "/sessions": backendTarget,
       "/skills": backendTarget,
       "/feishu": backendTarget,
+      "/uploads": backendTarget,
     },
   },
 });

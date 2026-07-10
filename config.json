@@ -2,6 +2,17 @@
   "base_url": "https://api.deepseek.com",
   "api_key": "sk-5ce7c839b7004c4dbe12935e947d4b90",
   "model": "deepseek-v4-pro",
+  "vision": {
+    "enabled": true,
+    "base_url": "https://model.nioint.com/v1",
+    "model": "Qwen3.6-Flash",
+    "api_key_env": "VISION_API_KEY",
+    "api_key": "temp_7d118ea2",
+    "max_images_per_request": 4,
+    "max_image_bytes": 20971520,
+    "max_output_tokens": 2048,
+    "timeout_seconds": 60
+  },
   "tavily_base_url": "https://api.tavily.com",
   "tavily_api_key": "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",
   "mcd_mcp_url": "https://mcp.mcd.cn",

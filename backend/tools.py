@@ -42,6 +42,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_mcd_mcp_config
+from .vision import analyze_image_file
 from .feishu_web_login import (
     FeishuWebSessionStore,
     build_feishu_cookies,
@@ -85,6 +86,7 @@ _TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
     "fetch_webpage": 900,
     "get_subagent_task": 30,
     "feishu_login_status": 60,
+    "analyze_image": 3600,
 }
 _TOOL_SIDE_EFFECT_NAMES = {
     "Agent",
@@ -826,6 +828,16 @@ class WebFetchInput(BaseModel):
     download: bool = Field(False, description="If true, download the URL as a file into the workspace tmp directory.")
 
 
+class AnalyzeImageInput(BaseModel):
+    """Arguments for analyzing a workspace image with the multimodal model."""
+
+    path: str = Field(..., description="Workspace-relative image path.")
+    prompt: str = Field(
+        "",
+        description="What should be extracted or analyzed from the image.",
+    )
+
+
 class RecentMcdOrdersInput(BaseModel):
     """Arguments for querying recent McDonald's mall orders."""
 
@@ -1105,6 +1117,66 @@ def _merge_search_results(
 # File-operation tools
 # ---------------------------------------------------------------------------
 
+_READ_FILE_MAX_CHARS = 80_000
+
+
+def _limit_read_output(text: str) -> str:
+    if len(text) <= _READ_FILE_MAX_CHARS:
+        return text
+    return (
+        text[:_READ_FILE_MAX_CHARS]
+        + f"\n\n[... truncated {len(text) - _READ_FILE_MAX_CHARS} characters ...]"
+    )
+
+
+def _read_pdf_text(target: Path) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(target))
+    return "\n\n".join(
+        f"--- Page {index} ---\n{page.extract_text() or ''}"
+        for index, page in enumerate(reader.pages, 1)
+    )
+
+
+def _read_docx_text(target: Path) -> str:
+    from docx import Document
+
+    document = Document(str(target))
+    lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
+    for table_index, table in enumerate(document.tables, 1):
+        lines.append(f"--- Table {table_index} ---")
+        lines.extend("\t".join(cell.text for cell in row.cells) for row in table.rows)
+    return "\n".join(lines)
+
+
+def _read_workbook_text(target: Path) -> str:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(str(target), read_only=True, data_only=True)
+    sections: list[str] = []
+    total_chars = 0
+    try:
+        for sheet in workbook.worksheets:
+            header = f"--- Sheet: {sheet.title} ---"
+            sections.append(header)
+            total_chars += len(header)
+            for row in sheet.iter_rows(
+                min_row=1,
+                max_row=min(sheet.max_row, 500),
+                values_only=True,
+            ):
+                line = "\t".join("" if value is None else str(value) for value in row[:100])
+                sections.append(line)
+                total_chars += len(line)
+                if total_chars >= _READ_FILE_MAX_CHARS:
+                    break
+            if total_chars >= _READ_FILE_MAX_CHARS:
+                break
+    finally:
+        workbook.close()
+    return "\n".join(sections)
+
 
 @tool
 def list_directory(path: str) -> str:
@@ -1126,18 +1198,51 @@ def list_directory(path: str) -> str:
 
 @tool
 def read_file(path: str) -> str:
-    """Read the contents of a text file. Provide a relative path from the workspace root."""
+    """Read text, PDF, DOCX, and XLSX files from the workspace."""
     try:
         target = _ensure_allowed(path)
     except PermissionError as exc:
         return str(exc)
     if not target.is_file():
         return f"File not found: {target}"
+    suffix = target.suffix.lower()
     try:
+        if suffix == ".pdf":
+            return _limit_read_output(_read_pdf_text(target))
+        if suffix == ".docx":
+            return _limit_read_output(_read_docx_text(target))
+        if suffix in {".xlsx", ".xlsm"}:
+            return _limit_read_output(_read_workbook_text(target))
+
         raw = target.read_bytes()
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return f"[Binary file: {target.name}, size={len(raw)} bytes]"
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                return _limit_read_output(raw.decode(encoding))
+            except UnicodeDecodeError:
+                continue
+        return f"[Binary file: {target.name}, size={len(raw)} bytes, path={target}]"
+    except Exception as exc:
+        return f"Failed to read {target.name}: {exc}"
+
+
+@tool(args_schema=AnalyzeImageInput)
+def analyze_image(path: str, prompt: str = "") -> str:
+    """Analyze an image and return visual observations for the main agent."""
+    try:
+        return analyze_image_file(
+            path=path,
+            prompt=prompt,
+            workspace_root=_workspace_root(),
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": str(exc),
+                "path": path,
+            },
+            ensure_ascii=False,
+        )
 
 
 @tool
@@ -2182,6 +2287,7 @@ def query_recent_mcd_orders(last_id: int = 0, size: int = 10) -> str:
 _FILE_TOOLS: list[Any] = [
     list_directory,
     read_file,
+    analyze_image,
     get_file_info,
     write_file,
     append_file,

@@ -131,6 +131,39 @@ def load_mcd_mcp_config(config_path: str | Path | None = None) -> dict[str, str 
     }
 
 
+def load_vision_config() -> dict[str, Any]:
+    """Load an OpenAI-compatible multimodal model configuration."""
+    data = load_app_config()
+    vision = data.get("vision", {})
+    if not isinstance(vision, dict):
+        vision = {}
+    key_env = str(vision.get("api_key_env") or "VISION_API_KEY").strip()
+    enabled_value = os.environ.get("VISION_ENABLED", vision.get("enabled", False))
+    enabled = str(enabled_value).strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "enabled": enabled,
+        "base_url": str(
+            os.environ.get("VISION_BASE_URL")
+            or vision.get("base_url")
+            or ""
+        ).rstrip("/"),
+        "model": str(
+            os.environ.get("VISION_MODEL")
+            or vision.get("model")
+            or ""
+        ).strip(),
+        "api_key": (
+            os.environ.get(key_env)
+            or str(vision.get("api_key") or "").strip()
+        ),
+        "api_key_env": key_env,
+        "max_images_per_request": int(vision.get("max_images_per_request") or 4),
+        "max_image_bytes": int(vision.get("max_image_bytes") or 20 * 1024 * 1024),
+        "max_output_tokens": int(vision.get("max_output_tokens") or 2048),
+        "timeout_seconds": int(vision.get("timeout_seconds") or 60),
+    }
+
+
 def create_chat_deepseek(config: dict[str, Any] | None = None, **overrides: Any) -> Any:
     """Create a ChatDeepSeek instance from config dict + overrides."""
     from langchain_deepseek import ChatDeepSeek

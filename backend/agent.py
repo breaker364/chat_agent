@@ -15,6 +15,7 @@ from .prompts import load_agent_policy, load_system_prompt
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
 from .tools import get_all_tools, _normalize_tool_payload_for_key
+from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
 
 SYSTEM_PROMPT = load_system_prompt()
 AGENT_POLICY = load_agent_policy()
@@ -33,6 +34,92 @@ HEARTBEAT_EMIT_INTERVAL_SECONDS = 3
 
 def estimate_tokens_from_text(text: str) -> int:
     return count_text_tokens(text or "")
+
+
+def _extract_usage_metadata(value: Any) -> dict[str, int]:
+    """Normalize token usage from LangChain and provider response shapes."""
+    if value is None:
+        return {}
+    candidates: list[Any] = []
+    if isinstance(value, dict):
+        candidates.extend(
+            [
+                value.get("usage_metadata"),
+                value.get("response_metadata"),
+                value.get("token_usage"),
+                value.get("usage"),
+                value,
+            ]
+        )
+        if isinstance(value.get("response_metadata"), dict):
+            candidates.append(value["response_metadata"].get("token_usage"))
+    else:
+        candidates.extend(
+            [
+                getattr(value, "usage_metadata", None),
+                getattr(value, "response_metadata", None),
+                getattr(value, "token_usage", None),
+                getattr(value, "usage", None),
+            ]
+        )
+
+    usage: dict[str, int] = {}
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not isinstance(candidate, dict):
+            candidate = getattr(candidate, "model_dump", lambda: {})()
+        if not isinstance(candidate, dict):
+            continue
+
+        nested = candidate.get("token_usage") or candidate.get("usage")
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        ):
+            item = candidate.get(key)
+            if isinstance(item, bool) or not isinstance(item, int):
+                continue
+            usage[key] = max(usage.get(key, 0), item)
+
+        input_details = candidate.get("input_token_details")
+        if isinstance(input_details, dict):
+            cache_read = input_details.get("cache_read")
+            if isinstance(cache_read, int) and not isinstance(cache_read, bool):
+                usage["prompt_cache_hit_tokens"] = max(
+                    usage.get("prompt_cache_hit_tokens", 0),
+                    cache_read,
+                )
+
+        prompt_details = candidate.get("prompt_tokens_details")
+        if isinstance(prompt_details, dict):
+            cached_tokens = prompt_details.get("cached_tokens")
+            if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool):
+                usage["prompt_cache_hit_tokens"] = max(
+                    usage.get("prompt_cache_hit_tokens", 0),
+                    cached_tokens,
+                )
+
+    if "input_tokens" not in usage and "prompt_tokens" in usage:
+        usage["input_tokens"] = usage["prompt_tokens"]
+    if "output_tokens" not in usage and "completion_tokens" in usage:
+        usage["output_tokens"] = usage["completion_tokens"]
+    if "total_tokens" not in usage and ("input_tokens" in usage or "output_tokens" in usage):
+        usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    if "prompt_cache_miss_tokens" not in usage and "input_tokens" in usage:
+        usage["prompt_cache_miss_tokens"] = max(
+            0,
+            usage["input_tokens"] - usage.get("prompt_cache_hit_tokens", 0),
+        )
+    return usage
 
 
 async def build_agent(
@@ -171,61 +258,7 @@ async def stream_agent_events(
             target[key] = target.get(key, 0) + value
 
     def extract_usage_metadata(value: Any) -> dict[str, int]:
-        if value is None:
-            return {}
-        candidates: list[Any] = []
-        if isinstance(value, dict):
-            candidates.extend(
-                [
-                    value.get("usage_metadata"),
-                    value.get("response_metadata"),
-                    value.get("token_usage"),
-                    value.get("usage"),
-                    value,
-                ]
-            )
-            if isinstance(value.get("response_metadata"), dict):
-                candidates.append(value["response_metadata"].get("token_usage"))
-        else:
-            candidates.extend(
-                [
-                    getattr(value, "usage_metadata", None),
-                    getattr(value, "response_metadata", None),
-                    getattr(value, "token_usage", None),
-                    getattr(value, "usage", None),
-                ]
-            )
-        usage: dict[str, int] = {}
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            if not isinstance(candidate, dict):
-                candidate = getattr(candidate, "model_dump", lambda: {})()
-            if not isinstance(candidate, dict):
-                continue
-            nested = candidate.get("token_usage") or candidate.get("usage")
-            if isinstance(nested, dict):
-                candidates.append(nested)
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "total_tokens",
-                "prompt_tokens",
-                "completion_tokens",
-                "prompt_cache_hit_tokens",
-                "prompt_cache_miss_tokens",
-            ):
-                value = candidate.get(key)
-                if isinstance(value, bool) or not isinstance(value, int):
-                    continue
-                usage[key] = max(usage.get(key, 0), value)
-        if "input_tokens" not in usage and "prompt_tokens" in usage:
-            usage["input_tokens"] = usage["prompt_tokens"]
-        if "output_tokens" not in usage and "completion_tokens" in usage:
-            usage["output_tokens"] = usage["completion_tokens"]
-        if "total_tokens" not in usage and ("input_tokens" in usage or "output_tokens" in usage):
-            usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-        return usage
+        return _extract_usage_metadata(value)
 
     def build_usage_payload() -> dict[str, Any]:
         hit = accumulated_model_usage.get("prompt_cache_hit_tokens", 0)
@@ -560,14 +593,113 @@ async def stream_agent_events(
             )
         )
     effective_history = trim_history(history)
+    effective_message = message
+    detected_image_paths = extract_image_paths(message, Path.cwd())
+    if detected_image_paths:
+        tool_call_names.append("analyze_image")
+        yield {
+            "event": "tool_call",
+            "data": json.dumps(
+                {
+                    "name": "analyze_image",
+                    "arguments": {
+                        "paths": detected_image_paths,
+                        "prompt": "Automatically analyze attached images before main-agent reasoning.",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {
+            "event": "progress",
+            "data": json.dumps(
+                {
+                    "message": f"Analyzing {len(detected_image_paths)} attached image(s).",
+                    "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                    "active_tool": "analyze_image",
+                },
+                ensure_ascii=False,
+            ),
+        }
+        try:
+            vision_result = await asyncio.to_thread(
+                analyze_image_files,
+                detected_image_paths,
+                (
+                    "Analyze the attached image or images for the user's request. "
+                    "Extract visible text, important objects, layout, relationships, "
+                    "errors, charts, and any evidence needed for an accurate answer.\n\n"
+                    f"User request:\n{message[:4000]}"
+                ),
+                Path.cwd(),
+            )
+            mark_step("image_analysis", "completed", "Multimodal image analysis succeeded")
+            effective_message = (
+                f"{message}\n\n"
+                "Automatically generated multimodal analysis follows. Treat it as "
+                "visual evidence, reconcile it with other files or tools, and provide "
+                "the final answer yourself.\n\n"
+                f"{vision_result}"
+            )
+            yield {
+                "event": "tool_result",
+                "data": json.dumps(
+                    {
+                        "name": "analyze_image",
+                        "content": vision_result,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        except VisionConfigurationError as exc:
+            mark_step("image_analysis", "blocked", str(exc))
+            effective_message = (
+                f"{message}\n\n"
+                "Image analysis was requested but the multimodal model is not configured. "
+                f"Configuration error: {exc}"
+            )
+            yield {
+                "event": "tool_result",
+                "data": json.dumps(
+                    {
+                        "name": "analyze_image",
+                        "content": json.dumps(
+                            {"success": False, "error": str(exc)},
+                            ensure_ascii=False,
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        except Exception as exc:
+            mark_step("image_analysis", "failed", str(exc))
+            effective_message = (
+                f"{message}\n\n"
+                f"Automatic image analysis failed: {exc}. "
+                "Continue with available evidence or retry with the analyze_image tool."
+            )
+            yield {
+                "event": "tool_result",
+                "data": json.dumps(
+                    {
+                        "name": "analyze_image",
+                        "content": json.dumps(
+                            {"success": False, "error": str(exc)},
+                            ensure_ascii=False,
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+
     context_message_count = len(effective_history) + 2
     context_char_count = sum(len(msg.get("content", "")) for msg in effective_history)
-    context_char_count += len(SYSTEM_PROMPT) + len(message)
+    context_char_count += len(SYSTEM_PROMPT) + len(effective_message)
     if skill_catalog_text:
         context_char_count += len(skill_catalog_text)
         context_message_count += 1
     context_token_estimate = estimate_tokens_from_text("".join(
-        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", message]
+        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", effective_message]
         + [msg.get("content", "") for msg in effective_history]
     ))
 
@@ -580,7 +712,7 @@ async def stream_agent_events(
             elif role == "assistant":
                 messages.append(AIMessage(content=content))
 
-    messages.append(HumanMessage(content=message))
+    messages.append(HumanMessage(content=effective_message))
 
     event_stream = agent.astream_events(
         {"messages": messages},

@@ -32,6 +32,7 @@ import {
   LogIn,
   LogOut,
   QrCode,
+  Paperclip,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -44,6 +45,24 @@ const DEBUG_SIDEBAR_COLLAPSED_KEY = "chat-agent:debug-sidebar-collapsed";
 const FEISHU_PANEL_COLLAPSED_KEY = "chat-agent:feishu-panel-collapsed";
 const MAX_HISTORY_ITEMS = 12;
 const MAX_HISTORY_ITEM_CHARS = 4000;
+const MAX_ATTACHMENTS = 10;
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const COMPOSER_MAX_HEIGHT = 176;
+
+function formatFileSize(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function buildAttachmentMessage(text, uploadedFiles) {
+  const body = text.trim() || "Read the attached files and complete the requested analysis.";
+  if (!uploadedFiles.length) return body;
+  const lines = uploadedFiles.map(
+    (file) => `- ${file.name} (${formatFileSize(file.size)}): \`${file.path}\``
+  );
+  return `${body}\n\nAttached files available in the workspace:\n${lines.join("\n")}\n\nRead the relevant files directly before answering.`;
+}
 
 function makeSessionId() {
   return `session-${Date.now()}`;
@@ -964,6 +983,9 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState("");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  const [pendingFiles, setPendingFiles] = useState([]);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [attachmentError, setAttachmentError] = useState("");
   const [loading, setLoading] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [toolEvents, setToolEvents] = useState([]);
@@ -977,6 +999,9 @@ export default function App() {
   const chatAreaRef = useRef(null);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
+  const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const dragDepthRef = useRef(0);
 
   // Skill system state
   const [showSkillPopup, setShowSkillPopup] = useState(false);
@@ -1007,6 +1032,97 @@ export default function App() {
   const scrollDown = useCallback((behavior = "auto") => {
     chatEndRef.current?.scrollIntoView({ behavior });
   }, []);
+
+  const resizeComposer = useCallback(() => {
+    const node = textareaRef.current;
+    if (!node) return;
+    node.style.height = "auto";
+    const nextHeight = Math.min(node.scrollHeight, COMPOSER_MAX_HEIGHT);
+    node.style.height = `${Math.max(nextHeight, 36)}px`;
+    node.style.overflowY = node.scrollHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
+  }, []);
+
+  useEffect(() => {
+    resizeComposer();
+  }, [input, resizeComposer]);
+
+  const addPendingFiles = useCallback((fileList) => {
+    const incoming = Array.from(fileList || []);
+    if (!incoming.length) return;
+    setAttachmentError("");
+    setPendingFiles((current) => {
+      const next = [...current];
+      for (const file of incoming) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          setAttachmentError(`${file.name} exceeds the 25 MB limit.`);
+          continue;
+        }
+        const duplicate = next.some(
+          (item) =>
+            item.name === file.name &&
+            item.size === file.size &&
+            item.lastModified === file.lastModified
+        );
+        if (!duplicate && next.length < MAX_ATTACHMENTS) next.push(file);
+      }
+      if (incoming.length + current.length > MAX_ATTACHMENTS) {
+        setAttachmentError(`A maximum of ${MAX_ATTACHMENTS} files can be attached.`);
+      }
+      return next;
+    });
+  }, []);
+
+  const removePendingFile = useCallback((index) => {
+    setPendingFiles((current) => current.filter((_, itemIndex) => itemIndex !== index));
+    setAttachmentError("");
+  }, []);
+
+  const uploadPendingFiles = useCallback(async (sessionId, files, signal) => {
+    if (!files.length) return [];
+    const formData = new FormData();
+    formData.append("session_id", sessionId);
+    files.forEach((file) => formData.append("files", file, file.name));
+    const response = await fetch(`${API_BASE}/uploads`, {
+      method: "POST",
+      body: formData,
+      signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || `Upload failed with HTTP ${response.status}`);
+    }
+    return payload.files || [];
+  }, []);
+
+  const handleDragEnter = useCallback((event) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  }, []);
+
+  const handleDragOver = useCallback((event) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }, []);
+
+  const handleDragLeave = useCallback((event) => {
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event) => {
+      if (!event.dataTransfer.files.length) return;
+      event.preventDefault();
+      dragDepthRef.current = 0;
+      setIsDraggingFiles(false);
+      addPendingFiles(event.dataTransfer.files);
+    },
+    [addPendingFiles]
+  );
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -1187,6 +1303,8 @@ export default function App() {
     setSubagentNotifications([]);
     setTaskProgress(null);
     setStreamingText("");
+    setPendingFiles([]);
+    setAttachmentError("");
   }, [defaultAssistantMessage, loadSession, refreshSessions]);
 
   const handleRenameSession = useCallback(async (event, session) => {
@@ -1501,7 +1619,8 @@ export default function App() {
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    const filesToUpload = [...pendingFiles];
+    if ((!text && !filesToUpload.length) || loading) return;
 
     let ensuredSessionId = activeSessionId;
     if (!ensuredSessionId) {
@@ -1510,14 +1629,10 @@ export default function App() {
       writeLastSessionId(ensuredSessionId);
     }
 
-    const userMsg = { role: "user", content: text, tools: [] };
-
-    setInput("");
     setLoading(true);
     setStreamingText("");
     setToolEvents([]);
     setDebugEvents([]);
-    setMessages((prev) => [...prev, userMsg]);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1602,11 +1717,23 @@ export default function App() {
     }
 
     try {
+      const uploadedFiles = await uploadPendingFiles(
+        ensuredSessionId,
+        filesToUpload,
+        controller.signal
+      );
+      const requestText = buildAttachmentMessage(text, uploadedFiles);
+      const userMsg = { role: "user", content: requestText, tools: [] };
+      setInput("");
+      setPendingFiles([]);
+      setAttachmentError("");
+      setMessages((prev) => [...prev, userMsg]);
+
       const resp = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({
-          message: text,
+          message: requestText,
           session_id: ensuredSessionId,
           history: currentHistory,
         }),
@@ -1681,7 +1808,16 @@ export default function App() {
       setToolEvents([]);
       abortRef.current = null;
     }
-  }, [activeSessionId, currentHistory, input, loading, refreshSessions, loadSession]);
+  }, [
+    activeSessionId,
+    currentHistory,
+    input,
+    loading,
+    pendingFiles,
+    refreshSessions,
+    loadSession,
+    uploadPendingFiles,
+  ]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1805,32 +1941,95 @@ export default function App() {
           </div>
         </main>
 
-        <footer className="input-area">
-          <div className="input-wrapper">
-            <button
-              className="skill-slash-btn"
-              onClick={handleOpenSkillPopup}
-              title="Open skills (/skill)"
-              disabled={loading}
-            >
-              <Zap size={16} />
-            </button>
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder='Send a message… (type "/skill" for skills)'
-              rows={1}
-              disabled={loading}
-            />
-            {loading ? (
-              <button className="stop-btn" onClick={handleStop} title="Stop current request">
-                <Square size={16} />
-              </button>
+        <footer
+          className={`input-area ${isDraggingFiles ? "is-dragging" : ""}`}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          <div className="composer-shell">
+            {isDraggingFiles ? (
+              <div className="composer-drop-prompt">
+                <Paperclip size={18} />
+                Drop files to attach
+              </div>
             ) : null}
-            <button className="send-btn" onClick={handleSend} disabled={loading || !input.trim()}>
-              {loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-            </button>
+            {pendingFiles.length ? (
+              <div className="attachment-list">
+                {pendingFiles.map((file, index) => (
+                  <div className="attachment-chip" key={`${file.name}-${file.size}-${file.lastModified}`}>
+                    <FileText size={14} />
+                    <span className="attachment-name" title={file.name}>{file.name}</span>
+                    <span className="attachment-size">{formatFileSize(file.size)}</span>
+                    <button
+                      type="button"
+                      className="attachment-remove"
+                      onClick={() => removePendingFile(index)}
+                      aria-label={`Remove ${file.name}`}
+                      disabled={loading}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <div className="input-wrapper">
+              <button
+                className="skill-slash-btn"
+                onClick={handleOpenSkillPopup}
+                title="Open skills (/skill)"
+                disabled={loading}
+              >
+                <Zap size={16} />
+              </button>
+              <button
+                type="button"
+                className="attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+                title="Attach files"
+                disabled={loading || pendingFiles.length >= MAX_ATTACHMENTS}
+              >
+                <Paperclip size={17} />
+              </button>
+              <input
+                ref={fileInputRef}
+                className="file-input"
+                type="file"
+                multiple
+                onChange={(event) => {
+                  addPendingFiles(event.target.files);
+                  event.target.value = "";
+                }}
+                disabled={loading}
+              />
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Send a message or drop files here"
+                rows={1}
+                disabled={loading}
+              />
+              {loading ? (
+                <button className="stop-btn" onClick={handleStop} title="Stop current request">
+                  <Square size={16} />
+                </button>
+              ) : null}
+              <button
+                className="send-btn"
+                onClick={handleSend}
+                disabled={loading || (!input.trim() && !pendingFiles.length)}
+              >
+                {loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+              </button>
+            </div>
+            <div className={`composer-meta ${attachmentError ? "has-error" : ""}`}>
+              <span>{attachmentError || "Enter to send · Shift+Enter for a new line · up to 10 files, 25 MB each"}</span>
+              <span>{input.length.toLocaleString()} chars</span>
+            </div>
           </div>
         </footer>
       </div>

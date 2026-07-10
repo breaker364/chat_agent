@@ -913,6 +913,88 @@ body,
   padding: 14px 24px 22px;
   border-top: 1px solid var(--border);
   background: rgba(250, 249, 245, 0.9);
+  position: relative;
+  transition: background var(--duration-fast) var(--ease-out);
+}
+
+.input-area.is-dragging {
+  background: color-mix(in srgb, var(--accent-subtle) 70%, var(--bg-primary));
+}
+
+.composer-shell {
+  position: relative;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.composer-drop-prompt {
+  position: absolute;
+  inset: -8px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px dashed var(--accent);
+  border-radius: calc(var(--radius-lg) + 4px);
+  background: color-mix(in srgb, var(--bg-surface) 88%, var(--accent-subtle));
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: none;
+  box-shadow: 0 10px 30px rgba(0, 136, 192, 0.12);
+}
+
+.attachment-list {
+  display: flex;
+  gap: 7px;
+  overflow-x: auto;
+  padding: 0 2px 8px;
+  scrollbar-width: thin;
+}
+
+.attachment-chip {
+  min-width: 0;
+  max-width: 270px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  box-shadow: var(--shadow-sm);
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-size {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-tertiary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.attachment-remove:hover:not(:disabled) {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 .input-wrapper {
@@ -942,14 +1024,22 @@ body,
   font-family: var(--font-body);
   resize: none;
   line-height: 1.5;
-  max-height: 120px;
+  min-height: 36px;
+  max-height: 176px;
   padding: 7px 0;
+  overflow-y: hidden;
+  transition: height 80ms ease-out;
 }
 
 .input-wrapper textarea::placeholder {
   color: var(--text-tertiary);
 }
 
+.file-input {
+  display: none;
+}
+
+.attach-btn,
 .send-btn,
 .stop-btn {
   width: 38px;
@@ -963,6 +1053,43 @@ body,
   cursor: pointer;
   flex-shrink: 0;
   transition: all var(--duration-fast) var(--ease-out);
+}
+
+.attach-btn {
+  width: 34px;
+  height: 38px;
+  border: none;
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-out), background var(--duration-fast) var(--ease-out);
+}
+
+.attach-btn:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.attach-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.composer-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 5px 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.composer-meta.has-error {
+  color: var(--danger);
 }
 
 .send-btn {

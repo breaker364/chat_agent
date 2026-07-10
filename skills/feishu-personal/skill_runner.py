@@ -5,7 +5,6 @@ import io
 import json
 import os
 import re
-import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -98,6 +97,48 @@ def _patch_requests_no_proxy() -> None:
     requests.request = request_no_proxy  # type: ignore[assignment]
 
 
+def _split_lark_command(command_text: str) -> list[str]:
+    """Split CLI text while tolerating an unclosed final quoted argument.
+
+    Model-generated commands often place long multiline Markdown in
+    ``--text "..."``. If the final quote is omitted, shlex rejects the whole
+    command. This parser keeps the remainder as one argument and preserves
+    ordinary backslashes used in Windows paths.
+    """
+    argv: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+
+    while index < len(command_text):
+        char = command_text[index]
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif (
+                char == "\\"
+                and index + 1 < len(command_text)
+                and command_text[index + 1] in {quote, "\\"}
+            ):
+                index += 1
+                current.append(command_text[index])
+            else:
+                current.append(char)
+        elif char in {'"', "'"}:
+            quote = char
+        elif char.isspace():
+            if current:
+                argv.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+        index += 1
+
+    if current:
+        argv.append("".join(current))
+    return argv
+
+
 def _execute_lark_cli(skill_root: Path, request_text: str) -> str:
     """Execute an explicit `lark ...` command through lark_tools.cli.
 
@@ -113,23 +154,10 @@ def _execute_lark_cli(skill_root: Path, request_text: str) -> str:
     if not command_text:
         raise RuntimeError("Empty lark command.")
 
-    try:
-        argv = shlex.split(command_text, posix=False)
-    except ValueError as exc:
-        raise RuntimeError(f"Could not parse lark command: {exc}") from exc
+    argv = _split_lark_command(command_text)
 
     if not argv:
         raise RuntimeError("Empty lark command.")
-
-    # posix=False preserves literal quote characters (e.g. --sheet "name"
-    # becomes ['--sheet', '"name"'] instead of ['--sheet', 'name']).
-    # Strip surrounding matching single/double quotes from each arg so that
-    # downstream consumers (like _select_sheets which matches by name/id)
-    # see the clean value.
-    argv = [
-        a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in ('"', "'") else a
-        for a in argv
-    ]
 
     blocked_tokens = {";", "&&", "||", "|", ">", ">>", "<"}
     if any(token in blocked_tokens for token in argv):

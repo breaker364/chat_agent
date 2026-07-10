@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
@@ -89,6 +89,72 @@ def get_subagent_manager() -> Any:
 
 def _workspace() -> Path:
     return Path.cwd().resolve()
+
+
+MAX_UPLOAD_FILES = 10
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _safe_upload_component(value: str, fallback: str) -> str:
+    name = Path(value or "").name
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return cleaned or fallback
+
+
+@app.post("/uploads")
+async def upload_files(
+    session_id: str = Form("default"),
+    files: list[UploadFile] = File(...),
+) -> JSONResponse:
+    if not files:
+        return JSONResponse({"error": "At least one file is required."}, status_code=400)
+    if len(files) > MAX_UPLOAD_FILES:
+        return JSONResponse(
+            {"error": f"At most {MAX_UPLOAD_FILES} files can be uploaded at once."},
+            status_code=400,
+        )
+
+    workspace = _workspace()
+    safe_session = _safe_upload_component(session_id, "default")
+    upload_dir = workspace / "tmp" / "uploads" / safe_session
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    uploaded: list[dict[str, Any]] = []
+
+    for upload in files:
+        original_name = Path(upload.filename or "attachment").name
+        safe_name = _safe_upload_component(original_name, "attachment")
+        target = upload_dir / f"{uuid4().hex[:10]}_{safe_name}"
+        size = 0
+        try:
+            with target.open("wb") as handle:
+                while chunk := await upload.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        handle.close()
+                        target.unlink(missing_ok=True)
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"File '{original_name}' exceeds the "
+                                    f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+                                )
+                            },
+                            status_code=413,
+                        )
+                    handle.write(chunk)
+        finally:
+            await upload.close()
+
+        uploaded.append(
+            {
+                "name": original_name,
+                "path": target.relative_to(workspace).as_posix(),
+                "size": size,
+                "content_type": upload.content_type or "application/octet-stream",
+            }
+        )
+
+    return JSONResponse({"files": uploaded})
 
 
 def get_feishu_session_store() -> FeishuWebSessionStore:
