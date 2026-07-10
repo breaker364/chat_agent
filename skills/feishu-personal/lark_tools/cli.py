@@ -181,8 +181,18 @@ def _parse_wiki_token_arg(value):
 
 
 def load_and_auth_cookies():
-    """Load cookies, auto-login if session is missing or expired."""
+    """Load cookies, auto-login if session is missing or expired.
+
+    Tries sources in order:
+      1. System keyring (lark login)
+      2. sessionss/feishu_web_session.json (agent QR login)
+    """
     cookies = load_cookies()
+
+    # Fallback: if keyring is empty, try the agent's session file
+    if not cookies:
+        cookies = _load_cookies_from_sessionss()
+
     auth_ok = check_auth(cookies) if cookies else False
     if not auth_ok:
         print('[auth] Session expired or missing. Starting QR login...', file=sys.stderr)
@@ -195,6 +205,30 @@ def load_and_auth_cookies():
             raise LarkCliError('AUTH_FAILED', 'Cookies saved but auth check still fails.')
         print('[auth] Login successful. Continuing with command...', file=sys.stderr)
     return cookies
+
+
+def _load_cookies_from_sessionss():
+    """Try to load the session cookie from the agent's session file."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Look for sessionss/feishu_web_session.json relative to cwd or known paths
+    candidates = [
+        _Path.cwd() / "sessionss" / "feishu_web_session.json",
+        _Path(__file__).resolve().parent.parent.parent / "sessionss" / "feishu_web_session.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+            session = str(payload.get("session") or "").strip()
+            if session:
+                print(f"[auth] Using session from {path}", file=sys.stderr)
+                return [{"name": "session", "value": session, "domain": ".feishu.cn"}]
+        except Exception:
+            continue
+    return None
 
 
 def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C901

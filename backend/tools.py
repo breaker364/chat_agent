@@ -1369,13 +1369,14 @@ def update_task_plan(todos: list[TaskPlanTodoInput], source: str = "model", reas
             indent=2,
         )
 
-    session = SessionStore(_workspace_root()).set_task_plan(
+    store = SessionStore(_workspace_root())
+    session = store.set_task_plan(
         session_id,
         normalized,
         source=source or "model",
         reason=reason,
     )
-    plan = session.get("task_progress", {}).get("task_plan", {})
+    plan = store.load_task_plan(session_id)
     return json.dumps(
         {
             "success": True,

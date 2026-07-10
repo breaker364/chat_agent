@@ -77,11 +77,25 @@ def _validate_cookies(skill_root: Path, cookies: list[dict[str, str]]) -> None:
 
 
 def _patch_requests_no_proxy() -> None:
-    session = requests.Session()
-    session.trust_env = False
-    requests.get = session.get  # type: ignore[assignment]
-    requests.post = session.post  # type: ignore[assignment]
-    requests.request = session.request  # type: ignore[assignment]
+    def request_no_proxy(method: str, url: str, **kwargs):
+        # Feishu returns transient CSRF-related cookies on normal API
+        # responses. Reusing one Session silently sends those cookies on the
+        # next POST without the browser-side CSRF context that created them.
+        # A fresh Session preserves explicit authentication cookies while
+        # preventing response cookies from leaking into later requests.
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.request(method, url, **kwargs)
+
+    def get_no_proxy(url: str, params=None, **kwargs):
+        return request_no_proxy("GET", url, params=params, **kwargs)
+
+    def post_no_proxy(url: str, data=None, json=None, **kwargs):
+        return request_no_proxy("POST", url, data=data, json=json, **kwargs)
+
+    requests.get = get_no_proxy  # type: ignore[assignment]
+    requests.post = post_no_proxy  # type: ignore[assignment]
+    requests.request = request_no_proxy  # type: ignore[assignment]
 
 
 def _execute_lark_cli(skill_root: Path, request_text: str) -> str:

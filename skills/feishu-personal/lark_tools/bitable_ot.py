@@ -384,6 +384,11 @@ def submit_operations(cookies, base_token: str, table_id: str, operations: list,
         cookies, DOC_HOST, f'/space/api/rce/messages?member_id={member_id}', body,
     )
     resp = res.get('data') or {}
+    if not isinstance(resp, dict):
+        raise RuntimeError(
+            f'USER_CHANGES failed: http_status={res.get("status")} '
+            f'non_json_response={resp!r}'
+        )
     top_code = resp.get('code')
     data = resp.get('data') or {}
     inner_code = data.get('code')

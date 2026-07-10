@@ -55,12 +55,10 @@ def resolve_wiki_to_bitable(cookies, wiki_token: str) -> str:
 # fetch_bitable_schema
 # ---------------------------------------------------------------------------
 
-# Headers that match what the Feishu web UI sends for API calls.  The write
-# path (rce/messages) uses these and works reliably without CSRF errors;
-# applying them to the read path (tablesv3) fixes the intermittent CSRF
-# failures that occur with the minimal header set.
+# Headers that match the general Feishu web API request context. CSRF-related
+# response cookies must not leak between otherwise independent API calls; that
+# isolation is enforced by the agent request wrapper.
 _BITABLE_API_HEADERS = {
-    "Origin": "https://nio.feishu.cn",
     "x-command-version": "7.65.0",
     "x-web-version": "7.65.0",
     "x-lgw-terminal-type": "2",
@@ -85,36 +83,57 @@ def _is_csrf_error(payload) -> bool:
 def _bitable_post_with_csrf_fallback(cookies, host, url_path, body, extra_headers=None):
     """POST to a bitable endpoint with CSRF-aware retry.
 
-    On the first attempt uses the full browser-matching header set (Origin,
-    x-web-version, locale, etc.).  If the server still returns a CSRF error
-    the call is retried once with a stripped cookie (domain-less) before
-    giving up with a clear diagnostic.
+    Retry strategy:
+      1. Full browser-matching headers (Origin, x-web-version, locale, ...)
+      2. Same headers + cookies without domain attribute (cross-subdomain fix)
+      3. Wait 2 s + retry with full headers (transient server-side CSRF expiry)
+
+    Each attempt is isolated from response cookies set by earlier requests.
     """
-    headers = {**_BITABLE_API_HEADERS, **(extra_headers or {})}
+    import time as _time  # local import — only used on the slow path
+
+    headers = {
+        "Origin": f"https://{host}",
+        **_BITABLE_API_HEADERS,
+        **(extra_headers or {}),
+    }
+
+    # --- Attempt 1: full headers ---
     res = http_post_with_cookies(cookies, host, url_path, body, headers)
     payload = res.get("data")
+    if not _is_csrf_error(payload):
+        return res
 
-    if _is_csrf_error(payload):
-        # Retry once: strip the domain attribute from cookies, which can
-        # sometimes resolve cross-subdomain CSRF mismatches.
-        retry_cookies = []
-        for c in cookies:
-            c2 = dict(c)
-            c2.pop("domain", None)
-            retry_cookies.append(c2)
-        res = http_post_with_cookies(retry_cookies, host, url_path, body, headers)
-        payload = res.get("data")
+    # --- Attempt 2: strip cookie domain ---
+    retry_cookies = []
+    for c in cookies:
+        c2 = dict(c)
+        c2.pop("domain", None)
+        retry_cookies.append(c2)
+    res = http_post_with_cookies(retry_cookies, host, url_path, body, headers)
+    payload = res.get("data")
+    if not _is_csrf_error(payload):
+        return res
 
-    if _is_csrf_error(payload):
-        raise RuntimeError(
-            "Feishu API returned CSRF token error. "
-            "The session cookie may have been invalidated. "
-            "Run feishu QR login again to obtain a fresh session, "
-            "then retry the operation. "
-            f"Server response: {payload!r}"
-        )
+    # --- Attempt 3: brief delay then retry with full headers ---
+    # CSRF tokens can have a short rotation window; waiting a moment
+    # sometimes lets the server-side state settle.
+    _time.sleep(2)
+    res = http_post_with_cookies(cookies, host, url_path, body, headers)
+    payload = res.get("data")
+    if not _is_csrf_error(payload):
+        return res
 
-    return res
+    raise RuntimeError(
+        "Feishu API returned CSRF token error after 3 retry attempts. "
+        "The login session may be invalid, or the endpoint's CSRF protocol "
+        "may have changed. "
+        "Remediation:\n"
+        "  1. Confirm the session with a read-only Feishu request\n"
+        "  2. Re-login only if that authentication check also fails\n"
+        "  3. Otherwise inspect the endpoint request protocol\n"
+        f"Server response: {payload!r}"
+    )
 
 
 def fetch_bitable_schema(cookies, token: str, table_id: str = None) -> dict:
