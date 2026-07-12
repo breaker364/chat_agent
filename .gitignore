@@ -37,3 +37,5 @@ skills/pisces-ebom-matcher
 tmp/
 snake-game/
 tools/
+.venv_py310/
+.npm-cache/

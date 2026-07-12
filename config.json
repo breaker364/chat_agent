@@ -1,0 +1,38 @@
+{
+  "base_url": "https://api.xiaomimimo.com/v1",
+  "api_key": "sk-c4lfrlu5bu82dzhbb0r5npq1lguvaj0hbeqwo194e0ej46n0",
+  "model": "mimo-v2.5-pro",
+  "vision": {
+    "enabled": true,
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen3.6-flash",
+    "api_key_env": "sk-ws-H.EMXPDEE.tDZm.MEUCIAoeE-xRn8kR5_RZLcaJ7DPXUfuF9YmXMhNBLVfo-H2pAiEA19VwPzQ5Pg6VQxfdB7xzeVToLhvfiDf38KTLh-uqAkk",
+    "api_key": "",
+    "max_images_per_request": 4,
+    "max_image_bytes": 20971520,
+    "max_output_tokens": 2048,
+    "timeout_seconds": 60
+  },
+  "tavily_base_url": "https://api.tavily.com",
+  "tavily_api_key": "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",
+  "mcd_mcp_url": "https://mcp.mcd.cn",
+  "mcd_mcp_token": "at3zHqwRSOhwx1AclByj3F5tDRuD8Sdk",
+  "_comment_deepseek_config": "DeepSeek config is kept here as a disabled backup because JSON does not support comments.",
+  "_disabled_deepseek_config": {
+    "base_url": "https://api.deepseek.com",
+    "api_key": "sk-5ce7c839b7004c4dbe12935e947d4b90",
+    "model": "deepseek-v4-pro"
+  },
+  "_comment_previous_vision_config": "Previous vision config is kept here as a disabled backup because JSON does not support comments.",
+  "_disabled_previous_vision_config": {
+    "enabled": true,
+    "base_url": "https://model.nioint.com/v1",
+    "model": "Qwen3.6-Flash",
+    "api_key_env": "VISION_API_KEY",
+    "api_key": "temp_7d118ea2",
+    "max_images_per_request": 4,
+    "max_image_bytes": 20971520,
+    "max_output_tokens": 2048,
+    "timeout_seconds": 60
+  }
+}

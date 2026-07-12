@@ -1,0 +1,30 @@
+{
+    "app":  {
+                "backend_host":  "127.0.0.1",
+                "backend_bind_host":  "0.0.0.0",
+                "backend_port":  8000,
+                "frontend_host":  "127.0.0.1",
+                "frontend_port":  5173,
+                "backend_health_path":  "/health",
+                "api_base_url":  "http://localhost:8000"
+            },
+    "paths":  {
+                  "session_dir":  "sessionss",
+                  "feishu_session_file":  "feishu_web_session.json",
+                  "download_dir":  "tmp",
+                  "python_executable":  "D:/NoobhekCode/chat_agent/.venv_py310/Scripts/python.exe",
+                  "python_env_name":  "Py310",
+                  "python_env_root":  "",
+                  "llm_config_path":  "config.json",
+                  "legacy_llm_config_path":  "",
+                  "deepseek_tokenizer_dir":  "C:/Users/hank.yu3/Downloads/deepseek_v3_tokenizer"
+              },
+    "feishu":  {
+                   "session_cookie":  ""
+               },
+    "checkers_game":  {
+                          "backend_host":  "0.0.0.0",
+                          "backend_port":  5000,
+                          "api_base_url":  "http://localhost:5000"
+                      }
+}
