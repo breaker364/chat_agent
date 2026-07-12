@@ -1,0 +1,39 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+
+# Local editor settings
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+env_*/
+sessions/
+sessionss/
+# Frontend dependencies / build
+frontend/node_modules/
+frontend/dist/
+*.csv
+# Logs
+*.log
+*.docx
+# Temporary debug / test artifacts
+tmp_*
+skills/pisces-ebom-matcher
+tmp/
+snake-game/
+tools/
