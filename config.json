@@ -7,7 +7,7 @@
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "model": "qwen3.6-flash",
     "api_key_env": "sk-ws-H.EMXPDEE.tDZm.MEUCIAoeE-xRn8kR5_RZLcaJ7DPXUfuF9YmXMhNBLVfo-H2pAiEA19VwPzQ5Pg6VQxfdB7xzeVToLhvfiDf38KTLh-uqAkk",
-    "api_key": "",
+    "api_key": "sk-ws-H.EMXPDEE.tDZm.MEUCIAoeE-xRn8kR5_RZLcaJ7DPXUfuF9YmXMhNBLVfo-H2pAiEA19VwPzQ5Pg6VQxfdB7xzeVToLhvfiDf38KTLh-uqAkk",
     "max_images_per_request": 4,
     "max_image_bytes": 20971520,
     "max_output_tokens": 2048,
