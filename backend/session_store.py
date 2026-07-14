@@ -66,6 +66,22 @@ def _compact_tool(tool: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _coerce_optional_int(value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+    return value
+
+
 def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
     item = dict(message)
     item["content"] = _compact_text(item.get("content"), MAX_STORED_MESSAGE_CHARS)
@@ -427,7 +443,7 @@ class SessionStore:
             "path": str(result.get("path") or ""),
             "token": str(result.get("token") or result.get("base_token") or ""),
             "table_id": str(result.get("table_id") or ""),
-            "record_count": result.get("record_count"),
+            "record_count": _coerce_optional_int(result.get("record_count")),
             "verified": bool(result.get("verified", False)),
             "summary": str(result.get("summary") or ""),
             "source_tool": str(result.get("source_tool") or ""),
@@ -488,6 +504,7 @@ class SessionStore:
             "path": str(artifact.get("path") or ""),
             "token": str(artifact.get("token") or artifact.get("base_token") or ""),
             "table_id": str(artifact.get("table_id") or ""),
+            "record_count": _coerce_optional_int(artifact.get("record_count")),
             "summary": str(artifact.get("summary") or ""),
             "created_at": artifact.get("created_at") or _now_iso(),
             "updated_at": _now_iso(),
@@ -512,7 +529,10 @@ class SessionStore:
                 item.get("table_id", ""),
             )
             if item_identity == identity:
-                deduped.append({**item, **normalized})
+                merged = {**item, **normalized}
+                if normalized.get("record_count") is None and item.get("record_count") is not None:
+                    merged["record_count"] = item.get("record_count")
+                deduped.append(merged)
                 replaced = True
             else:
                 deduped.append(item)

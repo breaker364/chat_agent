@@ -811,12 +811,16 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
                     with audit_read('sheet.read', target=token_arg, extra=sheet_opts or None):
                         cmd_sheet_read(cookies, token_arg, sheet_opts)
             elif sub == 'images':
-                # sheet images <url> [--sheet NAME] [--cell A1] [--download] [--out PATH]
+                # sheet images <url> [--sheet NAME] [--cell A1|--cells A1,B2|--range A1:B2] [--download] [--out PATH]
                 sheet_opts = {}
                 sheet_name = _get_arg(args, '--sheet')
                 if sheet_name: sheet_opts['sheetName'] = sheet_name
                 cell = _get_arg(args, '--cell')
                 if cell: sheet_opts['cell'] = cell
+                cells = _get_arg(args, '--cells')
+                if cells: sheet_opts['cells'] = cells
+                cell_range = _get_arg(args, '--range')
+                if cell_range: sheet_opts['range'] = cell_range
                 if _has_flag(args, '--download'): sheet_opts['download'] = True
                 out = _get_arg(args, '--out')
                 if out: sheet_opts['outputPath'] = out

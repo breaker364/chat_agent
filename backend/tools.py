@@ -42,7 +42,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_mcd_mcp_config
-from .vision import analyze_image_file
+from .vision import analyze_image_file, analyze_image_files
 from .feishu_web_login import (
     FeishuWebSessionStore,
     build_feishu_cookies,
@@ -160,6 +160,22 @@ def _canonical_json(payload: Any) -> str:
         return str(payload)
 
 
+def _coerce_optional_int(value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+    return value
+
+
 def _normalize_task_plan_todo(value: Any, index: int) -> dict[str, str]:
     if hasattr(value, "model_dump"):
         value = value.model_dump()
@@ -222,6 +238,10 @@ def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
         normalized = _normalize_feishu_batch_write_payload(payload)
         if normalized is not None:
             return normalized
+    if isinstance(payload, dict) and tool_name == "record_primary_result":
+        normalized = dict(payload)
+        normalized["record_count"] = _coerce_optional_int(normalized.get("record_count"))
+        return normalized
     if tool_name != "update_task_plan" or not isinstance(payload, dict):
         return payload
     todos = payload.get("todos")
@@ -1028,6 +1048,16 @@ class AnalyzeImageInput(BaseModel):
     )
 
 
+class AnalyzeImagesInput(BaseModel):
+    """Arguments for analyzing multiple workspace images with the multimodal model."""
+
+    paths: list[str] = Field(..., description="Workspace-relative image paths.")
+    prompt: str = Field(
+        "",
+        description="What should be extracted or analyzed from the images.",
+    )
+
+
 class RecentMcdOrdersInput(BaseModel):
     """Arguments for querying recent McDonald's mall orders."""
 
@@ -1510,6 +1540,26 @@ def analyze_image(path: str, prompt: str = "") -> str:
         )
 
 
+@tool(args_schema=AnalyzeImagesInput)
+def analyze_images(paths: list[str], prompt: str = "") -> str:
+    """Analyze multiple workspace images in one multimodal request."""
+    try:
+        return analyze_image_files(
+            paths=paths,
+            prompt=prompt,
+            workspace_root=_workspace_root(),
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": str(exc),
+                "paths": paths,
+            },
+            ensure_ascii=False,
+        )
+
+
 @tool
 def get_file_info(path: str) -> str:
     """Get metadata about a file or directory (size, modified time, type)."""
@@ -1729,7 +1779,7 @@ def record_primary_result(
         "summary": (summary or "").strip(),
         "token": (token or "").strip(),
         "table_id": (table_id or "").strip(),
-        "record_count": record_count,
+        "record_count": _coerce_optional_int(record_count),
         "verified": bool(verified),
         "status": "verified" if verified else "created",
         "source_tool": "record_primary_result",
@@ -2627,6 +2677,7 @@ _FILE_TOOLS: list[Any] = [
     list_directory,
     read_file,
     analyze_image,
+    analyze_images,
     get_file_info,
     write_file,
     append_file,

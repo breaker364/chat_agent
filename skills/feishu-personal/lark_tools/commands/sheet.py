@@ -397,6 +397,46 @@ def _parse_cell_range(cell_ref: str):
     return int(row_str) - 1, _col_letter_to_index(col_letter)
 
 
+def _normalize_cell_ref(cell_ref: str) -> str:
+    row, col = _parse_cell_range(cell_ref)
+    return f'{_col_index_to_letter(col)}{row + 1}'
+
+
+def _expand_cell_range(range_ref: str) -> list[str]:
+    parts = [part.strip() for part in str(range_ref or '').split(':')]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"Invalid cell range: {range_ref!r}. Expected format like 'E3:E7'.")
+    start_row, start_col = _parse_cell_range(parts[0])
+    end_row, end_col = _parse_cell_range(parts[1])
+    row_min, row_max = sorted((start_row, end_row))
+    col_min, col_max = sorted((start_col, end_col))
+    return [
+        f'{_col_index_to_letter(col)}{row + 1}'
+        for row in range(row_min, row_max + 1)
+        for col in range(col_min, col_max + 1)
+    ]
+
+
+def _parse_cell_list(cells_arg: str) -> list[str]:
+    cells: list[str] = []
+    for item in re.split(r'[,;\s]+', str(cells_arg or '').strip()):
+        if not item:
+            continue
+        cells.append(_normalize_cell_ref(item))
+    return cells
+
+
+def _image_target_cells(opts: dict) -> set[str]:
+    targets: list[str] = []
+    if opts.get('cell'):
+        targets.append(_normalize_cell_ref(opts['cell']))
+    if opts.get('cells'):
+        targets.extend(_parse_cell_list(opts['cells']))
+    if opts.get('range'):
+        targets.extend(_expand_cell_range(opts['range']))
+    return set(targets)
+
+
 # ---------------------------------------------------------------------------
 # _parse_sheet_image_entries  — extract image resources from a cell block
 # ---------------------------------------------------------------------------
@@ -776,7 +816,7 @@ def _resolve_sheet_image_output_path(out_base: str, default_name: str) -> str:
 def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
     """List and optionally download images from a spreadsheet sheet.
 
-    Usage from CLI:  lark sheet images <url> [--sheet NAME] [--cell A1] [--download] [--out PATH]
+    Usage from CLI:  lark sheet images <url> [--sheet NAME] [--cell A1|--cells A1,B2|--range A1:B2] [--download] [--out PATH]
     Usage from agent: cmd_sheet_images(cookies, url, opts)
 
     Output (JSON):
@@ -785,7 +825,7 @@ def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
       - images: [{index, token, width, height, cell}]
       - downloaded: [{token, cell, path, size}]  (when --download)
 
-    When --cell is specified, only images in that cell are listed/downloaded.
+    When --cell, --cells, or --range is specified, only images in those cells are listed/downloaded.
     When --download is specified, images are downloaded to the output directory.
     """
     opts = opts or {}
@@ -801,22 +841,21 @@ def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
     print(f'[sheet] Extracting images from "{sheet_name}" ({sheet_id})...', file=sys.stderr)
     img_data = fetch_sheet_images(cookies, spreadsheet_token, sheet_id)
 
-    target_cell = opts.get('cell')
-    if target_cell:
-        try:
-            target_row, target_col = _parse_cell_range(target_cell)
-        except ValueError as e:
-            raise RuntimeError(str(e))
+    try:
+        target_cells = _image_target_cells(opts)
+    except ValueError as e:
+        raise RuntimeError(str(e))
 
     # Build enriched image list with cell addresses
     enriched = []
     for img in img_data['images']:
         # f2 values in cell_map are 0-based, matching img['index']
         cells = img_data['cell_map'].get(img['index'], [])
-        if target_cell:
-            if target_cell not in cells:
+        if target_cells:
+            matching_cells = [cell for cell in cells if cell in target_cells]
+            if not matching_cells:
                 continue
-            cells = [target_cell]
+            cells = matching_cells
         enriched.append({
             'index': img['index'],
             'token': img['token'],

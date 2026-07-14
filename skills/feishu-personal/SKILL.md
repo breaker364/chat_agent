@@ -94,7 +94,10 @@ lark bitable download <url> [tableId] [--out path]
   lark sheet images <url>                      # list all images in the first sheet
   lark sheet images <url> --sheet "SheetName"   # specify a sheet
   lark sheet images <url> --cell E3             # filter to a specific cell
+  lark sheet images <url> --cells E3,E4,E5      # filter to specific cells
+  lark sheet images <url> --range E3:E7         # filter to a rectangular range
   lark sheet images <url> --cell E3 --download  # download the image(s)
+  lark sheet images <url> --range E3:E7 --download --out ./img # download target range
   lark sheet images <url> --download --out ./img # download all to directory
   ```
 - From Python:
