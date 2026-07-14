@@ -647,12 +647,13 @@ async def stream_agent_events(
     effective_message = message
     detected_image_paths = extract_image_paths(message, Path.cwd())
     if detected_image_paths:
-        tool_call_names.append("analyze_image")
+        image_tool_name = "analyze_images" if len(detected_image_paths) > 1 else "analyze_image"
+        tool_call_names.append(image_tool_name)
         yield {
             "event": "tool_call",
             "data": json.dumps(
                 {
-                    "name": "analyze_image",
+                    "name": image_tool_name,
                     "arguments": {
                         "paths": detected_image_paths,
                         "prompt": "Automatically analyze attached images before main-agent reasoning.",
@@ -667,7 +668,7 @@ async def stream_agent_events(
                 {
                     "message": f"Analyzing {len(detected_image_paths)} attached image(s).",
                     "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
-                    "active_tool": "analyze_image",
+                    "active_tool": image_tool_name,
                 },
                 ensure_ascii=False,
             ),
@@ -696,7 +697,7 @@ async def stream_agent_events(
                 "event": "tool_result",
                 "data": json.dumps(
                     {
-                        "name": "analyze_image",
+                        "name": image_tool_name,
                         "content": vision_result,
                     },
                     ensure_ascii=False,
@@ -713,7 +714,7 @@ async def stream_agent_events(
                 "event": "tool_result",
                 "data": json.dumps(
                     {
-                        "name": "analyze_image",
+                        "name": image_tool_name,
                         "content": json.dumps(
                             {"success": False, "error": str(exc)},
                             ensure_ascii=False,
@@ -733,7 +734,7 @@ async def stream_agent_events(
                 "event": "tool_result",
                 "data": json.dumps(
                     {
-                        "name": "analyze_image",
+                        "name": image_tool_name,
                         "content": json.dumps(
                             {"success": False, "error": str(exc)},
                             ensure_ascii=False,
