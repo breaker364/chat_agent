@@ -764,6 +764,15 @@ def cmd_sheet_download(cookies, input_str: str, opts: dict = None):
 
 # ── sheet images ─────────────────────────────────────────────────────────
 
+def _resolve_sheet_image_output_path(out_base: str, default_name: str) -> str:
+    """Resolve sheet image downloads as directory-based outputs."""
+    if not out_base:
+        return default_name
+    out_dir = os.path.expanduser(os.path.expandvars(out_base))
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, default_name)
+
+
 def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
     """List and optionally download images from a spreadsheet sheet.
 
@@ -827,7 +836,6 @@ def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
     # Download if requested
     if opts.get('download'):
         from ..commands.img import download_sheet_image
-        from ..paths import resolve_output_path
 
         out_base = opts.get('outputPath') or ''
         downloaded = []
@@ -836,7 +844,7 @@ def cmd_sheet_images(cookies, input_str: str, opts: dict = None):
                 continue
             cell_label = img['cells'][0].replace(' ', '_')
             default_name = f'{sheet_name}_{cell_label}_{img["token"][:12]}.png'
-            out_path = resolve_output_path(out_base, default_name)
+            out_path = _resolve_sheet_image_output_path(out_base, default_name)
             try:
                 download_sheet_image(cookies, img['token'], spreadsheet_token, out_path)
                 downloaded.append({

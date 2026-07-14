@@ -184,7 +184,44 @@ def _normalize_task_plan_todo(value: Any, index: int) -> dict[str, str]:
     }
 
 
+def _extract_json_array_from_text(text: str) -> Any | None:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\[", text or ""):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            return value
+    return None
+
+
+def _normalize_feishu_batch_write_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if str(payload.get("skill_name") or "") != "feishu-personal":
+        return None
+    request = str(payload.get("request") or "")
+    lowered = request.lower()
+    if "add-records-batch" not in lowered and "batch" not in lowered and "批量" not in request:
+        return None
+    records = _extract_json_array_from_text(request)
+    if records is None:
+        return None
+    table_match = re.search(r"\b(tbl[A-Za-z0-9]+)\b", request)
+    target_match = re.search(r"https?://[^\s，。；;]+|\b[A-Za-z0-9]{20,}\b", request)
+    return {
+        "skill_name": "feishu-personal",
+        "operation": "bitable.add-records-batch",
+        "target": target_match.group(0) if target_match else "",
+        "table_id": table_match.group(0) if table_match else "",
+        "records_hash": _arguments_hash(records),
+    }
+
+
 def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
+    if isinstance(payload, dict) and tool_name == "use_skill":
+        normalized = _normalize_feishu_batch_write_payload(payload)
+        if normalized is not None:
+            return normalized
     if tool_name != "update_task_plan" or not isinstance(payload, dict):
         return payload
     todos = payload.get("todos")
@@ -399,6 +436,157 @@ def _side_effect_repeat_message(tool_name: str, call_key: str) -> str:
     )
 
 
+def _json_objects_from_text(text: str) -> list[dict[str, Any]]:
+    objects: list[dict[str, Any]] = []
+    raw = (text or "").strip()
+    if not raw:
+        return objects
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(raw):
+        start = raw.find("{", index)
+        if start < 0:
+            break
+        try:
+            parsed, end = decoder.raw_decode(raw[start:])
+        except Exception:
+            index = start + 1
+            continue
+        if isinstance(parsed, dict):
+            objects.append(parsed)
+        index = start + max(end, 1)
+    return objects
+
+
+def _origin_from_text(text: str) -> str:
+    match = re.search(r"(https?://[^/\s，。；;]+)", text or "")
+    return match.group(1) if match else ""
+
+
+def _feishu_bitable_url_from_request(request: str, token: str, table_id: str = "") -> str:
+    origin = _origin_from_text(request)
+    if not origin or not token:
+        return ""
+    suffix = f"?table={table_id}" if table_id else ""
+    return f"{origin}/base/{token}{suffix}"
+
+
+def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> None:
+    session_id = _current_session_id()
+    if not session_id:
+        return
+    store = _session_store_for_runtime()
+    if store is None:
+        return
+    args = arguments if isinstance(arguments, dict) else {}
+    try:
+        for obj in _json_objects_from_text(content):
+            if obj.get("success") is False or obj.get("error"):
+                continue
+            saved_path = obj.get("saved_path") or obj.get("path")
+            url = obj.get("url")
+            if saved_path or url:
+                store.register_artifact(
+                    session_id,
+                    {
+                        "role": "intermediate",
+                        "type": "file" if saved_path else "url",
+                        "path": str(saved_path or ""),
+                        "url": str(url or ""),
+                        "summary": str(obj.get("summary") or obj.get("message") or "Tool-produced artifact."),
+                        "source_tool": tool_name,
+                    },
+                )
+        if tool_name == "write_file":
+            path = str(args.get("path") or "")
+            if path:
+                store.register_artifact(
+                    session_id,
+                    {
+                        "role": "intermediate",
+                        "type": "file",
+                        "path": path,
+                        "summary": "File written by agent.",
+                        "source_tool": tool_name,
+                    },
+                )
+        elif tool_name == "analyze_image":
+            path = str(args.get("path") or "")
+            stage_name = "image_analysis" + (":" + _arguments_hash(path) if path else "")
+            store.record_stage_result(
+                session_id,
+                stage_name,
+                {
+                    "status": "completed",
+                    "summary": (content or "")[:1000],
+                    "result_ref": path,
+                    "source_tool": tool_name,
+                    "verified": False,
+                },
+            )
+        elif tool_name == "use_skill" and str(args.get("skill_name") or "") == "feishu-personal":
+            request = str(args.get("request") or "")
+            for obj in _json_objects_from_text(content):
+                if obj.get("success") is not True:
+                    continue
+                if obj.get("records_written") is not None and obj.get("obj_token") and obj.get("table_id"):
+                    token = str(obj.get("obj_token") or "")
+                    table_id = str(obj.get("table_id") or "")
+                    store.record_primary_result(
+                        session_id,
+                        {
+                            "type": "feishu_bitable",
+                            "title": "Feishu Bitable records",
+                            "status": "written",
+                            "url": _feishu_bitable_url_from_request(request, token, table_id),
+                            "token": token,
+                            "table_id": table_id,
+                            "record_count": obj.get("records_written"),
+                            "verified": False,
+                            "summary": f"Written {obj.get('records_written')} records.",
+                            "source_tool": tool_name,
+                        },
+                    )
+                elif obj.get("url") and (obj.get("obj_token") or obj.get("wiki_token")):
+                    store.record_primary_result(
+                        session_id,
+                        {
+                            "type": "feishu_bitable",
+                            "title": str(obj.get("title") or "Feishu Bitable"),
+                            "status": "created",
+                            "url": str(obj.get("url") or ""),
+                            "token": str(obj.get("obj_token") or ""),
+                            "summary": "Feishu Bitable created.",
+                            "source_tool": tool_name,
+                        },
+                    )
+                elif obj.get("tableId") and obj.get("total") is not None:
+                    progress = store.get_resume_context(session_id)
+                    primary = progress.get("primary_result") if isinstance(progress, dict) else None
+                    if isinstance(primary, dict) and str(primary.get("table_id") or "") == str(obj.get("tableId")):
+                        store.record_primary_result(
+                            session_id,
+                            {
+                                **primary,
+                                "status": "verified",
+                                "verified": True,
+                                "record_count": obj.get("total"),
+                                "summary": f"Verified table contains {obj.get('total')} records.",
+                                "source_tool": tool_name,
+                            },
+                        )
+    except Exception as exc:
+        logger.debug("Auto result registration failed for %s: %s", tool_name, exc)
+
+
 def _run_cache_for_current_request() -> dict[str, str] | None:
     run_id = _current_run_id()
     if not run_id:
@@ -478,6 +666,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             latency_ms = int((time.monotonic() - started_at) * 1000)
             if cache is not None:
                 cache[cache_key] = result_text
+            _auto_register_tool_result(tool_name, kwargs, result_text)
             _save_conversation_cache_result(
                 tool_name=tool_name,
                 arguments=kwargs,
@@ -599,6 +788,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             if cache is not None:
                 cache[cache_key] = result_text
             latency_ms = int((time.monotonic() - started_at) * 1000)
+            _auto_register_tool_result(tool_name, kwargs, result_text)
             _save_conversation_cache_result(
                 tool_name=tool_name,
                 arguments=kwargs,
@@ -852,6 +1042,31 @@ class ScriptStageInput(BaseModel):
     status: str = Field(..., description="Stage status: planned, running, completed, failed.")
     summary: str = Field("", description="Short human-readable summary of what happened in this stage.")
     artifact_path: str = Field("", description="Optional workspace path to the generated script or output artifact.")
+
+
+class PrimaryResultInput(BaseModel):
+    """Arguments for recording the user-visible primary result of a task."""
+
+    result_type: str = Field(..., description="Result type, e.g. file, feishu_bitable, feishu_doc, report, dataset.")
+    title: str = Field("", description="Short result title.")
+    url: str = Field("", description="URL where the user can open the result.")
+    path: str = Field("", description="Workspace path where the result file is saved.")
+    summary: str = Field("", description="Short summary of what the result contains.")
+    token: str = Field("", description="Optional service token or id.")
+    table_id: str = Field("", description="Optional table id for table-like results.")
+    record_count: int | None = Field(None, description="Optional number of records/items in the result.")
+    verified: bool = Field(False, description="Whether the result has been verified.")
+
+
+class StageResultInput(BaseModel):
+    """Arguments for recording a reusable completed stage result."""
+
+    stage_name: str = Field(..., description="Stable stage name, e.g. image_analysis or extracted_records.")
+    result_ref: str = Field("", description="Path, URL, or token for the reusable stage result.")
+    summary: str = Field("", description="Short stage result summary.")
+    item_count: int | None = Field(None, description="Optional number of items represented by the stage.")
+    verified: bool = Field(False, description="Whether this stage result has been verified.")
+    status: str = Field("completed", description="Stage status, usually completed or verified.")
 
 
 class TaskPlanTodoInput(BaseModel):
@@ -1178,6 +1393,56 @@ def _read_workbook_text(target: Path) -> str:
     return "\n".join(sections)
 
 
+def _feishu_crud_script_block_reason(content: str) -> str:
+    text = (content or "").lower()
+    has_feishu_marker = any(
+        marker in text
+        for marker in (
+            "feishu_web_session.json",
+            "/space/api/",
+            "/bitable/",
+            "lark_tools.commands.bitable",
+            "lark_tools.bitable",
+        )
+    )
+    has_write_intent = any(
+        marker in text
+        for marker in (
+            "requests.post",
+            "requests.patch",
+            "requests.delete",
+            "add-record",
+            "add_records",
+            "set-record",
+            "delete-record",
+            "cmd_bitable_add",
+            "cmd_bitable_set",
+            "cmd_bitable_delete",
+        )
+    )
+    if has_feishu_marker and has_write_intent:
+        return (
+            "Feishu/Lark CRUD scripts are blocked. Use the feishu-personal "
+            "skill route instead, for example: "
+            "lark bitable add-records-batch <url> <tableId> --json-file <path>."
+        )
+    return ""
+
+
+def _blocked_feishu_script_payload(path: str, reason: str) -> str:
+    return json.dumps(
+        {
+            "blocked": True,
+            "reason": reason,
+            "path": path,
+            "suggested_tool": "use_skill",
+            "suggested_skill": "feishu-personal",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
 @tool
 def list_directory(path: str) -> str:
     """List files and folders in a directory. Provide a relative path from the workspace root."""
@@ -1274,6 +1539,10 @@ def write_file(path: str, content: str, overwrite: bool = True) -> str:
         target = _ensure_allowed(path)
     except PermissionError as exc:
         return str(exc)
+    if target.suffix.lower() == ".py":
+        reason = _feishu_crud_script_block_reason(content or "")
+        if reason:
+            return _blocked_feishu_script_payload(str(target), reason)
     if target.exists() and target.is_dir():
         return f"Cannot write file because target is a directory: {target}"
     if target.exists() and not overwrite:
@@ -1292,6 +1561,11 @@ def append_file(path: str, content: str) -> str:
         target = _ensure_allowed(path)
     except PermissionError as exc:
         return str(exc)
+    if target.suffix.lower() == ".py":
+        existing = target.read_text(encoding="utf-8", errors="ignore") if target.exists() and target.is_file() else ""
+        reason = _feishu_crud_script_block_reason(existing + "\n" + (content or ""))
+        if reason:
+            return _blocked_feishu_script_payload(str(target), reason)
     if target.exists() and target.is_dir():
         return f"Cannot append because target is a directory: {target}"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1429,6 +1703,64 @@ def record_script_stage(
     }
     SessionStore(workspace).add_script_stage(session_id, payload)
     return json.dumps({"success": True, **payload}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=PrimaryResultInput)
+def record_primary_result(
+    result_type: str,
+    title: str = "",
+    url: str = "",
+    path: str = "",
+    summary: str = "",
+    token: str = "",
+    table_id: str = "",
+    record_count: int | None = None,
+    verified: bool = False,
+) -> str:
+    """Record the primary result location so final answers can return it."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    payload = {
+        "type": (result_type or "artifact").strip(),
+        "title": (title or "Result").strip(),
+        "url": (url or "").strip(),
+        "path": (path or "").strip(),
+        "summary": (summary or "").strip(),
+        "token": (token or "").strip(),
+        "table_id": (table_id or "").strip(),
+        "record_count": record_count,
+        "verified": bool(verified),
+        "status": "verified" if verified else "created",
+        "source_tool": "record_primary_result",
+    }
+    SessionStore(_workspace_root()).record_primary_result(session_id, payload)
+    return json.dumps({"success": True, "primary_result": payload}, ensure_ascii=False, indent=2)
+
+
+@tool(args_schema=StageResultInput)
+def record_stage_result(
+    stage_name: str,
+    result_ref: str = "",
+    summary: str = "",
+    item_count: int | None = None,
+    verified: bool = False,
+    status: str = "completed",
+) -> str:
+    """Record a reusable stage result so continuation does not repeat work."""
+    session_id = _current_session_id()
+    if not session_id:
+        return json.dumps({"success": False, "error": "No active session id."}, ensure_ascii=False, indent=2)
+    payload = {
+        "status": (status or "completed").strip(),
+        "result_ref": (result_ref or "").strip(),
+        "summary": (summary or "").strip(),
+        "item_count": item_count,
+        "verified": bool(verified),
+        "source_tool": "record_stage_result",
+    }
+    SessionStore(_workspace_root()).record_stage_result(session_id, stage_name, payload)
+    return json.dumps({"success": True, "stage_name": stage_name, "stage_result": payload}, ensure_ascii=False, indent=2)
 
 
 @tool(args_schema=TaskPlanInput)
@@ -1611,6 +1943,13 @@ def run_python_file(
         return json.dumps({"path": str(target), "error": "File not found."}, ensure_ascii=False, indent=2)
     if target.suffix.lower() != ".py":
         return json.dumps({"path": str(target), "error": "Only .py files can be executed."}, ensure_ascii=False, indent=2)
+    try:
+        script_text = target.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        script_text = ""
+    reason = _feishu_crud_script_block_reason(script_text)
+    if reason:
+        return _blocked_feishu_script_payload(str(target), reason)
 
     try:
         timeout_value = min(_PYTHON_RUN_MAX_TIMEOUT_SECONDS, max(1, int(timeout_seconds)))
@@ -2300,6 +2639,8 @@ _AGENT_TOOLS: list[Any] = [
     get_subagent_task,
     SendMessage,
     record_script_stage,
+    record_primary_result,
+    record_stage_result,
     update_task_plan,
     record_task_item,
     update_task_item,

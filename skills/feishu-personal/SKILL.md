@@ -33,7 +33,7 @@ intent and translates it to the correct CLI command automatically.
 | "读取记录" / "read records" | `lark bitable records <url> --all` |
 | "添加一条记录" / "add a record" | `lark bitable add-record <url> <tableId> <field=value>...` |
 | "批量写入" / "batch write" | `lark bitable add-records-batch <url> <tableId> <json>` |
-| "添加字段" / "add a field" | `lark bitable add-field <url> <tableId> <name> --type <type>` |
+| "添加字段" / "add a field" | `lark bitable add-field <url> <tableId> <name> --type <type> [--format <number_format>]` |
 
 ### Complete bitable command reference
 
@@ -42,11 +42,16 @@ lark bitable create <title>                        — create a new base
 lark bitable tables <url-or-token>                  — list all tables
 lark bitable schema <url> [tableId]                 — show field schema
 lark bitable records <url> --table <tbl> --all      — read all records
-lark bitable add-field <url> <tableId> <name> [--type text|number|checkbox|url|datetime]
+lark bitable add-field <url> <tableId> <name> [--type text|number|checkbox|url|datetime] [--format 0.###]
 lark bitable add-record <url> <tableId> <field=value>...
 lark bitable add-records-batch <url> <tableId> <json_array>
+lark bitable add-records-batch <url> <tableId> --json-file <path>
+lark bitable add-records-batch <url> <tableId> @<path>
 lark bitable set-record <url> <tableId> <recordId> <field=value>...
 lark bitable delete-record <url> <tableId> <recordId>
+lark bitable delete-record <url> --table <tableId> --record-id <recordId>
+lark bitable delete-records <url> --table <tableId> --record-ids <id1,id2>
+lark bitable set-field-format <url> <tableId> <fieldId|fieldName> <number_format>
 lark bitable rename-field <url> <tableId> <fieldId> <new_name>
 lark bitable download <url> [tableId] [--out path]
 ```
@@ -56,7 +61,7 @@ lark bitable download <url> [tableId] [--out path]
 ```
 1. lark bitable create <title>                     → get obj_token + url
 2. lark bitable tables <url>                        → get table_id
-3. lark bitable add-field <url> <tableId> <name>    → repeat for each field, get field IDs
+3. lark bitable add-field <url> <tableId> <name>    → repeat for each field, get field IDs; use `--format 0.###` or similar for precise number display
 4. lark bitable add-records-batch <url> <tableId> '[{"fldXXX":"val1","fldYYY":"val2"}, ...]'
 5. lark bitable records <url> --table <tbl> --all   → verify
 ```

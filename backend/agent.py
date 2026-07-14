@@ -12,6 +12,7 @@ from langgraph.prebuilt import create_react_agent
 
 from .config import create_chat_deepseek, load_llm_config
 from .prompts import load_agent_policy, load_system_prompt
+from .session_store import SessionStore
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
 from .tools import get_all_tools, _normalize_tool_payload_for_key
@@ -34,6 +35,48 @@ HEARTBEAT_EMIT_INTERVAL_SECONDS = 3
 
 def estimate_tokens_from_text(text: str) -> int:
     return count_text_tokens(text or "")
+
+
+def _format_resume_context(context: dict[str, Any]) -> str:
+    if not context:
+        return ""
+    lines: list[str] = []
+    primary = context.get("primary_result")
+    if isinstance(primary, dict) and (primary.get("url") or primary.get("path") or primary.get("summary")):
+        lines.append("Primary result already registered:")
+        lines.append(
+            "- {type}: {target} | status={status} | verified={verified} | summary={summary}".format(
+                type=primary.get("type", "result"),
+                target=primary.get("url") or primary.get("path") or primary.get("token") or "",
+                status=primary.get("status", ""),
+                verified=primary.get("verified", False),
+                summary=str(primary.get("summary") or "")[:300],
+            )
+        )
+    stage_results = context.get("stage_results")
+    if isinstance(stage_results, dict) and stage_results:
+        lines.append("Reusable completed stage results:")
+        for name, result in list(stage_results.items())[:8]:
+            if not isinstance(result, dict):
+                continue
+            if str(result.get("status") or "") not in {"completed", "verified"}:
+                continue
+            lines.append(
+                f"- {name}: result_ref={result.get('result_ref') or ''} | summary={str(result.get('summary') or '')[:220]}"
+            )
+    unfinished = context.get("unfinished_todos")
+    if isinstance(unfinished, list) and unfinished:
+        lines.append("Unfinished task plan items:")
+        for item in unfinished[:6]:
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('task_id')}: {item.get('status')} | {item.get('content')}")
+    if not lines:
+        return ""
+    return (
+        "Session resume context. Reuse completed stages and primary results; "
+        "do not rerun expensive analysis or recreate outputs unless the user explicitly asks.\n"
+        + "\n".join(lines)
+    )
 
 
 def _extract_usage_metadata(value: Any) -> dict[str, int]:
@@ -592,6 +635,14 @@ async def stream_agent_events(
                 )
             )
         )
+    resume_context = {}
+    try:
+        resume_context = SessionStore(Path.cwd()).get_resume_context(session_id)
+    except Exception:
+        resume_context = {}
+    resume_text = _format_resume_context(resume_context)
+    if resume_text:
+        messages.append(SystemMessage(content=resume_text))
     effective_history = trim_history(history)
     effective_message = message
     detected_image_paths = extract_image_paths(message, Path.cwd())
@@ -698,8 +749,11 @@ async def stream_agent_events(
     if skill_catalog_text:
         context_char_count += len(skill_catalog_text)
         context_message_count += 1
+    if resume_text:
+        context_char_count += len(resume_text)
+        context_message_count += 1
     context_token_estimate = estimate_tokens_from_text("".join(
-        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", effective_message]
+        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", resume_text or "", effective_message]
         + [msg.get("content", "") for msg in effective_history]
     ))
 

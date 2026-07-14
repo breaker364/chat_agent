@@ -126,6 +126,26 @@ def _split_lark_command(command_text: str) -> list[str]:
                 current.append(char)
         elif char in {'"', "'"}:
             quote = char
+        elif char == "[":
+            depth = 0
+            in_json_string = False
+            escape = False
+            while index < len(command_text):
+                json_char = command_text[index]
+                current.append(json_char)
+                if escape:
+                    escape = False
+                elif json_char == "\\" and in_json_string:
+                    escape = True
+                elif json_char == '"':
+                    in_json_string = not in_json_string
+                elif not in_json_string and json_char == "[":
+                    depth += 1
+                elif not in_json_string and json_char == "]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
         elif char.isspace():
             if current:
                 argv.append("".join(current))
@@ -245,6 +265,40 @@ def _extract_bitable_target(request_text: str) -> str:
     raise RuntimeError("No Feishu Base URL or base token found in the request.")
 
 
+def _extract_bitable_table_id(request_text: str) -> str:
+    match = re.search(r"\b(tbl[A-Za-z0-9]+)\b", request_text or "")
+    if match:
+        return match.group(1)
+    raise RuntimeError("No Bitable table ID found in the request.")
+
+
+def _extract_json_array(request_text: str) -> list[dict[str, Any]]:
+    raw = request_text or ""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\[", raw):
+        try:
+            value, _ = decoder.raw_decode(raw[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            if not all(isinstance(item, dict) for item in value):
+                raise RuntimeError("Batch records JSON must be an array of objects.")
+            return value
+    raise RuntimeError("No valid JSON array of records found in the request.")
+
+
+def _execute_bitable_add_records_batch(skill_root: Path, request_text: str) -> str:
+    from lark_tools.commands.bitable_write import cmd_bitable_add_records_batch
+
+    target = _extract_bitable_target(request_text)
+    table_id = _extract_bitable_table_id(request_text)
+    records = _extract_json_array(request_text)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        cmd_bitable_add_records_batch(_load_cookies(skill_root), target, table_id, records)
+    return buffer.getvalue().strip()
+
+
 # ---------------------------------------------------------------------------
 # Shortcut route detectors — map natural-language requests to CLI commands
 # ---------------------------------------------------------------------------
@@ -300,12 +354,9 @@ def _detect_bitable_route(request_text: str) -> str | None:
 
     # --- Batch add records ---
     if target and _has_bitable_batch_intent(raw):
-        table_match = re.search(r"(?:table|表)\s*[:=]?\s*([A-Za-z0-9]+)", raw, re.I)
-        table_id = table_match.group(1) if table_match else "tblTODO"
         json_match = re.search(r"\[.*\]", raw, re.DOTALL)
         if json_match:
-            records_json = json_match.group(0)
-            return f"lark bitable add-records-batch {target} {table_id} {records_json}"
+            return None
         return None
 
     # --- Add fields ---
@@ -317,10 +368,12 @@ def _detect_bitable_route(request_text: str) -> str | None:
             fname = name_match[0]
             type_match = re.search(r"(?:type|类型)\s*[:=]?\s*([A-Za-z]+)", raw, re.I)
             ftype = type_match.group(1) if type_match else "text"
+            format_match = re.search(r"--format\s+([^\s,，;；]+)", raw, re.I)
+            format_arg = f" --format {format_match.group(1)}" if format_match else ""
             if table_id:
-                return f"lark bitable add-field {target} {table_id} {fname} --type {ftype}"
+                return f"lark bitable add-field {target} {table_id} {fname} --type {ftype}{format_arg}"
             else:
-                return f"lark bitable add-field {target} tblTODO {fname} --type {ftype}"
+                return f"lark bitable add-field {target} tblTODO {fname} --type {ftype}{format_arg}"
         return None
 
     return None
@@ -435,6 +488,22 @@ def _looks_like_bitable_add_table_request(text: str) -> bool:
         return False
 
 
+def _looks_like_bitable_batch_request(text: str) -> bool:
+    raw = text or ""
+    lowered = raw.lower()
+    if not any(marker in lowered for marker in ("add-records-batch", "batch")) and not any(
+        marker in raw for marker in ("批量", "多条", "多行")
+    ):
+        return False
+    try:
+        _extract_bitable_target(raw)
+        _extract_bitable_table_id(raw)
+        _extract_json_array(raw)
+        return True
+    except Exception:
+        return False
+
+
 def _looks_like_doc_read_request(text: str) -> bool:
     if _looks_like_whiteboard_read_request(text):
         return False
@@ -455,23 +524,27 @@ def main() -> int:
     if _looks_like_lark_cli_request(request_text):
         result = _execute_lark_cli(skill_root, request_text)
 
-    # ---- Route 2: bitable shortcut routes (auto-detect intent) ----
+    # ---- Route 2: direct natural-language bitable batch write ----
+    elif _looks_like_bitable_batch_request(request_text):
+        result = _execute_bitable_add_records_batch(skill_root, request_text)
+
+    # ---- Route 3: bitable shortcut routes (auto-detect intent) ----
     elif (bitable_cmd := _detect_bitable_route(request_text)) is not None:
         result = _execute_lark_cli(skill_root, bitable_cmd)
 
-    # ---- Route 3: add-table to existing base (deprecated shortcut) ----
+    # ---- Route 4: add-table to existing base (deprecated shortcut) ----
     elif _looks_like_bitable_add_table_request(request_text):
         cookies = _load_cookies(skill_root)
         _validate_cookies(skill_root, cookies)
         result = _execute_bitable_add_table(skill_root, request_text)
 
-    # ---- Route 4: whiteboard read ----
+    # ---- Route 5: whiteboard read ----
     elif _looks_like_whiteboard_read_request(request_text):
         cookies = _load_cookies(skill_root)
         _validate_cookies(skill_root, cookies)
         result = _execute_whiteboard_read(skill_root, request_text)
 
-    # ---- Route 5: doc/wiki read ----
+    # ---- Route 6: doc/wiki read ----
     elif _looks_like_doc_read_request(request_text):
         cookies = _load_cookies(skill_root)
         _validate_cookies(skill_root, cookies)

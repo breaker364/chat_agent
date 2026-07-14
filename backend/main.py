@@ -360,6 +360,63 @@ def _append_persisted_summary(final_text: str, summary: dict[str, Any]) -> str:
     return f"{body}\n\n" + "\n".join(lines) if body else "\n".join(lines)
 
 
+def _append_result_locations(final_text: str, result_context: dict[str, Any]) -> str:
+    body = (final_text or "").strip()
+    if "**Result Location**" in body or "**结果位置**" in body:
+        return body
+    lines: list[str] = []
+    primary = result_context.get("primary_result")
+    if isinstance(primary, dict):
+        target = primary.get("url") or primary.get("path")
+        if target:
+            lines.append("**Result Location**")
+            lines.append(f"- Primary: {target}")
+            if primary.get("summary"):
+                lines.append(f"- Summary: {primary.get('summary')}")
+            if primary.get("record_count") is not None:
+                lines.append(f"- Records: {primary.get('record_count')}")
+    artifacts = result_context.get("artifacts")
+    if isinstance(artifacts, list):
+        primary_artifacts = [
+            item for item in artifacts
+            if isinstance(item, dict)
+            and item.get("role") == "primary"
+            and (item.get("url") or item.get("path"))
+        ]
+        if primary_artifacts and not lines:
+            lines.append("**Result Location**")
+        for item in primary_artifacts[:5]:
+            target = item.get("url") or item.get("path")
+            lines.append(f"- {item.get('title') or item.get('type') or 'Artifact'}: {target}")
+    if not lines:
+        return body
+    return f"{body}\n\n" + "\n".join(lines) if body else "\n".join(lines)
+
+
+def _looks_like_raw_failure_output(final_text: str) -> bool:
+    body = (final_text or "").strip().lower()
+    return (
+        body.startswith("agent execution failed")
+        or body.startswith("traceback (most recent call last)")
+    )
+
+
+def _extract_embedded_execution_status(final_text: str) -> tuple[str, str]:
+    """Recover status emitted inside the agent's final execution summary."""
+    status = ""
+    failure_reason = ""
+    for line in (final_text or "").splitlines():
+        stripped = line.strip().lstrip("-").strip()
+        lowered = stripped.lower()
+        if lowered.startswith("status:") or stripped.startswith("状态:"):
+            raw_status = stripped.split(":", 1)[1].strip().lower()
+            if raw_status.startswith(("failed", "blocked", "completed")):
+                status = raw_status.split()[0]
+        elif lowered.startswith("failure reason:") or stripped.startswith("失败原因:"):
+            failure_reason = stripped.split(":", 1)[1].strip()
+    return status, failure_reason
+
+
 def _finalize_agent_response(
     *,
     store: SessionStore,
@@ -371,6 +428,16 @@ def _finalize_agent_response(
     failure_reason: str = "",
 ) -> str:
     unfinished_todos = store.get_unfinished_task_plan_todos(session_id)
+    if status == "completed" and _looks_like_raw_failure_output(final_text):
+        status = "failed"
+        failure_reason = failure_reason or "Final response contains raw execution failure output."
+    embedded_status, embedded_failure_reason = _extract_embedded_execution_status(final_text)
+    if status == "completed" and embedded_status in {"failed", "blocked"}:
+        status = embedded_status
+        failure_reason = failure_reason or embedded_failure_reason or "Agent execution summary reported an incomplete run."
+    if status == "completed" and unfinished_todos:
+        status = "blocked"
+        failure_reason = failure_reason or "Task plan has unfinished todo items."
     summary = _build_execution_summary(
         user_message=user_message,
         final_text=final_text,
@@ -380,6 +447,7 @@ def _finalize_agent_response(
     )
     final_with_summary = _append_persisted_summary(final_text, summary)
     store.record_execution_summary(session_id, summary)
+    final_with_summary = _append_result_locations(final_with_summary, store.get_resume_context(session_id))
     store.append_tool_event(
         session_id,
         event_type="turn_result",

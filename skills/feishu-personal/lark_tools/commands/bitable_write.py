@@ -12,6 +12,7 @@ Commands:
     bitable add-record    <token|url> <tableId> <fieldName=value>...
     bitable delete-record <token|url> <tableId> <recordId>
     bitable add-field     <token|url> <tableId> <name> [--type text|number|...]
+    bitable set-field-format <token|url> <tableId> <fieldId|fieldName> <format>
     bitable rename-field  <token|url> <tableId> <fieldId> <new_name>
 """
 
@@ -135,7 +136,37 @@ def _load_field_map(cookies, base_token: str, table_id: str) -> dict:
             f"[bitable_write] Could not load field map (tablesv3 POST failed): {exc}",
             file=sys.stderr,
         )
+    try:
+        return _load_field_map_from_clientvars(cookies, base_token, table_id)
+    except Exception as exc:
+        print(
+            f"[bitable_write] Could not load field map from clientvars: {exc}",
+            file=sys.stderr,
+        )
         return {}
+
+
+def _load_field_map_from_clientvars(cookies, base_token: str, table_id: str) -> dict:
+    """Load table field map from clientvars as a fallback to tablesv3."""
+    import base64, zlib
+    from ..config import BITABLE_HOST
+    from ..http_utils import http_get
+
+    clientvars_url = (
+        f'/space/api/v1/bitable/{base_token}/clientvars'
+        f'?tableID={table_id}&viewID=&recordLimit=0&ondemandLimit=0'
+        f'&needBase=true&viewLazyLoad=false&ondemandVer=2&openType=1'
+        f'&noMissCS=true&optimizationFlag=1&removeFmlExtra=true'
+    )
+    res = http_get(cookies, BITABLE_HOST, clientvars_url)
+    payload = res.get('data')
+    if not isinstance(payload, dict) or payload.get('code') != 0:
+        raise RuntimeError(f"Failed to fetch clientvars: payload={payload!r}")
+    table_str = (payload.get('data') or {}).get('table')
+    if not table_str:
+        raise RuntimeError('No table field in clientvars response')
+    table_data = json.loads(zlib.decompress(base64.b64decode(table_str), 47))
+    return build_field_map({'data': {'table': table_data}})
 
 
 def _load_field_descriptor(cookies, base_token: str, table_id: str, field_id: str) -> dict:
@@ -324,7 +355,8 @@ def cmd_bitable_add_record(cookies, token_or_url: str, table_id: str, kv_pairs: 
 
 
 def cmd_bitable_add_records_batch(cookies, token_or_url: str, table_id: str,
-                                   records: list[dict[str, str]]):
+                                   records: list[dict[str, str]],
+                                   resolve_field_names: bool = True):
     """Add multiple records in a single OT operation.
 
     Standard workflow (avoids tablesv3 POST entirely):
@@ -339,11 +371,15 @@ def cmd_bitable_add_records_batch(cookies, token_or_url: str, table_id: str,
     Pass field IDs directly from the AddField responses.
     """
     base_token = _resolve(cookies, token_or_url)
+    field_map = _load_field_map(cookies, base_token, table_id) if resolve_field_names else {}
     operations = []
-    for record in records:
-        cell_data = {}
-        for fid, raw_value in record.items():
-            cell_data[fid] = encode_text_value(str(raw_value))
+    for index, record in enumerate(records, 1):
+        if not isinstance(record, dict):
+            raise RuntimeError(f'Record #{index} is not an object: {record!r}')
+        try:
+            cell_data = _build_cell_data(field_map, record)
+        except RuntimeError as exc:
+            raise RuntimeError(f'Invalid record #{index}: {exc}') from exc
         new_rid = new_record_id()
         operations.append(op_add_record(table_id, new_rid, cell_data))
 
@@ -389,7 +425,21 @@ _FIELD_TYPE_ALIASES = {
 }
 
 
-def cmd_bitable_add_field(cookies, token_or_url: str, table_id: str, name: str, type_name: str = 'text'):
+def _field_property_for_type(ftype: int, *, number_format: str | None = None) -> dict:
+    if ftype != 2:
+        return {}
+    formatter = (number_format or '0.##########').strip()
+    return {'formatter': formatter} if formatter else {}
+
+
+def cmd_bitable_add_field(
+    cookies,
+    token_or_url: str,
+    table_id: str,
+    name: str,
+    type_name: str = 'text',
+    number_format: str | None = None,
+):
     """Append a new field at the end of every view in the table.
 
     Reads the current field count + view list from tablesv3, then submits
@@ -409,6 +459,7 @@ def cmd_bitable_add_field(cookies, token_or_url: str, table_id: str, name: str, 
         field_type=ftype,
         view_ids=layout['view_ids'],
         total_after=total_after,
+        property_obj=_field_property_for_type(ftype, number_format=number_format),
     )
     resp = submit_operations(cookies, base_token, table_id, [op])
     print(json.dumps({
@@ -418,6 +469,7 @@ def cmd_bitable_add_field(cookies, token_or_url: str, table_id: str, name: str, 
         'field_id': new_fid,
         'name': name,
         'type': ftype,
+        'format': number_format if ftype == 2 and number_format else ('0.##########' if ftype == 2 else None),
         'total_fields': total_after,
         'views': layout['view_ids'],
         'rev': (resp.get('data') or {}).get('rev'),
@@ -443,6 +495,40 @@ def cmd_bitable_rename_field(cookies, token_or_url: str, table_id: str, field_id
         'field_id': fid,
         'old_name': old_name,
         'new_name': new_name,
+        'rev': (resp.get('data') or {}).get('rev'),
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_bitable_set_field_format(
+    cookies,
+    token_or_url: str,
+    table_id: str,
+    field_id_or_name: str,
+    number_format: str,
+):
+    base_token = _resolve(cookies, token_or_url)
+    field_map = _load_field_map(cookies, base_token, table_id)
+    fid, _ = _resolve_field_name_to_id(field_map, field_id_or_name)
+    descriptor = _load_field_descriptor(cookies, base_token, table_id, fid)
+    if descriptor is None:
+        raise RuntimeError(f'Field {fid} not found in table {table_id}')
+    if int(descriptor.get('type') or 0) != 2:
+        raise RuntimeError(f'Field {fid} is not a number field')
+    old_name = descriptor.get('name') or fid
+    old_format = (descriptor.get('property') or {}).get('formatter')
+    descriptor = dict(descriptor)
+    descriptor['property'] = dict(descriptor.get('property') or {})
+    descriptor['property']['formatter'] = number_format
+    op = op_rename_field(table_id, fid, old_name, current_descriptor=descriptor)
+    resp = submit_operations(cookies, base_token, table_id, [op])
+    print(json.dumps({
+        'success': True,
+        'obj_token': base_token,
+        'table_id': table_id,
+        'field_id': fid,
+        'name': old_name,
+        'old_format': old_format,
+        'format': number_format,
         'rev': (resp.get('data') or {}).get('rev'),
     }, indent=2, ensure_ascii=False))
 

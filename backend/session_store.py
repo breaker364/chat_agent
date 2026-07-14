@@ -225,6 +225,9 @@ class SessionStore:
             "script_stages": [],
             "task_items": [],
             "pitfalls": [],
+            "primary_result": None,
+            "stage_results": {},
+            "artifacts": [],
             "updated_at": _now_iso(),
         }
 
@@ -405,9 +408,141 @@ class SessionStore:
             progress["task_items"] = []
         if "pitfalls" not in progress or not isinstance(progress.get("pitfalls"), list):
             progress["pitfalls"] = []
+        if "stage_results" not in progress or not isinstance(progress.get("stage_results"), dict):
+            progress["stage_results"] = {}
+        if "artifacts" not in progress or not isinstance(progress.get("artifacts"), list):
+            progress["artifacts"] = []
         progress["updated_at"] = _now_iso()
         self.save_session(session)
         return session
+
+    def record_primary_result(self, session_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        normalized = {
+            "type": str(result.get("type") or "artifact"),
+            "title": str(result.get("title") or result.get("summary") or "Result"),
+            "status": str(result.get("status") or "created"),
+            "url": str(result.get("url") or ""),
+            "path": str(result.get("path") or ""),
+            "token": str(result.get("token") or result.get("base_token") or ""),
+            "table_id": str(result.get("table_id") or ""),
+            "record_count": result.get("record_count"),
+            "verified": bool(result.get("verified", False)),
+            "summary": str(result.get("summary") or ""),
+            "source_tool": str(result.get("source_tool") or ""),
+            "updated_at": _now_iso(),
+        }
+        progress["primary_result"] = normalized
+        self.register_artifact(
+            session_id,
+            {
+                **normalized,
+                "role": "primary",
+            },
+            save=False,
+            session=session,
+        )
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def record_stage_result(self, session_id: str, stage_name: str, result: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        stage_results = progress.setdefault("stage_results", {})
+        key = str(stage_name or result.get("stage_name") or "stage").strip() or "stage"
+        stage_results[key] = {
+            "stage_name": key,
+            "status": str(result.get("status") or "completed"),
+            "result_ref": str(result.get("result_ref") or result.get("path") or ""),
+            "summary": str(result.get("summary") or ""),
+            "item_count": result.get("item_count"),
+            "verified": bool(result.get("verified", False)),
+            "source_tool": str(result.get("source_tool") or ""),
+            "updated_at": _now_iso(),
+        }
+        progress["stage_results"] = stage_results
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def register_artifact(
+        self,
+        session_id: str,
+        artifact: dict[str, Any],
+        *,
+        save: bool = True,
+        session: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session = session or self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        artifacts = progress.setdefault("artifacts", [])
+        role = str(artifact.get("role") or "intermediate")
+        normalized = {
+            "artifact_id": str(artifact.get("artifact_id") or f"artifact-{uuid4().hex[:8]}"),
+            "role": role,
+            "type": str(artifact.get("type") or "artifact"),
+            "title": str(artifact.get("title") or artifact.get("summary") or ""),
+            "url": str(artifact.get("url") or ""),
+            "path": str(artifact.get("path") or ""),
+            "token": str(artifact.get("token") or artifact.get("base_token") or ""),
+            "table_id": str(artifact.get("table_id") or ""),
+            "summary": str(artifact.get("summary") or ""),
+            "created_at": artifact.get("created_at") or _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        identity = (
+            normalized["role"],
+            normalized["type"],
+            normalized["url"],
+            normalized["path"],
+            normalized["token"],
+            normalized["table_id"],
+        )
+        deduped: list[dict[str, Any]] = []
+        replaced = False
+        for item in artifacts if isinstance(artifacts, list) else []:
+            item_identity = (
+                item.get("role", ""),
+                item.get("type", ""),
+                item.get("url", ""),
+                item.get("path", ""),
+                item.get("token", ""),
+                item.get("table_id", ""),
+            )
+            if item_identity == identity:
+                deduped.append({**item, **normalized})
+                replaced = True
+            else:
+                deduped.append(item)
+        if not replaced:
+            deduped.append(normalized)
+        progress["artifacts"] = deduped[-100:]
+        progress["updated_at"] = _now_iso()
+        if save:
+            self.save_session(session)
+        return session
+
+    def get_resume_context(self, session_id: str) -> dict[str, Any]:
+        session = self.ensure_task_plan_recovered(session_id) or self.load_session(session_id)
+        if session is None:
+            return {}
+        progress = session.get("task_progress", {})
+        plan = self.load_task_plan(session_id)
+        return {
+            "primary_result": progress.get("primary_result"),
+            "stage_results": progress.get("stage_results") if isinstance(progress.get("stage_results"), dict) else {},
+            "artifacts": progress.get("artifacts") if isinstance(progress.get("artifacts"), list) else [],
+            "unfinished_todos": [
+                todo for todo in (plan.get("todos") or [])
+                if isinstance(todo, dict) and str(todo.get("status") or "pending") != "completed"
+            ],
+            "completed_todos": [
+                todo for todo in (plan.get("todos") or [])
+                if isinstance(todo, dict) and str(todo.get("status") or "") == "completed"
+            ],
+        }
 
     def set_task_plan(
         self,

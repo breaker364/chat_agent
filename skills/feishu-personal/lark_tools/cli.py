@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time as _time
+from pathlib import Path
 
 from lark_tools.intranet import assert_on_intranet
 from lark_tools.proto import encode_message
@@ -37,7 +38,7 @@ from lark_tools.commands.bitable import (
 from lark_tools.commands.bitable_write import (
     cmd_bitable_create, cmd_bitable_set_record, cmd_bitable_add_record,
     cmd_bitable_delete_record, cmd_bitable_add_field, cmd_bitable_rename_field,
-    cmd_bitable_add_records_batch,
+    cmd_bitable_add_records_batch, cmd_bitable_set_field_format,
 )
 from lark_tools.commands.calendar import cmd_calendar_list, cmd_calendar_events, cmd_calendar_detail
 from lark_tools.commands.minutes import (
@@ -58,6 +59,83 @@ from lark_tools.commands.sheet_write import (
     cmd_sheet_insert_row, cmd_sheet_delete_row, cmd_sheet_insert_col, cmd_sheet_delete_col,
     cmd_sheet_add_tab, cmd_sheet_delete_tab, cmd_sheet_rename_tab, cmd_sheet_state_clear,
 )
+
+
+def _strip_matching_outer_quotes(value: str) -> str:
+    text = (value or '').strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _load_batch_records_json(filtered_args: list, start_index: int = 4):
+    """Load add-records-batch payload from argv or --json-file.
+
+    JSON payloads can contain spaces, so all remaining argv parts are joined
+    before parsing. This keeps explicit CLI usage and model-generated commands
+    robust without relying on entity-specific assumptions.
+    """
+    if '--json-file' in filtered_args:
+        file_index = filtered_args.index('--json-file')
+        if file_index + 1 >= len(filtered_args):
+            raise ValueError('--json-file requires a path')
+        path = Path(filtered_args[file_index + 1]).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise ValueError(f'JSON file not found: {path}')
+        raw_json = path.read_text(encoding='utf-8-sig')
+    else:
+        raw_json = ' '.join(filtered_args[start_index:]) if len(filtered_args) > start_index else '[]'
+    raw_json = _strip_matching_outer_quotes(raw_json)
+    if raw_json.startswith('@'):
+        path = Path(raw_json[1:]).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise ValueError(f'JSON file not found: {path}')
+        raw_json = path.read_text(encoding='utf-8-sig')
+    try:
+        records = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            'Invalid JSON for records. Pass a JSON array of objects as one argument, '
+            'or use --json-file. Example: '
+            'lark bitable add-records-batch <url> <tableId> '
+            '\'[{"fldXXX":"value"}]\'. '
+            f'Parser error: {exc}'
+        ) from exc
+    if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
+        raise ValueError('records_json must be a JSON array of objects')
+    return records
+
+
+def _parse_delete_record_args(args: list, filtered_args: list):
+    """Parse delete-record arguments in positional or option form."""
+    table_id = _get_arg(args, '--table') or _get_arg(args, '--table-id')
+    record_id = _get_arg(args, '--record-id')
+    if not table_id and len(filtered_args) > 3 and not filtered_args[3].startswith('--'):
+        table_id = filtered_args[3]
+    if not record_id and len(filtered_args) > 4 and not filtered_args[4].startswith('--'):
+        record_id = filtered_args[4]
+    return table_id, record_id
+
+
+def _parse_delete_records_args(args: list, filtered_args: list):
+    """Parse delete-records arguments into (table_id, record_ids)."""
+    table_id = _get_arg(args, '--table') or _get_arg(args, '--table-id')
+    raw_ids = _get_arg(args, '--record-ids') or _get_arg(args, '--record-id')
+    if not table_id and len(filtered_args) > 3 and not filtered_args[3].startswith('--'):
+        table_id = filtered_args[3]
+    if raw_ids:
+        record_ids = [item.strip() for item in raw_ids.split(',') if item.strip()]
+    else:
+        record_ids = [
+            item.strip()
+            for item in filtered_args[4:]
+            if item.strip() and not item.startswith('--')
+        ]
+    return table_id, record_ids
 from lark_tools.commands.im_write import cmd_send_text, cmd_send_media, cmd_recall
 from lark_tools.audit import audit_write, audit_read
 from lark_tools.errors import LarkCliError
@@ -542,36 +620,57 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
                 cmd_bitable_add_record(cookies, token_arg, table_id, kv_pairs)
         elif sub == 'add-records-batch':
             # bitable add-records-batch <token|url> <tableId> <records_json>
+            # bitable add-records-batch <token|url> <tableId> --json-file <path>
+            # bitable add-records-batch <token|url> <tableId> @path
             # records_json: [{"fldXXX":"val1","fldYYY":"val2"}, ...]
             if len(filtered_args) < 4:
-                print(json.dumps({'error': 'Usage: bitable add-records-batch <token|url> <tableId> <records_json>'})); sys.exit(1)
+                print(json.dumps({'error': 'Usage: bitable add-records-batch <token|url> <tableId> <records_json|--json-file path>'})); sys.exit(1)
             table_id = filtered_args[3]
-            raw_json = filtered_args[4] if len(filtered_args) > 4 else '[]'
             try:
-                records = json.loads(raw_json)
-            except json.JSONDecodeError as exc:
-                print(json.dumps({'error': f'Invalid JSON for records: {exc}'})); sys.exit(1)
-            if not isinstance(records, list):
-                print(json.dumps({'error': 'records_json must be a JSON array of objects'})); sys.exit(1)
+                records = _load_batch_records_json(filtered_args, 4)
+            except ValueError as exc:
+                print(json.dumps({'error': str(exc)}, ensure_ascii=False)); sys.exit(1)
             with audit_write('bitable.add-records-batch', target=bt_token, extra={'table_id': table_id, 'count': len(records)}):
                 cmd_bitable_add_records_batch(cookies, token_arg, table_id, records)
         elif sub == 'delete-record':
             # bitable delete-record <token|url> <tableId> <recordId>
-            if len(filtered_args) < 5:
-                print(json.dumps({'error': 'Usage: bitable delete-record <token|url> <tableId> <recordId>'})); sys.exit(1)
-            table_id = filtered_args[3]
-            record_id = filtered_args[4]
+            # bitable delete-record <token|url> --table <tableId> --record-id <recordId>
+            table_id, record_id = _parse_delete_record_args(args, filtered_args)
+            if not table_id or not record_id:
+                print(json.dumps({'error': 'Usage: bitable delete-record <token|url> <tableId> <recordId> OR bitable delete-record <token|url> --table <tableId> --record-id <recordId>'})); sys.exit(1)
             with audit_write('bitable.delete-record', target=bt_token, extra={'table_id': table_id, 'record_id': record_id}):
                 cmd_bitable_delete_record(cookies, token_arg, table_id, record_id)
+        elif sub == 'delete-records':
+            # bitable delete-records <token|url> <tableId> <recordId>...
+            # bitable delete-records <token|url> --table <tableId> --record-ids <id1,id2>
+            table_id, record_ids = _parse_delete_records_args(args, filtered_args)
+            if not table_id or not record_ids:
+                print(json.dumps({'error': 'Usage: bitable delete-records <token|url> <tableId> <recordId>... OR bitable delete-records <token|url> --table <tableId> --record-ids <id1,id2>'})); sys.exit(1)
+            deleted = []
+            with audit_write('bitable.delete-records', target=bt_token, extra={'table_id': table_id, 'count': len(record_ids)}):
+                for record_id in record_ids:
+                    cmd_bitable_delete_record(cookies, token_arg, table_id, record_id)
+                    deleted.append(record_id)
+            print(json.dumps({'success': True, 'table_id': table_id, 'records_deleted': len(deleted), 'record_ids': deleted}, ensure_ascii=False, indent=2))
         elif sub == 'add-field':
-            # bitable add-field <token|url> <tableId> <name> [--type text|number|...]
+            # bitable add-field <token|url> <tableId> <name> [--type text|number|...] [--format 0.###]
             if len(filtered_args) < 5:
-                print(json.dumps({'error': 'Usage: bitable add-field <token|url> <tableId> <name> [--type text|number|checkbox|url|datetime|singleselect|multiselect]'})); sys.exit(1)
+                print(json.dumps({'error': 'Usage: bitable add-field <token|url> <tableId> <name> [--type text|number|checkbox|url|datetime|singleselect|multiselect] [--format 0.###]'})); sys.exit(1)
             table_id = filtered_args[3]
             name = filtered_args[4]
             ftype = _get_arg(args, '--type') or 'text'
-            with audit_write('bitable.add-field', target=bt_token, extra={'table_id': table_id, 'name': name, 'type': ftype}):
-                cmd_bitable_add_field(cookies, token_arg, table_id, name, ftype)
+            number_format = _get_arg(args, '--format')
+            with audit_write('bitable.add-field', target=bt_token, extra={'table_id': table_id, 'name': name, 'type': ftype, 'format': number_format}):
+                cmd_bitable_add_field(cookies, token_arg, table_id, name, ftype, number_format)
+        elif sub == 'set-field-format':
+            # bitable set-field-format <token|url> <tableId> <field_id_or_name> <format>
+            if len(filtered_args) < 6:
+                print(json.dumps({'error': 'Usage: bitable set-field-format <token|url> <tableId> <field_id_or_name> <format>'})); sys.exit(1)
+            table_id = filtered_args[3]
+            fid_or_name = filtered_args[4]
+            number_format = filtered_args[5]
+            with audit_write('bitable.set-field-format', target=bt_token, extra={'table_id': table_id, 'field': fid_or_name, 'format': number_format}):
+                cmd_bitable_set_field_format(cookies, token_arg, table_id, fid_or_name, number_format)
         elif sub == 'rename-field':
             # bitable rename-field <token|url> <tableId> <field_id_or_name> <new_name>
             if len(filtered_args) < 6:
@@ -582,7 +681,7 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             with audit_write('bitable.rename-field', target=bt_token, extra={'table_id': table_id}):
                 cmd_bitable_rename_field(cookies, token_arg, table_id, fid_or_name, new_name)
         else:
-            print(json.dumps({'error': 'Usage: bitable create [title] | tables|schema|views|records|download <token|url> [tableId] | set-record|add-record|delete-record|add-field|rename-field ...'})); sys.exit(1)
+            print(json.dumps({'error': 'Usage: bitable create [title] | tables|schema|views|records|download <token|url> [tableId] | set-record|add-record|delete-record|add-field|set-field-format|rename-field ...'})); sys.exit(1)
 
     elif command in ('calendar', 'cal'):
         sub = filtered_args[1] if len(filtered_args) > 1 else None
