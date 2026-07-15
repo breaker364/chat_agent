@@ -233,6 +233,40 @@ def _normalize_run_python_file_payload(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _normalize_record_primary_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "result_type": str(payload.get("result_type") or "artifact").strip(),
+        "title": str(payload.get("title") or "").strip(),
+        "url": str(payload.get("url") or "").strip(),
+        "path": _normalize_workspace_path_for_key(payload.get("path")),
+        "summary": str(payload.get("summary") or "").strip(),
+        "token": str(payload.get("token") or "").strip(),
+        "table_id": str(payload.get("table_id") or "").strip(),
+        "record_count": _coerce_optional_int(payload.get("record_count")),
+        "verified": _coerce_bool_for_key(payload.get("verified"), False),
+    }
+
+
+def _normalize_task_item_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": str(payload.get("task_id") or "").strip(),
+        "title": str(payload.get("title") or "").strip(),
+        "status": str(payload.get("status") or "pending").strip(),
+        "details": str(payload.get("details") or "").strip(),
+        "artifact_path": _normalize_workspace_path_for_key(payload.get("artifact_path")),
+    }
+
+
+def _normalize_task_item_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": str(payload.get("task_id") or "").strip(),
+        "status": str(payload.get("status") or "").strip(),
+        "title": str(payload.get("title") or "").strip(),
+        "details": str(payload.get("details") or "").strip(),
+        "artifact_path": _normalize_workspace_path_for_key(payload.get("artifact_path")),
+    }
+
+
 def _normalize_task_plan_todo(value: Any, index: int) -> dict[str, str]:
     if hasattr(value, "model_dump"):
         value = value.model_dump()
@@ -300,9 +334,11 @@ def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
     if isinstance(payload, dict) and tool_name == "run_python_file":
         return _normalize_run_python_file_payload(payload)
     if isinstance(payload, dict) and tool_name == "record_primary_result":
-        normalized = dict(payload)
-        normalized["record_count"] = _coerce_optional_int(normalized.get("record_count"))
-        return normalized
+        return _normalize_record_primary_result_payload(payload)
+    if isinstance(payload, dict) and tool_name == "record_task_item":
+        return _normalize_task_item_payload(payload)
+    if isinstance(payload, dict) and tool_name == "update_task_item":
+        return _normalize_task_item_update_payload(payload)
     if tool_name != "update_task_plan" or not isinstance(payload, dict):
         return payload
     todos = payload.get("todos")
@@ -2774,8 +2810,6 @@ _AGENT_TOOLS: list[Any] = [
     record_primary_result,
     record_stage_result,
     update_task_plan,
-    record_task_item,
-    update_task_item,
     record_pitfall,
     query_recent_mcd_orders,
     feishu_login_status,
