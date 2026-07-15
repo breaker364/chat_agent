@@ -907,7 +907,7 @@ async def stream_agent_events(
             tool_result_suppression_queue.setdefault(name, []).append(is_duplicate_display_call)
             if not is_duplicate_display_call:
                 emitted_tool_call_keys.add(display_key)
-            tool_call_names.append(name)
+                tool_call_names.append(name)
             tool_call_history.append(
                 {"phase": "start", "tool": name, "arguments": input_data, "at": time.monotonic()}
             )

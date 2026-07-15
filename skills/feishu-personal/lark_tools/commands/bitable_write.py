@@ -12,6 +12,7 @@ Commands:
     bitable add-record    <token|url> <tableId> <fieldName=value>...
     bitable delete-record <token|url> <tableId> <recordId>
     bitable add-field     <token|url> <tableId> <name> [--type text|number|...]
+    bitable add-fields-batch <token|url> <tableId> <fields_json>
     bitable set-field-format <token|url> <tableId> <fieldId|fieldName> <format>
     bitable rename-field  <token|url> <tableId> <fieldId> <new_name>
 """
@@ -411,6 +412,25 @@ def cmd_bitable_delete_record(cookies, token_or_url: str, table_id: str, record_
     }, indent=2, ensure_ascii=False))
 
 
+def cmd_bitable_delete_records_batch(cookies, token_or_url: str, table_id: str, record_ids: list[str]):
+    """Delete multiple records in one OT submit."""
+    base_token = _resolve(cookies, token_or_url)
+    clean_ids = [str(record_id).strip() for record_id in record_ids if str(record_id).strip()]
+    if not clean_ids:
+        print(json.dumps({'success': False, 'error': 'No record IDs provided'}))
+        return
+    operations = [op_delete_record(table_id, record_id) for record_id in clean_ids]
+    resp = submit_operations(cookies, base_token, table_id, operations)
+    print(json.dumps({
+        'success': True,
+        'obj_token': base_token,
+        'table_id': table_id,
+        'records_deleted': len(clean_ids),
+        'record_ids': clean_ids,
+        'rev': (resp.get('data') or {}).get('rev'),
+    }, indent=2, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------------------
 # Field CRUD commands (Phase 3)
 # ---------------------------------------------------------------------------
@@ -430,6 +450,34 @@ def _field_property_for_type(ftype: int, *, number_format: str | None = None) ->
         return {}
     formatter = (number_format or '0.##########').strip()
     return {'formatter': formatter} if formatter else {}
+
+
+def _normalize_field_spec(field: dict | str, index: int) -> dict:
+    """Normalize a batch field spec into name/type/format values."""
+    if isinstance(field, str):
+        name = field.strip()
+        type_name = 'text'
+        number_format = None
+    elif isinstance(field, dict):
+        name = str(field.get('name') or field.get('field') or '').strip()
+        type_name = str(field.get('type') or field.get('type_name') or 'text').strip() or 'text'
+        number_format = field.get('format')
+        if number_format is None:
+            number_format = field.get('number_format')
+        number_format = str(number_format).strip() if number_format is not None else None
+    else:
+        raise ValueError(f'Field spec #{index} must be an object or string, got: {field!r}')
+    if not name:
+        raise ValueError(f'Field spec #{index} is missing a non-empty name')
+    ftype = _FIELD_TYPE_ALIASES.get(type_name.lower())
+    if ftype is None:
+        raise ValueError(f'Unknown field type for {name!r}: {type_name!r}. Valid: {", ".join(sorted(_FIELD_TYPE_ALIASES))}')
+    return {
+        'name': name,
+        'type_name': type_name,
+        'type': ftype,
+        'format': number_format,
+    }
 
 
 def cmd_bitable_add_field(
@@ -471,6 +519,57 @@ def cmd_bitable_add_field(
         'type': ftype,
         'format': number_format if ftype == 2 and number_format else ('0.##########' if ftype == 2 else None),
         'total_fields': total_after,
+        'views': layout['view_ids'],
+        'rev': (resp.get('data') or {}).get('rev'),
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_bitable_add_fields_batch(
+    cookies,
+    token_or_url: str,
+    table_id: str,
+    fields: list[dict | str],
+):
+    """Append multiple fields with one schema read and one OT submit."""
+    if not isinstance(fields, list):
+        raise ValueError('fields_json must be a JSON array')
+    base_token = _resolve(cookies, token_or_url)
+    layout = _load_table_layout(cookies, base_token, table_id)
+    operations = []
+    added = []
+    for index, raw_field in enumerate(fields, 1):
+        spec = _normalize_field_spec(raw_field, index)
+        new_fid = new_field_id()
+        total_after = layout['field_count'] + index
+        op = op_add_field(
+            table_id=table_id,
+            field_id=new_fid,
+            name=spec['name'],
+            field_type=spec['type'],
+            view_ids=layout['view_ids'],
+            total_after=total_after,
+            property_obj=_field_property_for_type(spec['type'], number_format=spec['format']),
+        )
+        operations.append(op)
+        added.append({
+            'field_id': new_fid,
+            'name': spec['name'],
+            'type': spec['type'],
+            'format': spec['format'] if spec['type'] == 2 and spec['format'] else ('0.##########' if spec['type'] == 2 else None),
+            'total_fields': total_after,
+        })
+
+    if not operations:
+        print(json.dumps({'success': False, 'error': 'No fields provided'}))
+        return
+
+    resp = submit_operations(cookies, base_token, table_id, operations)
+    print(json.dumps({
+        'success': True,
+        'obj_token': base_token,
+        'table_id': table_id,
+        'fields_added': len(added),
+        'fields': added,
         'views': layout['view_ids'],
         'rev': (resp.get('data') or {}).get('rev'),
     }, indent=2, ensure_ascii=False))

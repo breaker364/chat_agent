@@ -377,15 +377,20 @@ def _append_result_locations(final_text: str, result_context: dict[str, Any]) ->
                 lines.append(f"- Records: {primary.get('record_count')}")
     artifacts = result_context.get("artifacts")
     if isinstance(artifacts, list):
+        primary_target = ""
+        if isinstance(primary, dict):
+            primary_target = str(primary.get("url") or primary.get("path") or "")
         primary_artifacts = [
             item for item in artifacts
             if isinstance(item, dict)
             and item.get("role") == "primary"
             and (item.get("url") or item.get("path"))
+            and (item.get("status") in {"written", "verified"} or item.get("record_count") is not None or item.get("verified"))
+            and str(item.get("url") or item.get("path") or "") != primary_target
         ]
         if primary_artifacts and not lines:
             lines.append("**Result Location**")
-        for item in primary_artifacts[:5]:
+        for item in primary_artifacts[:3]:
             target = item.get("url") or item.get("path")
             lines.append(f"- {item.get('title') or item.get('type') or 'Artifact'}: {target}")
     if not lines:
@@ -435,7 +440,7 @@ def _finalize_agent_response(
     if status == "completed" and embedded_status in {"failed", "blocked"}:
         status = embedded_status
         failure_reason = failure_reason or embedded_failure_reason or "Agent execution summary reported an incomplete run."
-    if status == "completed" and unfinished_todos:
+    if status == "completed" and unfinished_todos and embedded_status != "completed":
         status = "blocked"
         failure_reason = failure_reason or "Task plan has unfinished todo items."
     summary = _build_execution_summary(

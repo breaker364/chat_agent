@@ -35,6 +35,9 @@ intent and translates it to the correct CLI command automatically.
 | "批量写入" / "batch write" | `lark bitable add-records-batch <url> <tableId> <json>` |
 | "添加字段" / "add a field" | `lark bitable add-field <url> <tableId> <name> --type <type> [--format <number_format>]` |
 
+For multiple fields or records, use the explicit batch commands instead of
+calling the single-field or single-record command repeatedly.
+
 ### Complete bitable command reference
 
 ```text
@@ -43,6 +46,9 @@ lark bitable tables <url-or-token>                  — list all tables
 lark bitable schema <url> [tableId]                 — show field schema
 lark bitable records <url> --table <tbl> --all      — read all records
 lark bitable add-field <url> <tableId> <name> [--type text|number|checkbox|url|datetime] [--format 0.###]
+lark bitable add-fields-batch <url> <tableId> <json_array>
+lark bitable add-fields-batch <url> <tableId> --json-file <path>
+lark bitable add-fields-batch <url> <tableId> @<path>
 lark bitable add-record <url> <tableId> <field=value>...
 lark bitable add-records-batch <url> <tableId> <json_array>
 lark bitable add-records-batch <url> <tableId> --json-file <path>
@@ -61,10 +67,14 @@ lark bitable download <url> [tableId] [--out path]
 ```
 1. lark bitable create <title>                     → get obj_token + url
 2. lark bitable tables <url>                        → get table_id
-3. lark bitable add-field <url> <tableId> <name>    → repeat for each field, get field IDs; use `--format 0.###` or similar for precise number display
-4. lark bitable add-records-batch <url> <tableId> '[{"fldXXX":"val1","fldYYY":"val2"}, ...]'
+3. lark bitable add-fields-batch <url> <tableId> '[{"name":"Name","type":"text"},{"name":"Amount","type":"number","format":"0.###"}]'
+4. lark bitable add-records-batch <url> <tableId> '[{"Name":"row1","Amount":1.23}, ...]'
 5. lark bitable records <url> --table <tbl> --all   → verify
 ```
+
+When passing a large JSON payload, write it to `tmp/` and call the batch command
+with `@<path>` or `--json-file <path>`. Relative paths are resolved against the
+agent workspace as well as the skill working directory.
 
 ## When to use
 

@@ -176,6 +176,63 @@ def _coerce_optional_int(value: Any) -> Any:
     return value
 
 
+def _normalize_workspace_path_for_key(path: Any) -> str:
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        root = _workspace_root()
+        candidate = Path(raw).expanduser()
+        target = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        try:
+            return target.relative_to(root).as_posix()
+        except ValueError:
+            return str(target)
+    except Exception:
+        return raw.replace("\\", "/").lstrip("./")
+
+
+def _content_hash_for_key(value: Any) -> str:
+    return _arguments_hash("" if value is None else str(value))
+
+
+def _coerce_bool_for_key(value: Any, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _normalize_write_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": _normalize_workspace_path_for_key(payload.get("path")),
+        "content_hash": _content_hash_for_key(payload.get("content")),
+        "overwrite": _coerce_bool_for_key(payload.get("overwrite"), True),
+    }
+
+
+def _normalize_run_python_file_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        timeout_seconds = int(payload.get("timeout_seconds", _PYTHON_RUN_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        timeout_seconds = _PYTHON_RUN_TIMEOUT_SECONDS
+    timeout_seconds = min(_PYTHON_RUN_MAX_TIMEOUT_SECONDS, max(1, timeout_seconds))
+    return {
+        "path": _normalize_workspace_path_for_key(payload.get("path")),
+        "cli_args": str(payload.get("cli_args") or ""),
+        "timeout_seconds": timeout_seconds,
+        "working_directory": _normalize_workspace_path_for_key(payload.get("working_directory") or ""),
+        "python_executable": str(payload.get("python_executable") or "").strip(),
+    }
+
+
 def _normalize_task_plan_todo(value: Any, index: int) -> dict[str, str]:
     if hasattr(value, "model_dump"):
         value = value.model_dump()
@@ -238,6 +295,10 @@ def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
         normalized = _normalize_feishu_batch_write_payload(payload)
         if normalized is not None:
             return normalized
+    if isinstance(payload, dict) and tool_name == "write_file":
+        return _normalize_write_file_payload(payload)
+    if isinstance(payload, dict) and tool_name == "run_python_file":
+        return _normalize_run_python_file_payload(payload)
     if isinstance(payload, dict) and tool_name == "record_primary_result":
         normalized = dict(payload)
         normalized["record_count"] = _coerce_optional_int(normalized.get("record_count"))
@@ -499,6 +560,17 @@ def _feishu_bitable_url_from_request(request: str, token: str, table_id: str = "
     return f"{origin}/base/{token}{suffix}"
 
 
+def _primary_result_is_stronger_than_created(primary: Any) -> bool:
+    if not isinstance(primary, dict):
+        return False
+    status = str(primary.get("status") or "").lower()
+    if status in {"written", "verified"}:
+        return True
+    if primary.get("record_count") is not None:
+        return True
+    return bool(primary.get("verified"))
+
+
 def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> None:
     session_id = _current_session_id()
     if not session_id:
@@ -576,18 +648,27 @@ def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> 
                         },
                     )
                 elif obj.get("url") and (obj.get("obj_token") or obj.get("wiki_token")):
-                    store.record_primary_result(
-                        session_id,
-                        {
-                            "type": "feishu_bitable",
-                            "title": str(obj.get("title") or "Feishu Bitable"),
-                            "status": "created",
-                            "url": str(obj.get("url") or ""),
-                            "token": str(obj.get("obj_token") or ""),
-                            "summary": "Feishu Bitable created.",
-                            "source_tool": tool_name,
-                        },
-                    )
+                    payload = {
+                        "type": "feishu_bitable",
+                        "title": str(obj.get("title") or "Feishu Bitable"),
+                        "status": "created",
+                        "url": str(obj.get("url") or ""),
+                        "token": str(obj.get("obj_token") or ""),
+                        "summary": "Feishu Bitable created.",
+                        "source_tool": tool_name,
+                    }
+                    progress = store.get_resume_context(session_id)
+                    primary = progress.get("primary_result") if isinstance(progress, dict) else None
+                    if _primary_result_is_stronger_than_created(primary):
+                        store.register_artifact(
+                            session_id,
+                            {
+                                **payload,
+                                "role": "intermediate",
+                            },
+                        )
+                    else:
+                        store.record_primary_result(session_id, payload)
                 elif obj.get("tableId") and obj.get("total") is not None:
                     progress = store.get_resume_context(session_id)
                     primary = progress.get("primary_result") if isinstance(progress, dict) else None

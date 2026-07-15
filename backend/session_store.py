@@ -505,6 +505,8 @@ class SessionStore:
             "token": str(artifact.get("token") or artifact.get("base_token") or ""),
             "table_id": str(artifact.get("table_id") or ""),
             "record_count": _coerce_optional_int(artifact.get("record_count")),
+            "status": str(artifact.get("status") or ""),
+            "verified": bool(artifact.get("verified", False)),
             "summary": str(artifact.get("summary") or ""),
             "created_at": artifact.get("created_at") or _now_iso(),
             "updated_at": _now_iso(),

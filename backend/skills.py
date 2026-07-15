@@ -274,13 +274,19 @@ def _skill_runner_path(skill: SkillDefinition) -> Path | None:
     return runner if runner.exists() else None
 
 
-def _execute_skill_runner_sync(skill: SkillDefinition, params: dict[str, Any]) -> str:
+def _execute_skill_runner_sync(
+    skill: SkillDefinition,
+    params: dict[str, Any],
+    workspace_root: Path | None = None,
+) -> str:
     runner = _skill_runner_path(skill)
     if runner is None:
         raise FileNotFoundError(f"No skill runner found for skill '{skill.name}'.")
 
     env = dict(os.environ)
     env["CHAT_AGENT_SKILL_ROOT"] = str(Path(skill.source_path).resolve())
+    if workspace_root is not None:
+        env["CHAT_AGENT_WORKSPACE_ROOT"] = str(workspace_root.resolve())
     process = subprocess.run(
         [sys.executable, str(runner)],
         input=json.dumps(params, ensure_ascii=False).encode("utf-8"),
@@ -314,7 +320,7 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
 
     runner = _skill_runner_path(skill)
     if runner is not None:
-        return await asyncio.to_thread(_execute_skill_runner_sync, skill, params)
+        return await asyncio.to_thread(_execute_skill_runner_sync, skill, params, root)
 
     cfg = load_llm_config()
     llm = create_chat_deepseek(cfg, temperature=0.3, streaming=False, max_tokens=8192)

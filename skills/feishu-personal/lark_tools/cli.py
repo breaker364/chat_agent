@@ -15,7 +15,10 @@ from pathlib import Path
 from lark_tools.intranet import assert_on_intranet
 from lark_tools.proto import encode_message
 from lark_tools.gateway import send_gateway_request, decode_response
-from lark_tools.auth import load_cookies, check_auth, cmd_login
+from lark_tools.auth import (
+    load_cookies, check_auth, cmd_login,
+    get_current_user_id, load_user_name,
+)
 from lark_tools.commands.search import SEARCH_CONFIGS, cmd_search
 from lark_tools.commands.chat import (
     get_today_time_range, cmd_chat_today, cmd_chat_messages, cmd_chat_p2p, cmd_chat_thread,
@@ -38,7 +41,9 @@ from lark_tools.commands.bitable import (
 from lark_tools.commands.bitable_write import (
     cmd_bitable_create, cmd_bitable_set_record, cmd_bitable_add_record,
     cmd_bitable_delete_record, cmd_bitable_add_field, cmd_bitable_rename_field,
-    cmd_bitable_add_records_batch, cmd_bitable_set_field_format,
+    cmd_bitable_add_records_batch, cmd_bitable_add_fields_batch,
+    cmd_bitable_delete_records_batch, cmd_bitable_set_field_format,
+    cmd_bitable_add_table,
 )
 from lark_tools.commands.calendar import cmd_calendar_list, cmd_calendar_events, cmd_calendar_detail
 from lark_tools.commands.minutes import (
@@ -68,20 +73,37 @@ def _strip_matching_outer_quotes(value: str) -> str:
     return text
 
 
-def _load_batch_records_json(filtered_args: list, start_index: int = 4):
-    """Load add-records-batch payload from argv or --json-file.
+def _resolve_existing_input_file(path_text: str) -> Path:
+    """Resolve CLI input files from cwd, then the agent workspace if present."""
+    raw_path = Path(path_text).expanduser()
+    if raw_path.is_absolute():
+        return raw_path
 
-    JSON payloads can contain spaces, so all remaining argv parts are joined
-    before parsing. This keeps explicit CLI usage and model-generated commands
-    robust without relying on entity-specific assumptions.
-    """
+    candidates = [Path.cwd() / raw_path]
+    workspace_root = os.environ.get('CHAT_AGENT_WORKSPACE_ROOT')
+    if workspace_root:
+        candidates.append(Path(workspace_root).expanduser() / raw_path)
+    for parent in Path.cwd().parents:
+        candidates.append(parent / raw_path)
+
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    return candidates[0].resolve()
+
+
+def _load_json_array_from_args(filtered_args: list, start_index: int, label: str):
+    """Load a JSON array from argv, --json-file, or @path."""
     if '--json-file' in filtered_args:
         file_index = filtered_args.index('--json-file')
         if file_index + 1 >= len(filtered_args):
             raise ValueError('--json-file requires a path')
-        path = Path(filtered_args[file_index + 1]).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
+        path = _resolve_existing_input_file(filtered_args[file_index + 1])
         if not path.is_file():
             raise ValueError(f'JSON file not found: {path}')
         raw_json = path.read_text(encoding='utf-8-sig')
@@ -89,22 +111,27 @@ def _load_batch_records_json(filtered_args: list, start_index: int = 4):
         raw_json = ' '.join(filtered_args[start_index:]) if len(filtered_args) > start_index else '[]'
     raw_json = _strip_matching_outer_quotes(raw_json)
     if raw_json.startswith('@'):
-        path = Path(raw_json[1:]).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
+        path = _resolve_existing_input_file(raw_json[1:])
         if not path.is_file():
             raise ValueError(f'JSON file not found: {path}')
         raw_json = path.read_text(encoding='utf-8-sig')
     try:
-        records = json.loads(raw_json)
+        payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            'Invalid JSON for records. Pass a JSON array of objects as one argument, '
-            'or use --json-file. Example: '
-            'lark bitable add-records-batch <url> <tableId> '
-            '\'[{"fldXXX":"value"}]\'. '
-            f'Parser error: {exc}'
-        ) from exc
+        raise ValueError(f'Invalid JSON for {label}. Parser error: {exc}') from exc
+    if not isinstance(payload, list):
+        raise ValueError(f'{label} must be a JSON array')
+    return payload
+
+
+def _load_batch_records_json(filtered_args: list, start_index: int = 4):
+    """Load add-records-batch payload from argv or --json-file.
+
+    JSON payloads can contain spaces, so all remaining argv parts are joined
+    before parsing. This keeps explicit CLI usage and model-generated commands
+    robust without relying on entity-specific assumptions.
+    """
+    records = _load_json_array_from_args(filtered_args, start_index, 'records')
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         raise ValueError('records_json must be a JSON array of objects')
     return records
@@ -646,12 +673,22 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             table_id, record_ids = _parse_delete_records_args(args, filtered_args)
             if not table_id or not record_ids:
                 print(json.dumps({'error': 'Usage: bitable delete-records <token|url> <tableId> <recordId>... OR bitable delete-records <token|url> --table <tableId> --record-ids <id1,id2>'})); sys.exit(1)
-            deleted = []
             with audit_write('bitable.delete-records', target=bt_token, extra={'table_id': table_id, 'count': len(record_ids)}):
-                for record_id in record_ids:
-                    cmd_bitable_delete_record(cookies, token_arg, table_id, record_id)
-                    deleted.append(record_id)
-            print(json.dumps({'success': True, 'table_id': table_id, 'records_deleted': len(deleted), 'record_ids': deleted}, ensure_ascii=False, indent=2))
+                cmd_bitable_delete_records_batch(cookies, token_arg, table_id, record_ids)
+        elif sub == 'add-fields-batch':
+            # bitable add-fields-batch <token|url> <tableId> <fields_json>
+            # bitable add-fields-batch <token|url> <tableId> --json-file <path>
+            # bitable add-fields-batch <token|url> <tableId> @path
+            # fields_json: [{"name":"Amount","type":"number","format":"0.###"}, ...]
+            if len(filtered_args) < 4:
+                print(json.dumps({'error': 'Usage: bitable add-fields-batch <token|url> <tableId> <fields_json|--json-file path>'})); sys.exit(1)
+            table_id = filtered_args[3]
+            try:
+                fields = _load_json_array_from_args(filtered_args, 4, 'fields')
+            except ValueError as exc:
+                print(json.dumps({'error': str(exc)}, ensure_ascii=False)); sys.exit(1)
+            with audit_write('bitable.add-fields-batch', target=bt_token, extra={'table_id': table_id, 'count': len(fields)}):
+                cmd_bitable_add_fields_batch(cookies, token_arg, table_id, fields)
         elif sub == 'add-field':
             # bitable add-field <token|url> <tableId> <name> [--type text|number|...] [--format 0.###]
             if len(filtered_args) < 5:
@@ -680,8 +717,28 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             new_name = filtered_args[5]
             with audit_write('bitable.rename-field', target=bt_token, extra={'table_id': table_id}):
                 cmd_bitable_rename_field(cookies, token_arg, table_id, fid_or_name, new_name)
+        elif sub == 'add-table':
+            # bitable add-table <token|url> <name>
+            if len(filtered_args) < 4:
+                print(json.dumps({'error': 'Usage: bitable add-table <token|url> <name>'})); sys.exit(1)
+            name = filtered_args[3]
+            owner_user_id = get_current_user_id(cookies) or ''
+            owner_name = load_user_name() or owner_user_id or 'current user'
+            with audit_write('bitable.add-table', target=bt_token, extra={'name': name}):
+                cmd_bitable_add_table(
+                    cookies,
+                    token_arg,
+                    name,
+                    user_ticket='',
+                    owner_user_id=owner_user_id,
+                    owner_name=owner_name,
+                    owner_en_name=owner_name,
+                    local_rev=0,
+                    member_id=None,
+                    table_index=1,
+                )
         else:
-            print(json.dumps({'error': 'Usage: bitable create [title] | tables|schema|views|records|download <token|url> [tableId] | set-record|add-record|delete-record|add-field|set-field-format|rename-field ...'})); sys.exit(1)
+            print(json.dumps({'error': 'Usage: bitable create [title] | tables|schema|views|records|download <token|url> [tableId] | set-record|add-record|delete-record|delete-records|add-field|add-fields-batch|add-table|set-field-format|rename-field ...'})); sys.exit(1)
 
     elif command in ('calendar', 'cal'):
         sub = filtered_args[1] if len(filtered_args) > 1 else None
