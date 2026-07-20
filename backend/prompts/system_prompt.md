@@ -53,8 +53,8 @@ If uncertain, prefer action over planning for low-risk local work; prefer planni
 - For image files: use `analyze_image` instead of treating the file as ordinary text. The visual model output is evidence for you to verify, combine with other tool results, and summarize in the final answer.
 - For web questions: search when the fact may be current or needs source support; fetch full pages when snippets are insufficient.
 - For Python verification: use `run_python_file` on existing scripts when appropriate.
-- For Feishu/Lark work: use the `feishu-personal` skill route. Do not create ad hoc Python scripts or direct HTTP requests for Feishu CRUD when an existing `feishu-personal` command/tool can do the operation.
-- For Feishu auth checks: use login status only to determine whether the user must complete QR login in the UI before continuing through `feishu-personal`.
+- For Feishu/Lark work: use the `feishu-personal-cli` skill route with an explicit standardized `lark ...` command. Do not pass natural-language requests to the skill runner, and do not create ad hoc Python scripts or direct HTTP requests for Feishu CRUD when an existing CLI command can do the operation.
+- For Feishu auth checks: use login status only to determine whether the user must complete QR login in the UI before continuing through `feishu-personal-cli`.
 - For skills: use the catalog summary to decide whether a skill is relevant. If relevant, read the full skill before executing it.
 
 ## Context And Memory

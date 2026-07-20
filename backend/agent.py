@@ -573,6 +573,34 @@ async def stream_agent_events(
             for name, count in sorted(counts.items())
         )
 
+    def summarize_exception_for_user(exc_text: str) -> str:
+        lines = [line.strip() for line in (exc_text or "").splitlines() if line.strip()]
+        exception_line = ""
+        for line in reversed(lines):
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception):", line):
+                exception_line = line
+                break
+        if not exception_line:
+            exception_line = lines[-1] if lines else "Unknown execution error."
+        lowered = exception_line.lower()
+        if "could not determine the requested operation" in lowered:
+            diagnosis = "The skill runner could not map the request to a supported standardized command."
+        elif "missing <token|url>" in lowered:
+            diagnosis = "The command is missing a required token or URL."
+        elif "exceeded" in lowered:
+            diagnosis = "A runtime budget or tool-call limit was exceeded."
+        else:
+            diagnosis = "A tool or subprocess failed and the task did not complete."
+        return (
+            "任务未完成。\n\n"
+            "**错误分析**\n"
+            f"- 异常摘要: `{exception_line}`\n"
+            f"- 可能原因: {diagnosis}\n"
+            "- 处理要求: 不应直接返回原始 traceback，应修正工具命令、参数或执行路径后继续。\n\n"
+            "**建议下一步**\n"
+            "- 根据异常摘要调整调用；如果是命令格式问题，改用标准 CLI 命令后重试。"
+        )
+
     def ensure_completion_summary(
         final_text: str,
         *,
@@ -869,17 +897,17 @@ async def stream_agent_events(
                 "event": "error",
                 "data": json.dumps(
                     {
-                        "message": str(exc),
+                        "message": summarize_exception_for_user(str(exc)),
                         "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
                     },
                     ensure_ascii=False,
                 ),
             }
-            fallback_text = collected_text.strip() or f"Agent execution failed: {exc}"
+            fallback_text = collected_text.strip() or summarize_exception_for_user(str(exc))
             yield {
                 "event": "done",
                 "data": json.dumps(
-                    ensure_completion_summary(fallback_text, status="failed", failure_reason=str(exc)),
+                    ensure_completion_summary(fallback_text, status="failed", failure_reason="agent/tool execution error"),
                     ensure_ascii=False,
                 ),
             }

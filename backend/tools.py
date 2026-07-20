@@ -304,8 +304,7 @@ def _extract_json_array_from_text(text: str) -> Any | None:
 
 
 def _normalize_feishu_batch_write_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-    if str(payload.get("skill_name") or "") != "feishu-personal":
-        return None
+    return None
     request = str(payload.get("request") or "")
     lowered = request.lower()
     if "add-records-batch" not in lowered and "batch" not in lowered and "批量" not in request:
@@ -316,7 +315,7 @@ def _normalize_feishu_batch_write_payload(payload: dict[str, Any]) -> dict[str, 
     table_match = re.search(r"\b(tbl[A-Za-z0-9]+)\b", request)
     target_match = re.search(r"https?://[^\s，。；;]+|\b[A-Za-z0-9]{20,}\b", request)
     return {
-        "skill_name": "feishu-personal",
+        "skill_name": str(payload.get("skill_name") or ""),
         "operation": "bitable.add-records-batch",
         "target": target_match.group(0) if target_match else "",
         "table_id": table_match.group(0) if table_match else "",
@@ -325,10 +324,6 @@ def _normalize_feishu_batch_write_payload(payload: dict[str, Any]) -> dict[str, 
 
 
 def _normalize_tool_payload_for_key(tool_name: str, payload: Any) -> Any:
-    if isinstance(payload, dict) and tool_name == "use_skill":
-        normalized = _normalize_feishu_batch_write_payload(payload)
-        if normalized is not None:
-            return normalized
     if isinstance(payload, dict) and tool_name == "write_file":
         return _normalize_write_file_payload(payload)
     if isinstance(payload, dict) and tool_name == "run_python_file":
@@ -660,66 +655,6 @@ def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> 
                     "verified": False,
                 },
             )
-        elif tool_name == "use_skill" and str(args.get("skill_name") or "") == "feishu-personal":
-            request = str(args.get("request") or "")
-            for obj in _json_objects_from_text(content):
-                if obj.get("success") is not True:
-                    continue
-                if obj.get("records_written") is not None and obj.get("obj_token") and obj.get("table_id"):
-                    token = str(obj.get("obj_token") or "")
-                    table_id = str(obj.get("table_id") or "")
-                    store.record_primary_result(
-                        session_id,
-                        {
-                            "type": "feishu_bitable",
-                            "title": "Feishu Bitable records",
-                            "status": "written",
-                            "url": _feishu_bitable_url_from_request(request, token, table_id),
-                            "token": token,
-                            "table_id": table_id,
-                            "record_count": obj.get("records_written"),
-                            "verified": False,
-                            "summary": f"Written {obj.get('records_written')} records.",
-                            "source_tool": tool_name,
-                        },
-                    )
-                elif obj.get("url") and (obj.get("obj_token") or obj.get("wiki_token")):
-                    payload = {
-                        "type": "feishu_bitable",
-                        "title": str(obj.get("title") or "Feishu Bitable"),
-                        "status": "created",
-                        "url": str(obj.get("url") or ""),
-                        "token": str(obj.get("obj_token") or ""),
-                        "summary": "Feishu Bitable created.",
-                        "source_tool": tool_name,
-                    }
-                    progress = store.get_resume_context(session_id)
-                    primary = progress.get("primary_result") if isinstance(progress, dict) else None
-                    if _primary_result_is_stronger_than_created(primary):
-                        store.register_artifact(
-                            session_id,
-                            {
-                                **payload,
-                                "role": "intermediate",
-                            },
-                        )
-                    else:
-                        store.record_primary_result(session_id, payload)
-                elif obj.get("tableId") and obj.get("total") is not None:
-                    progress = store.get_resume_context(session_id)
-                    primary = progress.get("primary_result") if isinstance(progress, dict) else None
-                    if isinstance(primary, dict) and str(primary.get("table_id") or "") == str(obj.get("tableId")):
-                        store.record_primary_result(
-                            session_id,
-                            {
-                                **primary,
-                                "status": "verified",
-                                "verified": True,
-                                "record_count": obj.get("total"),
-                                "summary": f"Verified table contains {obj.get('total')} records.",
-                                "source_tool": tool_name,
-                            },
-                        )
     except Exception as exc:
         logger.debug("Auto result registration failed for %s: %s", tool_name, exc)
 
@@ -1569,8 +1504,8 @@ def _feishu_crud_script_block_reason(content: str) -> str:
     )
     if has_feishu_marker and has_write_intent:
         return (
-            "Feishu/Lark CRUD scripts are blocked. Use the feishu-personal "
-            "skill route instead, for example: "
+            "Feishu/Lark CRUD scripts are blocked. Use the CLI-only Feishu skill "
+            "route with an explicit lark command instead, for example: "
             "lark bitable add-records-batch <url> <tableId> --json-file <path>."
         )
     return ""
@@ -1583,7 +1518,7 @@ def _blocked_feishu_script_payload(path: str, reason: str) -> str:
             "reason": reason,
             "path": path,
             "suggested_tool": "use_skill",
-            "suggested_skill": "feishu-personal",
+            "suggested_skill": "feishu-personal-cli",
         },
         ensure_ascii=False,
         indent=2,

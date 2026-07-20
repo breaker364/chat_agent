@@ -24,7 +24,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-
 @dataclass
 class SkillDefinition:
     name: str
@@ -358,7 +357,13 @@ class SkillDetailInput(BaseModel):
 
 class SkillExecuteInput(BaseModel):
     skill_name: str = Field(..., description="Installed skill name.")
-    request: str = Field(..., description="Natural-language request for the skill.")
+    request: str = Field(
+        ...,
+        description=(
+            "Skill request. For CLI-only skills, pass the exact standardized command; "
+            "natural language is not accepted."
+        ),
+    )
 
 
 def build_skill_tools(root: Path) -> list[Any]:

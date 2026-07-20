@@ -1,0 +1,42 @@
+<h2>实时工作动态布局</h2>
+<p class="subtitle">面向非开发人员的执行状态与技术调试信息分层展示</p>
+
+<div class="cards">
+  <div class="card" data-choice="inline-timeline" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">对话</div>
+        <div class="mockup-body">
+          <p><strong>你：</strong>帮我分析并处理这个问题</p>
+          <div style="border-left:3px solid #4f8cff;padding:10px 12px;margin:10px 0">
+            <p><strong>Agent 工作动态 · 正在进行</strong></p>
+            <p>已理解：需要定位失败原因并给出可执行处理方案。</p>
+            <p>正在检查：正在核对调用结果与错误信息。</p>
+            <p>下一步：根据核对结果判断是否重试或说明阻塞原因。</p>
+            <p>进度：第 2 步，共 3 步</p>
+          </div>
+          <p><strong>Agent：</strong>我已确认问题来自……</p>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>对话内实时时间线</h3>
+      <p>工作动态紧随本轮回答，Debug stream 保持在右侧独立显示。</p>
+    </div>
+  </div>
+  <div class="card" data-choice="separate-panel" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">对话与执行状态并列</div>
+        <div class="mockup-body" style="display:flex;gap:8px">
+          <div style="flex:1;border:1px solid #999;padding:8px">对话内容</div>
+          <div style="flex:1;border:1px solid #4f8cff;padding:8px">实时工作动态<br/><br/>已理解<br/>正在检查<br/>下一步<br/>进度</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>独立执行面板</h3>
+      <p>状态更醒目，但阅读时需要在两块区域间来回切换。</p>
+    </div>
+  </div>
+</div>

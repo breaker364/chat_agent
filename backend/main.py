@@ -406,6 +406,58 @@ def _looks_like_raw_failure_output(final_text: str) -> bool:
     )
 
 
+def _extract_exception_summary(text: str) -> tuple[str, str]:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    exception_line = ""
+    for line in reversed(lines):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception):", line):
+            exception_line = line
+            break
+    if not exception_line:
+        for line in reversed(lines):
+            if ":" in line and not line.startswith("File "):
+                exception_line = line
+                break
+    if not exception_line:
+        return "Unknown execution error.", "The runtime returned an exception without a concise final error line."
+
+    lowered = exception_line.lower()
+    if "could not determine the requested operation" in lowered:
+        diagnosis = "The skill runner could not map the request to a supported standardized command."
+    elif "missing <token|url>" in lowered:
+        diagnosis = "The command is missing a required target token or URL."
+    elif "exceeded" in lowered:
+        diagnosis = "A runtime budget or tool-call limit was exceeded."
+    elif "permission" in lowered or "access denied" in lowered:
+        diagnosis = "The operation hit a permission or sandbox boundary."
+    else:
+        diagnosis = "A tool or subprocess failed and the task did not complete."
+    return exception_line, diagnosis
+
+
+def _summarize_raw_failure_output(final_text: str, fallback_reason: str = "") -> str:
+    exception_line, diagnosis = _extract_exception_summary(final_text or fallback_reason)
+    return (
+        "任务未完成。\n\n"
+        "**错误分析**\n"
+        f"- 异常摘要: `{exception_line}`\n"
+        f"- 可能原因: {diagnosis}\n"
+        "- 处理要求: 不应把原始 traceback 直接返回给用户，应基于异常摘要修正命令、参数或执行路径后继续。\n\n"
+        "**建议下一步**\n"
+        "- 根据上面的异常摘要调整工具调用；如果是命令格式问题，改用标准 CLI 命令后重试。"
+    )
+
+
+def _sanitize_failure_reason(reason: str) -> str:
+    text = (reason or "").strip()
+    if not text:
+        return ""
+    if "traceback (most recent call last)" in text.lower():
+        exception_line, diagnosis = _extract_exception_summary(text)
+        return f"{exception_line} ({diagnosis})"
+    return text
+
+
 def _extract_embedded_execution_status(final_text: str) -> tuple[str, str]:
     """Recover status emitted inside the agent's final execution summary."""
     status = ""
@@ -436,10 +488,12 @@ def _finalize_agent_response(
     if status == "completed" and _looks_like_raw_failure_output(final_text):
         status = "failed"
         failure_reason = failure_reason or "Final response contains raw execution failure output."
+        final_text = _summarize_raw_failure_output(final_text, failure_reason)
     embedded_status, embedded_failure_reason = _extract_embedded_execution_status(final_text)
     if status == "completed" and embedded_status in {"failed", "blocked"}:
         status = embedded_status
         failure_reason = failure_reason or embedded_failure_reason or "Agent execution summary reported an incomplete run."
+    failure_reason = _sanitize_failure_reason(failure_reason)
     if status == "completed" and unfinished_todos and embedded_status != "completed":
         status = "blocked"
         failure_reason = failure_reason or "Task plan has unfinished todo items."
@@ -910,6 +964,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             status="completed" if assistant_text.strip() else "failed",
                             failure_reason="" if assistant_text.strip() else "Agent returned no final text.",
                         )
+                        event = {"event": "done", "data": json.dumps(assistant_text, ensure_ascii=False)}
                         final_usage = normalize_usage(run_usage, output_text=assistant_text)
                         store.replace_last_assistant_message(
                             session["session_id"],
