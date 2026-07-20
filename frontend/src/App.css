@@ -712,6 +712,36 @@ body,
   margin-left: 44px;
 }
 
+.agent-activity {
+  margin: 8px 0 8px 44px;
+  border-left: 3px solid var(--accent, #4f8cff);
+  padding: 10px 12px;
+  background: var(--tool-bg);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.agent-activity-title {
+  color: var(--text-primary);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.agent-activity-item {
+  padding: 6px 0;
+  border-top: 1px solid var(--tool-border);
+  line-height: 1.5;
+}
+
+.agent-activity-item:first-of-type { border-top: 0; }
+.agent-activity-summary { color: var(--text-primary); }
+.agent-activity-item.completed { border-left: 2px solid #35a66b; padding-left: 8px; }
+.agent-activity-item.blocked { border-left: 2px solid #d45b5b; padding-left: 8px; }
+
+@media (max-width: 700px) {
+  .agent-activity { margin-left: 0; font-size: 12px; }
+}
+
 .tool-message,
 .tool-result-message,
 .tool-group-message,

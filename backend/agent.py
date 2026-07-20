@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -31,10 +32,139 @@ MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_TOTAL_CHARS = 24_000
 MAX_HISTORY_MESSAGE_CHARS = 4_000
 HEARTBEAT_EMIT_INTERVAL_SECONDS = 3
+_SENSITIVE_TEXT_RE = re.compile(
+    r"(?:api[_-]?key|authorization|token|password|secret|cookie|credential)\s*[:=]?\s*\S+",
+    re.IGNORECASE,
+)
 
 
 def estimate_tokens_from_text(text: str) -> int:
     return count_text_tokens(text or "")
+
+
+def _safe_summary(value: Any, limit: int = 240) -> str:
+    """Return a short user-safe summary without raw diagnostics or credentials."""
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    safe_lines = [
+        line for line in lines
+        if "traceback" not in line.lower() and not _SENSITIVE_TEXT_RE.search(line)
+    ]
+    return " ".join(safe_lines)[:limit]
+
+
+def build_exception_analysis_context(
+    *,
+    exc_text: str,
+    active_tool: str | None,
+    tool_call_history: list[dict[str, Any]],
+    tool_errors: list[dict[str, Any]],
+    latest_activity: dict[str, Any] | None,
+    partial_response: str,
+) -> dict[str, Any]:
+    """Collect bounded, sanitized evidence for a user-facing failure analysis."""
+    exception_summary = ""
+    for line in str(exc_text or "").splitlines():
+        candidate = line.strip()
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception):", candidate):
+            exception_summary = candidate
+            break
+    exception_summary = _safe_summary(exception_summary or exc_text, 300) or "Unknown execution error."
+
+    recent_tools = [
+        str(item.get("tool") or "")[:80]
+        for item in tool_call_history[-8:]
+        if isinstance(item, dict) and item.get("tool")
+    ]
+    recent_errors = [
+        {"tool": str(item.get("tool") or "tool")[:80], "summary": _safe_summary(item.get("message"), 180) or "Tool failed."}
+        for item in tool_errors[-5:]
+        if isinstance(item, dict)
+    ]
+    activity_summary = _safe_summary((latest_activity or {}).get("summary"), 240)
+    return {
+        "exception_summary": exception_summary,
+        "active_tool": str(active_tool or "")[:80],
+        "recent_tools": recent_tools,
+        "recent_errors": recent_errors,
+        "latest_activity": activity_summary,
+        "partial_response": _safe_summary(partial_response, 800),
+    }
+
+
+_EXCEPTION_ANALYSIS_FIELDS = (
+    "what_happened",
+    "likely_cause",
+    "completion_status",
+    "next_step",
+)
+
+
+async def analyze_exception_for_user(context: dict[str, Any], invoke_analysis: Any) -> dict[str, str] | None:
+    """Run an injectable analyzer and accept only complete, safe structured output."""
+    try:
+        raw = invoke_analysis(context)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        if hasattr(raw, "content"):
+            raw = raw.content
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(parsed, dict):
+            return None
+        normalized: dict[str, str] = {}
+        for field in _EXCEPTION_ANALYSIS_FIELDS:
+            value = str(parsed.get(field) or "").strip()
+            if not value or len(value) > 600 or "traceback" in value.lower() or _SENSITIVE_TEXT_RE.search(value):
+                return None
+            normalized[field] = value
+        return normalized
+    except Exception:
+        return None
+
+
+def format_exception_analysis(analysis: dict[str, str]) -> str:
+    """Render a validated exception analysis without exposing raw diagnostics."""
+    return (
+        "任务未完成。\n\n"
+        "**问题分析**\n"
+        f"- 发生情况：{analysis['what_happened']}\n"
+        f"- 可能原因：{analysis['likely_cause']}\n"
+        f"- 完成情况：{analysis['completion_status']}\n\n"
+        "**建议下一步**\n"
+        f"- {analysis['next_step']}"
+    )
+
+
+def build_activity_event(
+    *,
+    state: str,
+    summary: str,
+    elapsed_seconds: int | float | None,
+    evidence: str = "",
+    judgment: str = "",
+    next_step: str = "",
+    progress: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a bounded, user-facing activity payload from observable events."""
+    normalized_state = state if state in {"understanding", "working", "judging", "completed", "blocked"} else "working"
+    payload: dict[str, Any] = {
+        "state": normalized_state,
+        "summary": _safe_summary(summary, 300) or "正在处理任务。",
+        "elapsed_seconds": max(0, int(elapsed_seconds or 0)),
+    }
+    for key, value in (("evidence", evidence), ("judgment", judgment), ("next_step", next_step)):
+        safe_value = _safe_summary(value, 300)
+        if safe_value:
+            payload[key] = safe_value
+    if isinstance(progress, dict):
+        current = progress.get("current")
+        total = progress.get("total")
+        if isinstance(current, int) and not isinstance(current, bool) and isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            payload["progress"] = {
+                "current": max(0, min(current, total)),
+                "total": total,
+                "label": _safe_summary(progress.get("label"), 120),
+            }
+    return payload
 
 
 def _format_resume_context(context: dict[str, Any]) -> str:
@@ -215,6 +345,20 @@ async def stream_agent_events(
     last_heartbeat_emitted_at = 0.0
     current_model_usage: dict[str, int] = {}
     accumulated_model_usage: dict[str, int] = {}
+    latest_activity: dict[str, Any] = {}
+
+    def activity_frame(state: str, summary: str, **details: Any) -> dict[str, Any]:
+        nonlocal latest_activity
+        latest_activity = build_activity_event(
+            state=state,
+            summary=summary,
+            elapsed_seconds=max(0, int(time.monotonic() - run_started_at)),
+            evidence=str(details.get("evidence") or ""),
+            judgment=str(details.get("judgment") or ""),
+            next_step=str(details.get("next_step") or ""),
+            progress=details.get("progress"),
+        )
+        return {"event": "activity", "data": json.dumps(latest_activity, ensure_ascii=False)}
 
     def to_jsonable(value: Any) -> Any:
         try:
@@ -573,7 +717,7 @@ async def stream_agent_events(
             for name, count in sorted(counts.items())
         )
 
-    def summarize_exception_for_user(exc_text: str) -> str:
+    def fallback_exception_for_user(exc_text: str) -> str:
         lines = [line.strip() for line in (exc_text or "").splitlines() if line.strip()]
         exception_line = ""
         for line in reversed(lines):
@@ -600,6 +744,30 @@ async def stream_agent_events(
             "**建议下一步**\n"
             "- 根据异常摘要调整调用；如果是命令格式问题，改用标准 CLI 命令后重试。"
         )
+
+    async def summarize_exception_for_user(exc_text: str) -> str:
+        context = build_exception_analysis_context(
+            exc_text=exc_text,
+            active_tool=active_tool,
+            tool_call_history=tool_call_history,
+            tool_errors=tool_errors,
+            latest_activity=latest_activity,
+            partial_response=collected_text,
+        )
+
+        def invoke_analysis(payload: dict[str, Any]) -> Any:
+            cfg = load_llm_config()
+            llm = create_chat_deepseek(cfg, temperature=0.0, streaming=False)
+            prompt = (
+                "You explain an agent failure to an end user. Return JSON only with "
+                "what_happened, likely_cause, completion_status, next_step. "
+                "Use concise Chinese, only state evidence in the context, and never include raw diagnostics, secrets, or tracebacks.\n\n"
+                + json.dumps(payload, ensure_ascii=False)
+            )
+            return llm.invoke([SystemMessage(content="Return valid JSON only."), HumanMessage(content=prompt)])
+
+        analysis = await analyze_exception_for_user(context, lambda payload: asyncio.to_thread(invoke_analysis, payload))
+        return format_exception_analysis(analysis) if analysis else fallback_exception_for_user(exc_text)
 
     def ensure_completion_summary(
         final_text: str,
@@ -803,6 +971,13 @@ async def stream_agent_events(
         version="v2",
     ).__aiter__()
 
+    yield activity_frame(
+        "understanding",
+        "正在理解您的任务并准备处理步骤。",
+        next_step="开始检查可用信息和所需操作。",
+        progress={"current": 1, "total": 3, "label": "理解任务"},
+    )
+
     yield {
         "event": "debug",
         "data": json.dumps(
@@ -851,6 +1026,12 @@ async def stream_agent_events(
                     ensure_ascii=False,
                 ),
             }
+            yield activity_frame(
+                "working",
+                "正在等待当前操作返回结果。",
+                next_step="收到结果后继续判断下一步。",
+                progress={"current": 2, "total": 3, "label": "执行任务"},
+            )
             yield {
                 "event": "debug",
                 "data": json.dumps(
@@ -892,18 +1073,32 @@ async def stream_agent_events(
                         ensure_ascii=False,
                     ),
                 }
+                yield activity_frame(
+                    "judging",
+                    "已发现执行问题，正在根据已有信息调整处理方式。",
+                    next_step="重试未完成的步骤。",
+                    progress={"current": 2, "total": 3, "label": "调整处理"},
+                )
                 continue
+            error_message = await summarize_exception_for_user(str(exc))
+            yield activity_frame(
+                "blocked",
+                "任务因执行问题暂时受阻。",
+                judgment=error_message,
+                next_step="请根据错误分析调整后重试。",
+                progress={"current": 3, "total": 3, "label": "处理受阻"},
+            )
             yield {
                 "event": "error",
                 "data": json.dumps(
                     {
-                        "message": summarize_exception_for_user(str(exc)),
+                        "message": error_message,
                         "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
                     },
                     ensure_ascii=False,
                 ),
             }
-            fallback_text = collected_text.strip() or summarize_exception_for_user(str(exc))
+            fallback_text = collected_text.strip() or error_message
             yield {
                 "event": "done",
                 "data": json.dumps(
@@ -938,6 +1133,12 @@ async def stream_agent_events(
                 tool_call_names.append(name)
             tool_call_history.append(
                 {"phase": "start", "tool": name, "arguments": input_data, "at": time.monotonic()}
+            )
+            yield activity_frame(
+                "working",
+                f"正在执行 {name}。",
+                next_step="等待该操作返回结果。",
+                progress={"current": 2, "total": 3, "label": "执行任务"},
             )
             if name == "web_search":
                 web_search_calls += 1

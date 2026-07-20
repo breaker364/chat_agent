@@ -308,6 +308,32 @@ function ProgressBubble({ message, elapsedSeconds }) {
   );
 }
 
+export function mergeActivityItems(items, activity) {
+  if (!activity?.state) return items;
+  const next = [...items];
+  const last = next[next.length - 1];
+  if (last && last.state === activity.state && ["working", "judging"].includes(activity.state)) {
+    next[next.length - 1] = activity;
+  } else {
+    next.push(activity);
+  }
+  return next;
+}
+
+function AgentActivityTimeline({ items }) {
+  if (!items?.length) return null;
+  return <section className="agent-activity" aria-label="Agent 工作动态">
+    <div className="agent-activity-title">Agent 工作动态</div>
+    {items.map((item, index) => <div className={`agent-activity-item ${item.state || "working"}`} key={`${item.state}-${index}`}>
+      <div className="agent-activity-summary">{item.summary}</div>
+      {item.evidence ? <div>已确认：{item.evidence}</div> : null}
+      {item.judgment ? <div>判断：{item.judgment}</div> : null}
+      {item.next_step ? <div>下一步：{item.next_step}</div> : null}
+      {item.progress ? <div>进度：{item.progress.current}/{item.progress.total}{item.progress.label ? ` · ${item.progress.label}` : ""}</div> : null}
+    </div>)}
+  </section>;
+}
+
 function ToolEvents({ events }) {
   const [expanded, setExpanded] = useState(false);
   if (!events?.length) return null;
@@ -989,6 +1015,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [toolEvents, setToolEvents] = useState([]);
+  const [activityItems, setActivityItems] = useState([]);
   const [debugEvents, setDebugEvents] = useState([]);
   const [subagentTasks, setSubagentTasks] = useState([]);
   const [subagentNotifications, setSubagentNotifications] = useState([]);
@@ -1299,6 +1326,7 @@ export default function App() {
     }
     setDebugEvents([]);
     setToolEvents([]);
+    setActivityItems([]);
     setSubagentTasks([]);
     setSubagentNotifications([]);
     setTaskProgress(null);
@@ -1637,7 +1665,12 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const runState = { assistantContent: "", tools: [], debug: [], usage: null };
+    const runState = { assistantContent: "", tools: [], debug: [], activities: [], usage: null };
+
+    function pushActivity(activity) {
+      runState.activities = mergeActivityItems(runState.activities, activity);
+      setActivityItems([...runState.activities]);
+    }
 
     function pushToolEvent(event) {
       const last = runState.tools[runState.tools.length - 1];
@@ -1678,6 +1711,8 @@ export default function App() {
           elapsed_seconds: parsed?.elapsed_seconds,
           active_tool: parsed?.active_tool,
         });
+      } else if (eventType === "activity") {
+        pushActivity(parsed || {});
       } else if (eventType === "debug") {
         const { message, elapsed_seconds, stage, ...details } = parsed || {};
         if (stage === "model_usage" && parsed?.usage && typeof parsed.usage === "object") {
@@ -1765,6 +1800,7 @@ export default function App() {
           role: "assistant",
           content: runState.assistantContent || "(no text reply)",
           tools: runState.tools,
+          activities: runState.activities,
           usage: runState.usage || {},
         },
       ]);
@@ -1778,6 +1814,7 @@ export default function App() {
             role: "assistant",
             content: runState.assistantContent || "(stopped)",
             tools: runState.tools,
+            activities: runState.activities,
             usage: runState.usage || {},
           },
         ]);
@@ -1791,6 +1828,7 @@ export default function App() {
             role: "assistant",
             content: `Request failed: ${err.message}`,
             tools: runState.tools,
+            activities: runState.activities,
             usage: runState.usage || {},
           },
         ]);
@@ -1806,6 +1844,7 @@ export default function App() {
       setLoading(false);
       setStreamingText("");
       setToolEvents([]);
+      setActivityItems([]);
       abortRef.current = null;
     }
   }, [
@@ -1911,10 +1950,12 @@ export default function App() {
                   </div>
                 </div>
                 {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
+                {msg.role === "assistant" && <AgentActivityTimeline items={msg.activities} />}
               </div>
             ))}
 
             <ToolEvents events={toolEvents} />
+            <AgentActivityTimeline items={activityItems} />
 
             {loading && streamingText && (
               <div className="message assistant-message streaming">
