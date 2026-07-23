@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt import create_react_agent
 
 from .config import create_chat_deepseek, load_llm_config
@@ -40,6 +41,108 @@ _SENSITIVE_TEXT_RE = re.compile(
 
 def estimate_tokens_from_text(text: str) -> int:
     return count_text_tokens(text or "")
+
+
+def _history_entry_text(entry: dict[str, Any]) -> str:
+    """Serialize structured history without dropping native tool payload fields."""
+    if entry.get("role") in {"assistant_tool_calls", "tool", "legacy_tool_result", "malformed_tool_result"}:
+        return json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
+    return str(entry.get("content") or "")
+
+
+def _tool_message_content(content: Any) -> str | list[Any]:
+    if isinstance(content, (str, list)):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _append_native_history_messages(messages: list[BaseMessage], history_items: list[dict[str, Any]]) -> None:
+    """Replay protected tool entries using LangChain's native call/result protocol."""
+    invalid_tool_call_ids: set[str] = set()
+    for entry in history_items:
+        role = entry.get("role", "")
+        if role == "user":
+            messages.append(HumanMessage(content=str(entry.get("content") or "")))
+        elif role == "assistant":
+            messages.append(AIMessage(content=str(entry.get("content") or "")))
+        elif role == "assistant_tool_calls":
+            tool_calls = entry.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                continue
+            valid_tool_calls: list[dict[str, Any]] = []
+            malformed_tool_calls: list[Any] = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    malformed_tool_calls.append(tool_call)
+                    continue
+                tool_call_id = str(tool_call.get("id") or "").strip()
+                name = str(tool_call.get("name") or "").strip()
+                arguments = tool_call.get("args")
+                if not tool_call_id or not name or not isinstance(arguments, dict):
+                    if tool_call_id:
+                        invalid_tool_call_ids.add(tool_call_id)
+                    malformed_tool_calls.append(tool_call)
+                    continue
+                valid_tool_calls.append(
+                    {"name": name, "args": arguments, "id": tool_call_id, "type": "tool_call"}
+                )
+            if valid_tool_calls:
+                messages.append(AIMessage(content="", tool_calls=valid_tool_calls))
+            for malformed_tool_call in malformed_tool_calls:
+                messages.append(
+                    AIMessage(
+                        content=json.dumps(
+                            {"malformed_tool_call": True, "tool_call": malformed_tool_call},
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    )
+                )
+        elif role == "tool":
+            tool_call_id = str(entry.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                continue
+            if tool_call_id in invalid_tool_call_ids:
+                messages.append(
+                    AIMessage(
+                        content=json.dumps(
+                            {
+                                "malformed_tool_result": True,
+                                "tool_call_id": tool_call_id,
+                                "name": entry.get("name"),
+                                "content": entry.get("content"),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    )
+                )
+                continue
+            messages.append(
+                ToolMessage(
+                    content=_tool_message_content(entry.get("content")),
+                    tool_call_id=tool_call_id,
+                    name=str(entry.get("name") or "tool"),
+                )
+            )
+        elif role in {"legacy_tool_result", "malformed_tool_result"}:
+            # An orphaned legacy result has no valid native call to reference.
+            # Preserve it explicitly instead of silently dropping the data.
+            messages.append(
+                AIMessage(
+                    content=json.dumps(
+                        {
+                            "legacy_unmatched_tool_result": role == "legacy_tool_result",
+                            "malformed_tool_result": role == "malformed_tool_result",
+                            "name": entry.get("name"),
+                            "tool_call_id": entry.get("tool_call_id"),
+                            "content": entry.get("content"),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
+            )
 
 
 def _safe_summary(value: Any, limit: int = 240) -> str:
@@ -346,6 +449,12 @@ async def stream_agent_events(
     current_model_usage: dict[str, int] = {}
     accumulated_model_usage: dict[str, int] = {}
     latest_activity: dict[str, Any] = {}
+    pending_tool_call_ids: dict[str, list[str]] = {}
+    tool_call_ids_by_run_id: dict[str, str] = {}
+    fallback_tool_sequence = 0
+    history_fingerprint = hashlib.sha256(
+        json.dumps(history or [], ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
 
     def activity_frame(state: str, summary: str, **details: Any) -> dict[str, Any]:
         nonlocal latest_activity
@@ -380,6 +489,13 @@ async def stream_agent_events(
             return [sanitize_tool_payload(item) for item in value]
         return to_jsonable(value)
 
+    def lossless_tool_payload(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): lossless_tool_payload(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [lossless_tool_payload(item) for item in value]
+        return to_jsonable(value)
+
     def runtime_tool_call_key(tool_name: str, arguments: Any) -> str:
         try:
             normalized_arguments = _normalize_tool_payload_for_key(tool_name, arguments)
@@ -393,6 +509,38 @@ async def stream_agent_events(
         except Exception:
             normalized = str(arguments)
         return f"{tool_name}:{normalized}"
+
+    def next_fallback_tool_call_id(tool_name: str) -> str:
+        nonlocal fallback_tool_sequence
+        fallback_tool_sequence += 1
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", tool_name).strip("-") or "tool"
+        return f"fallback-{history_fingerprint}-{safe_name}-{fallback_tool_sequence}"
+
+    def start_tool_call_id(event: dict[str, Any], tool_name: str) -> str:
+        run_id = str(event.get("run_id") or "").strip()
+        tool_call_id = run_id or next_fallback_tool_call_id(tool_name)
+        if run_id:
+            tool_call_ids_by_run_id[run_id] = tool_call_id
+        pending_tool_call_ids.setdefault(tool_name, []).append(tool_call_id)
+        return tool_call_id
+
+    def end_tool_call_id(event: dict[str, Any], tool_name: str) -> str:
+        run_id = str(event.get("run_id") or "").strip()
+        if run_id and run_id in tool_call_ids_by_run_id:
+            tool_call_id = tool_call_ids_by_run_id.pop(run_id)
+            pending = pending_tool_call_ids.get(tool_name, [])
+            if tool_call_id in pending:
+                pending.remove(tool_call_id)
+            if not pending:
+                pending_tool_call_ids.pop(tool_name, None)
+            return tool_call_id
+        pending = pending_tool_call_ids.get(tool_name, [])
+        if pending:
+            tool_call_id = pending.pop(0)
+            if not pending:
+                pending_tool_call_ids.pop(tool_name, None)
+            return tool_call_id
+        return run_id or next_fallback_tool_call_id(tool_name)
 
     def step_for_tool(tool_name: str) -> str:
         lowered = (tool_name or "").lower()
@@ -466,20 +614,24 @@ async def stream_agent_events(
         omitted = len(normalized) - len(head) - len(tail)
         return f"{head}\n\n[... omitted {omitted} chars from earlier content ...]\n\n{tail}"
 
-    def trim_history(history_items: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    def trim_history(history_items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if not history_items:
             return []
-        trimmed: list[dict[str, str]] = []
+        trimmed: list[dict[str, Any]] = []
         total_chars = 0
         # Keep the most recent turns first, then restore chronological order.
         for item in reversed(history_items):
             role = item.get("role", "")
+            if role in {"assistant_tool_calls", "tool", "legacy_tool_result", "malformed_tool_result"}:
+                # Protected tool records are replayed exactly as persisted.
+                trimmed.append(item)
+                continue
             if role not in {"user", "assistant"}:
                 continue
             content = compress_history_text(item.get("content", ""))
             projected = total_chars + len(content)
             if trimmed and (len(trimmed) >= MAX_HISTORY_MESSAGES or projected > MAX_HISTORY_TOTAL_CHARS):
-                break
+                continue
             trimmed.append({"role": role, "content": content})
             total_chars = projected
         trimmed.reverse()
@@ -844,16 +996,30 @@ async def stream_agent_events(
     detected_image_paths = extract_image_paths(message, Path.cwd())
     if detected_image_paths:
         image_tool_name = "analyze_images" if len(detected_image_paths) > 1 else "analyze_image"
+        image_tool_call_id = next_fallback_tool_call_id(image_tool_name)
         tool_call_names.append(image_tool_name)
+        image_arguments = {
+            "paths": detected_image_paths,
+            "prompt": "Automatically analyze attached images before main-agent reasoning.",
+        }
+        yield {
+            "event": "tool_transcript_call",
+            "data": json.dumps(
+                {
+                    "name": image_tool_name,
+                    "tool_call_id": image_tool_call_id,
+                    "arguments": image_arguments,
+                },
+                ensure_ascii=False,
+            ),
+        }
         yield {
             "event": "tool_call",
             "data": json.dumps(
                 {
                     "name": image_tool_name,
-                    "arguments": {
-                        "paths": detected_image_paths,
-                        "prompt": "Automatically analyze attached images before main-agent reasoning.",
-                    },
+                    "tool_call_id": image_tool_call_id,
+                    "arguments": image_arguments,
                 },
                 ensure_ascii=False,
             ),
@@ -890,10 +1056,22 @@ async def stream_agent_events(
                 f"{vision_result}"
             )
             yield {
+                "event": "tool_transcript_result",
+                "data": json.dumps(
+                    {
+                        "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
+                        "content": vision_result,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            yield {
                 "event": "tool_result",
                 "data": json.dumps(
                     {
                         "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
                         "content": vision_result,
                     },
                     ensure_ascii=False,
@@ -907,10 +1085,25 @@ async def stream_agent_events(
                 f"Configuration error: {exc}"
             )
             yield {
+                "event": "tool_transcript_result",
+                "data": json.dumps(
+                    {
+                        "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
+                        "content": json.dumps(
+                            {"success": False, "error": str(exc)},
+                            ensure_ascii=False,
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            yield {
                 "event": "tool_result",
                 "data": json.dumps(
                     {
                         "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
                         "content": json.dumps(
                             {"success": False, "error": str(exc)},
                             ensure_ascii=False,
@@ -927,10 +1120,25 @@ async def stream_agent_events(
                 "Continue with available evidence or retry with the analyze_image tool."
             )
             yield {
+                "event": "tool_transcript_result",
+                "data": json.dumps(
+                    {
+                        "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
+                        "content": json.dumps(
+                            {"success": False, "error": str(exc)},
+                            ensure_ascii=False,
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            yield {
                 "event": "tool_result",
                 "data": json.dumps(
                     {
                         "name": image_tool_name,
+                        "tool_call_id": image_tool_call_id,
                         "content": json.dumps(
                             {"success": False, "error": str(exc)},
                             ensure_ascii=False,
@@ -941,8 +1149,14 @@ async def stream_agent_events(
             }
 
     context_message_count = len(effective_history) + 2
-    context_char_count = sum(len(msg.get("content", "")) for msg in effective_history)
-    context_char_count += len(SYSTEM_PROMPT) + len(effective_message)
+    history_payloads = [_history_entry_text(entry) for entry in effective_history]
+    protected_tool_chars = sum(
+        len(payload)
+        for entry, payload in zip(effective_history, history_payloads)
+        if entry.get("protected_tool_history")
+    )
+    context_char_count = sum(len(payload) for payload in history_payloads)
+    context_char_count += len(SYSTEM_PROMPT) + len(AGENT_POLICY or "") + len(effective_message)
     if skill_catalog_text:
         context_char_count += len(skill_catalog_text)
         context_message_count += 1
@@ -951,17 +1165,49 @@ async def stream_agent_events(
         context_message_count += 1
     context_token_estimate = estimate_tokens_from_text("".join(
         [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", resume_text or "", effective_message]
-        + [msg.get("content", "") for msg in effective_history]
+        + history_payloads
     ))
 
+    if protected_tool_chars and context_char_count > MAX_HISTORY_TOTAL_CHARS:
+        capacity_message = (
+            "Protected tool history exceeds the configured context budget; "
+            "no tool arguments or results were truncated."
+        )
+        yield {
+            "event": "error",
+            "data": json.dumps(
+                {
+                    "code": "protected_context_capacity_exceeded",
+                    "message": capacity_message,
+                    "context_chars": context_char_count,
+                    "protected_tool_chars": protected_tool_chars,
+                    "context_budget_chars": MAX_HISTORY_TOTAL_CHARS,
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {"event": "done", "data": json.dumps(capacity_message, ensure_ascii=False)}
+        return
+
+    malformed_protected_entries = [
+        entry for entry in effective_history
+        if entry.get("role") == "malformed_tool_result"
+    ]
+    if malformed_protected_entries:
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "malformed_protected_tool_history",
+                    "message": "Malformed protected tool results were preserved as diagnostics; native replay was skipped for those results.",
+                    "count": len(malformed_protected_entries),
+                },
+                ensure_ascii=False,
+            ),
+        }
+
     if effective_history:
-        for msg in effective_history:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                messages.append(HumanMessage(content=content))
-            elif role == "assistant":
-                messages.append(AIMessage(content=content))
+        _append_native_history_messages(messages, effective_history)
 
     messages.append(HumanMessage(content=effective_message))
 
@@ -1124,7 +1370,9 @@ async def stream_agent_events(
                     yield {"event": "text", "data": json.dumps(token, ensure_ascii=False)}
 
         elif kind == "on_tool_start":
+            transcript_input_data = lossless_tool_payload(data.get("input", {}))
             input_data = sanitize_tool_payload(data.get("input", {}))
+            tool_call_id = start_tool_call_id(event, name)
             display_key = runtime_tool_call_key(name, input_data)
             is_duplicate_display_call = display_key in emitted_tool_call_keys
             tool_result_suppression_queue.setdefault(name, []).append(is_duplicate_display_call)
@@ -1132,8 +1380,22 @@ async def stream_agent_events(
                 emitted_tool_call_keys.add(display_key)
                 tool_call_names.append(name)
             tool_call_history.append(
-                {"phase": "start", "tool": name, "arguments": input_data, "at": time.monotonic()}
+                {
+                    "phase": "start",
+                    "tool": name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": input_data,
+                    "at": time.monotonic(),
+                }
             )
+            yield {
+                "event": "tool_transcript_call",
+                "data": json.dumps(
+                    {"name": name, "tool_call_id": tool_call_id, "arguments": transcript_input_data},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            }
             yield activity_frame(
                 "working",
                 f"正在执行 {name}。",
@@ -1213,7 +1475,8 @@ async def stream_agent_events(
                 yield {
                     "event": "tool_call",
                     "data": json.dumps(
-                        {"name": name, "arguments": input_data},
+                        {"name": name, "tool_call_id": tool_call_id, "arguments": input_data},
+                        default=str,
                         ensure_ascii=False,
                     ),
                 }
@@ -1239,6 +1502,7 @@ async def stream_agent_events(
             output = data.get("output", "")
             output_str = output.content if isinstance(output, BaseMessage) else str(output)
             tool_name = name or active_tool or "tool"
+            tool_call_id = end_tool_call_id(event, tool_name)
             is_error = output_indicates_tool_error(tool_name, output_str)
             if is_error:
                 tool_errors.append({"tool": tool_name, "message": output_str[:4000]})
@@ -1252,6 +1516,7 @@ async def stream_agent_events(
                 {
                     "phase": "end",
                     "tool": tool_name,
+                    "tool_call_id": tool_call_id,
                     "ok": not is_error,
                     "result_preview": result_preview,
                     "at": time.monotonic(),
@@ -1284,11 +1549,18 @@ async def stream_agent_events(
             suppress_result = bool(suppression_queue.pop(0)) if suppression_queue else False
             if not suppression_queue:
                 tool_result_suppression_queue.pop(tool_name, None)
+            yield {
+                "event": "tool_transcript_result",
+                "data": json.dumps(
+                    {"name": tool_name, "tool_call_id": tool_call_id, "content": output_str},
+                    ensure_ascii=False,
+                ),
+            }
             if not suppress_result:
                 yield {
                     "event": "tool_result",
                     "data": json.dumps(
-                        {"name": tool_name, "content": output_str},
+                        {"name": tool_name, "tool_call_id": tool_call_id, "content": output_str},
                         ensure_ascii=False,
                     ),
                 }
@@ -1523,4 +1795,3 @@ async def simple_chat(
             except Exception:
                 return str(data)
     return ""
-

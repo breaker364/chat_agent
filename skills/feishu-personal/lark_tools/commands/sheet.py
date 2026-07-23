@@ -37,7 +37,8 @@ def _post_sheet_api(cookies, body: dict):
 # _extract_sheet_names  (gzipTopSnapshot protobuf → {sheetId: name})
 # ---------------------------------------------------------------------------
 
-_SHEET_ID_RE = re.compile(r'^[0-9a-zA-Z]{6}$')
+#_SHEET_ID_RE = re.compile(r'^[0-9a-zA-Z]{6}$')
+_SHEET_ID_RE = re.compile(r'^[0-9a-f]{6}$')
 _SHEET_NAME_RE = re.compile(r'^[\x20-\x7E\u4e00-\u9fff]{1,100}$')
 
 

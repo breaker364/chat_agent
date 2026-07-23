@@ -17,7 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .agent import build_agent, stream_agent_events
 from .config import get_runtime_value
-from .session_store import SessionStore
+from .session_store import SessionStore, TOOL_EVENT_SCHEMA_VERSION
 from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
@@ -93,6 +93,7 @@ def _workspace() -> Path:
 
 MAX_UPLOAD_FILES = 10
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_PRIVATE_TOOL_ARGUMENT_KEYS = {"runtime", "config", "callbacks", "store", "context", "state"}
 
 
 def _safe_upload_component(value: str, fallback: str) -> str:
@@ -179,9 +180,9 @@ async def get_agent() -> Any:
 
 
 def _merge_history(
-    stored_history: list[dict[str, str]],
-    incoming_history: list[dict[str, str]] | None,
-) -> list[dict[str, str]]:
+    stored_history: list[dict[str, Any]],
+    incoming_history: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
     if not incoming_history:
         return stored_history
     if incoming_history == stored_history:
@@ -195,6 +196,57 @@ def _merge_history(
         merged.extend(incoming_history[overlap:])
         return merged
     return list(stored_history)
+
+
+def _assistant_tool_transcript_event(
+    event_type: str,
+    payload: Any,
+    sequence: int,
+    pending_ids: dict[str, list[str]],
+) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    name = str(data.get("name") or "tool").strip() or "tool"
+    tool_call_id = str(data.get("tool_call_id") or "").strip()
+    if event_type == "tool_call":
+        tool_call_id = tool_call_id or f"fallback-{sequence}"
+        pending_ids.setdefault(name, []).append(tool_call_id)
+        return {
+            "schema_version": TOOL_EVENT_SCHEMA_VERSION,
+            "type": "tool_call",
+            "sequence": sequence,
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "arguments": data.get("arguments"),
+        }
+
+    pending = pending_ids.get(name, [])
+    if not tool_call_id and pending:
+        tool_call_id = pending.pop(0)
+    elif tool_call_id and tool_call_id in pending:
+        pending.remove(tool_call_id)
+    if not pending:
+        pending_ids.pop(name, None)
+    tool_call_id = tool_call_id or f"fallback-{sequence}"
+    return {
+        "schema_version": TOOL_EVENT_SCHEMA_VERSION,
+        "type": "tool_result",
+        "sequence": sequence,
+        "tool_call_id": tool_call_id,
+        "name": name,
+        "content": data.get("content"),
+    }
+
+
+def _public_session_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _public_session_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _PRIVATE_TOOL_ARGUMENT_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_session_value(item) for item in value]
+    return value
 
 
 def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
@@ -212,10 +264,10 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
         "title": session.get("title"),
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
-        "messages": messages,
-        "task_progress": session.get("task_progress", {}),
-        "subagent_tasks": session.get("subagent_tasks", []),
-        "subagent_notifications": session.get("subagent_notifications", []),
+        "messages": _public_session_value(messages),
+        "task_progress": _public_session_value(session.get("task_progress", {})),
+        "subagent_tasks": _public_session_value(session.get("subagent_tasks", [])),
+        "subagent_notifications": _public_session_value(session.get("subagent_notifications", [])),
         "context_stats": {
             "history_messages": len(history_messages),
             "history_chars": history_chars,
@@ -827,9 +879,12 @@ async def chat_stream(request: Request) -> EventSourceResponse:
     async def event_generator():
         assistant_text = ""
         assistant_tools: list[dict[str, Any]] = []
+        pending_tool_ids: dict[str, list[str]] = {}
         run_usage: dict[str, Any] = {}
         turn_finalized = False
         interrupted = False
+        terminal_status = ""
+        terminal_failure_reason = ""
         previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
         previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
         run_id = f"{session['session_id']}:{uuid4().hex}"
@@ -873,6 +928,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                     pending_agent = asyncio.create_task(agent_iter.__anext__())
 
                     event_type = event.get("event", "")
+                    private_transcript_event = event_type in {"tool_transcript_call", "tool_transcript_result"}
                     raw_data = event.get("data", "")
                     parsed: Any
                     try:
@@ -882,20 +938,19 @@ async def chat_stream(request: Request) -> EventSourceResponse:
 
                     if event_type == "text":
                         assistant_text += str(parsed)
-                    elif event_type == "tool_call":
-                        assistant_tools.append(
-                            {
-                                "type": "tool_call",
-                                "name": parsed.get("name", "tool"),
-                                "arguments": parsed.get("arguments"),
-                            }
+                    elif event_type == "tool_transcript_call":
+                        transcript_event = _assistant_tool_transcript_event(
+                            "tool_call", parsed, len(assistant_tools), pending_tool_ids
                         )
+                        assistant_tools.append(transcript_event)
                         store.append_tool_event(
                             session["session_id"],
                             event_type="tool_call",
-                            tool_name=str(parsed.get("name") or "tool"),
-                            arguments=parsed.get("arguments"),
+                            tool_name=transcript_event["name"],
+                            tool_call_id=transcript_event["tool_call_id"],
+                            arguments=transcript_event.get("arguments"),
                         )
+                    elif event_type == "tool_call":
                         store.update_progress(
                             session["session_id"],
                             status="running",
@@ -903,20 +958,19 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             message=f"Calling tool `{parsed.get('name', 'tool')}`.",
                             last_debug_stage="tool_start",
                         )
-                    elif event_type == "tool_result":
-                        assistant_tools.append(
-                            {
-                                "type": "tool_result",
-                                "name": parsed.get("name", "tool"),
-                                "content": parsed.get("content"),
-                            }
+                    elif event_type == "tool_transcript_result":
+                        transcript_event = _assistant_tool_transcript_event(
+                            "tool_result", parsed, len(assistant_tools), pending_tool_ids
                         )
+                        assistant_tools.append(transcript_event)
                         store.append_tool_event(
                             session["session_id"],
                             event_type="tool_result",
-                            tool_name=str(parsed.get("name") or "tool"),
-                            content=parsed.get("content"),
+                            tool_name=transcript_event["name"],
+                            tool_call_id=transcript_event["tool_call_id"],
+                            content=transcript_event.get("content"),
                         )
+                    elif event_type == "tool_result":
                         store.update_progress(
                             session["session_id"],
                             status="running",
@@ -953,16 +1007,25 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             elapsed_seconds=parsed.get("elapsed_seconds", 0),
                             last_debug_stage=parsed.get("stage", ""),
                         )
+                    elif event_type == "error" and isinstance(parsed, dict):
+                        assistant_text = str(parsed.get("message") or assistant_text)
+                        if parsed.get("code") == "protected_context_capacity_exceeded":
+                            terminal_status = "failed"
+                            terminal_failure_reason = assistant_text
                     elif event_type == "done":
                         assistant_text = str(parsed or assistant_text)
+                        resolved_status = terminal_status or ("completed" if assistant_text.strip() else "failed")
+                        resolved_failure_reason = terminal_failure_reason or (
+                            "" if assistant_text.strip() else "Agent returned no final text."
+                        )
                         assistant_text = _finalize_agent_response(
                             store=store,
                             session_id=session["session_id"],
                             user_message=message,
                             final_text=assistant_text,
                             tools=assistant_tools,
-                            status="completed" if assistant_text.strip() else "failed",
-                            failure_reason="" if assistant_text.strip() else "Agent returned no final text.",
+                            status=resolved_status,
+                            failure_reason=resolved_failure_reason,
                         )
                         event = {"event": "done", "data": json.dumps(assistant_text, ensure_ascii=False)}
                         final_usage = normalize_usage(run_usage, output_text=assistant_text)
@@ -975,18 +1038,19 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                         store.update_progress(session["session_id"], usage=final_usage)
                         store.update_progress(
                             session["session_id"],
-                            status="idle",
+                            status="idle" if not terminal_status else terminal_status,
                             active_tool=None,
-                            message="Ready to continue.",
+                            message="Ready to continue." if not terminal_status else terminal_failure_reason,
                             elapsed_seconds=0,
-                            last_debug_stage="done",
+                            last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
                         )
                         turn_finalized = True
 
                     if await request.is_disconnected():
                         interrupted = True
                         break
-                    yield event
+                    if not private_transcript_event:
+                        yield event
         finally:
             if not turn_finalized and (assistant_text.strip() or assistant_tools):
                 partial_text = assistant_text.strip() or "(stopped before text reply)"
@@ -1069,7 +1133,10 @@ async def chat_sync(request: Request) -> JSONResponse:
     agent = await get_agent()
     final_text = ""
     tools: list[dict[str, Any]] = []
+    pending_tool_ids: dict[str, list[str]] = {}
     run_usage: dict[str, Any] = {}
+    terminal_status = ""
+    terminal_failure_reason = ""
     previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
     previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
     run_id = f"{session['session_id']}:{uuid4().hex}"
@@ -1084,22 +1151,39 @@ async def chat_sync(request: Request) -> JSONResponse:
                 parsed = event["data"]
             if event_type == "text":
                 final_text += str(parsed)
-            elif event_type == "tool_call":
-                tools.append({"type": "tool_call", "name": parsed.get("name"), "arguments": parsed.get("arguments")})
+            elif event_type == "tool_transcript_call":
+                transcript_event = _assistant_tool_transcript_event(
+                    "tool_call", parsed, len(tools), pending_tool_ids
+                )
+                tools.append(transcript_event)
                 store.append_tool_event(
                     session["session_id"],
                     event_type="tool_call",
-                    tool_name=str(parsed.get("name") or "tool"),
-                    arguments=parsed.get("arguments"),
+                    tool_name=transcript_event["name"],
+                    tool_call_id=transcript_event["tool_call_id"],
+                    arguments=transcript_event.get("arguments"),
                 )
-            elif event_type == "tool_result":
-                tools.append({"type": "tool_result", "name": parsed.get("name"), "content": parsed.get("content")})
+            elif event_type == "tool_call":
+                pass
+            elif event_type == "tool_transcript_result":
+                transcript_event = _assistant_tool_transcript_event(
+                    "tool_result", parsed, len(tools), pending_tool_ids
+                )
+                tools.append(transcript_event)
                 store.append_tool_event(
                     session["session_id"],
                     event_type="tool_result",
-                    tool_name=str(parsed.get("name") or "tool"),
-                    content=parsed.get("content"),
+                    tool_name=transcript_event["name"],
+                    tool_call_id=transcript_event["tool_call_id"],
+                    content=transcript_event.get("content"),
                 )
+            elif event_type == "tool_result":
+                pass
+            elif event_type == "error" and isinstance(parsed, dict):
+                final_text = str(parsed.get("message") or final_text)
+                if parsed.get("code") == "protected_context_capacity_exceeded":
+                    terminal_status = "failed"
+                    terminal_failure_reason = final_text
             elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
                 run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
             elif event_type == "debug" and parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
@@ -1126,18 +1210,18 @@ async def chat_sync(request: Request) -> JSONResponse:
         user_message=message,
         final_text=final_text,
         tools=tools,
-        status="completed" if final_text.strip() else "failed",
-        failure_reason="" if final_text.strip() else "Agent returned no final text.",
+        status=terminal_status or ("completed" if final_text.strip() else "failed"),
+        failure_reason=terminal_failure_reason or ("" if final_text.strip() else "Agent returned no final text."),
     )
     final_usage = normalize_usage(run_usage, output_text=final_text)
     store.replace_last_assistant_message(session["session_id"], final_text, tools=tools, usage=final_usage)
     store.update_progress(
         session["session_id"],
-        status="idle",
+        status="idle" if not terminal_status else terminal_status,
         active_tool=None,
-        message="Ready to continue.",
+        message="Ready to continue." if not terminal_status else terminal_failure_reason,
         elapsed_seconds=0,
-        last_debug_stage="done",
+        last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
         usage=final_usage,
     )
     return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})

@@ -18,6 +18,8 @@ MAX_STORED_TOOL_ARGUMENT_CHARS = 8_000
 MAX_STORED_TASK_OUTPUT_CHARS = 12_000
 MAX_TASK_OUTPUT_EVENTS = 40
 MAX_TOOL_RESULT_CACHE_ENTRIES = 200
+TOOL_EVENT_SCHEMA_VERSION = 1
+RECENT_TOOL_HISTORY_TURNS = 3
 _SESSION_FILE_LOCK = threading.RLock()
 
 
@@ -89,10 +91,175 @@ def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
     item["usage"] = usage if isinstance(usage, dict) else {}
     tools = item.get("tools", [])
     if isinstance(tools, list):
-        item["tools"] = [_compact_tool(tool) if isinstance(tool, dict) else tool for tool in tools]
+        # Tool transcripts are the lossless source for native history rehydration.
+        # Compact operational caches separately, but never compact this transcript.
+        item["tools"] = [dict(tool) if isinstance(tool, dict) else tool for tool in tools]
     else:
         item["tools"] = []
     return item
+
+
+def _event_type(tool: dict[str, Any]) -> str:
+    value = str(tool.get("type") or tool.get("event_type") or "").strip()
+    if value in {"tool_call", "tool_result"}:
+        return value
+    return ""
+
+
+def _legacy_tool_call_id(turn_index: int, tool_name: str, ordinal: int) -> str:
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", tool_name).strip("-") or "tool"
+    return f"legacy-{turn_index}-{safe_name}-{ordinal}"
+
+
+def normalize_tool_events(tools: Any, turn_index: int) -> list[dict[str, Any]]:
+    """Return ordered, non-mutating tool events suitable for prompt rehydration."""
+    if not isinstance(tools, list):
+        return []
+
+    pending_by_name: dict[str, list[str]] = {}
+    available_call_ids: set[str] = set()
+    legacy_call_counts: dict[str, int] = {}
+    legacy_result_counts: dict[str, int] = {}
+    normalized: list[dict[str, Any]] = []
+
+    indexed_tools = [
+        (index, tool)
+        for index, tool in enumerate(tools)
+        if isinstance(tool, dict) and _event_type(tool)
+    ]
+    indexed_tools.sort(
+        key=lambda pair: (
+            pair[1].get("sequence") if isinstance(pair[1].get("sequence"), int) else pair[0],
+            pair[0],
+        )
+    )
+
+    for fallback_sequence, (_, source) in enumerate(indexed_tools):
+        event_type = _event_type(source)
+        name = str(source.get("name") or source.get("tool_name") or "tool").strip() or "tool"
+        sequence = source.get("sequence") if isinstance(source.get("sequence"), int) else fallback_sequence
+        raw_id = source.get("tool_call_id") or source.get("id")
+        tool_call_id = str(raw_id).strip() if raw_id is not None else ""
+        is_legacy = not tool_call_id
+
+        if event_type == "tool_call":
+            if not tool_call_id:
+                legacy_call_counts[name] = legacy_call_counts.get(name, 0) + 1
+                tool_call_id = _legacy_tool_call_id(turn_index, name, legacy_call_counts[name])
+            pending_by_name.setdefault(name, []).append(tool_call_id)
+            available_call_ids.add(tool_call_id)
+            normalized.append(
+                {
+                    "schema_version": TOOL_EVENT_SCHEMA_VERSION,
+                    "type": "tool_call",
+                    "sequence": sequence,
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "arguments": source.get("arguments"),
+                    "legacy": is_legacy,
+                }
+            )
+            continue
+
+        pending = pending_by_name.setdefault(name, [])
+        matched_call = False
+        if not tool_call_id and pending:
+            tool_call_id = pending.pop(0)
+            matched_call = True
+        elif tool_call_id and tool_call_id in pending:
+            pending.remove(tool_call_id)
+            matched_call = True
+
+        legacy_unmatched = False
+        malformed = False
+        if not tool_call_id:
+            legacy_result_counts[name] = legacy_result_counts.get(name, 0) + 1
+            tool_call_id = _legacy_tool_call_id(turn_index, f"{name}-unmatched", legacy_result_counts[name])
+            legacy_unmatched = True
+        elif not matched_call and tool_call_id not in available_call_ids:
+            malformed = True
+        if matched_call:
+            available_call_ids.discard(tool_call_id)
+
+        normalized.append(
+            {
+                "schema_version": TOOL_EVENT_SCHEMA_VERSION,
+                "type": "tool_result",
+                "sequence": sequence,
+                "tool_call_id": tool_call_id,
+                "name": name,
+                "content": source.get("content"),
+                "legacy": is_legacy,
+                "legacy_unmatched": legacy_unmatched,
+                "malformed": malformed,
+            }
+        )
+    return normalized
+
+
+def _append_tool_history_entries(history: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
+    index = 0
+    while index < len(events):
+        event = events[index]
+        if event["type"] == "tool_call":
+            batch: list[dict[str, Any]] = []
+            first_sequence = event["sequence"]
+            while index < len(events) and events[index]["type"] == "tool_call":
+                call = events[index]
+                batch.append(
+                    {
+                        "name": call["name"],
+                        "args": call.get("arguments"),
+                        "id": call["tool_call_id"],
+                        "type": "tool_call",
+                    }
+                )
+                index += 1
+            history.append(
+                {
+                    "role": "assistant_tool_calls",
+                    "sequence": first_sequence,
+                    "tool_calls": batch,
+                    "protected_tool_history": True,
+                }
+            )
+            continue
+
+        if event.get("legacy_unmatched"):
+            history.append(
+                {
+                    "role": "legacy_tool_result",
+                    "sequence": event["sequence"],
+                    "name": event["name"],
+                    "tool_call_id": event["tool_call_id"],
+                    "content": event.get("content"),
+                    "legacy_unmatched": True,
+                    "protected_tool_history": True,
+                }
+            )
+        elif event.get("malformed"):
+            history.append(
+                {
+                    "role": "malformed_tool_result",
+                    "sequence": event["sequence"],
+                    "name": event["name"],
+                    "tool_call_id": event["tool_call_id"],
+                    "content": event.get("content"),
+                    "protected_tool_history": True,
+                }
+            )
+        else:
+            history.append(
+                {
+                    "role": "tool",
+                    "sequence": event["sequence"],
+                    "name": event["name"],
+                    "tool_call_id": event["tool_call_id"],
+                    "content": event.get("content"),
+                    "protected_tool_history": True,
+                }
+            )
+        index += 1
 
 
 class SessionStore:
@@ -943,6 +1110,7 @@ class SessionStore:
         *,
         event_type: str,
         tool_name: str,
+        tool_call_id: str | None = None,
         arguments: Any | None = None,
         content: Any | None = None,
     ) -> dict[str, Any]:
@@ -957,6 +1125,7 @@ class SessionStore:
             "event": str(event_type or "").strip() or "tool_event",
             "task_id": task_id,
             "tool_name": str(tool_name or "tool").strip() or "tool",
+            "tool_call_id": str(tool_call_id or "").strip(),
             "arguments": _compact_jsonable(arguments, MAX_STORED_TOOL_ARGUMENT_CHARS),
             "content": _compact_jsonable(content, MAX_STORED_TASK_OUTPUT_CHARS),
         }
@@ -1196,15 +1365,35 @@ class SessionStore:
         self.save_session(session)
         return session
 
-    def get_history(self, session_id: str) -> list[dict[str, str]]:
+    def get_history(self, session_id: str) -> list[dict[str, Any]]:
         session = self.ensure_task_plan_recovered(session_id)
         if session is None:
             return []
-        history: list[dict[str, str]] = []
-        for item in session.get("messages", []):
+        history: list[dict[str, Any]] = []
+        messages = session.get("messages", [])
+        protected_assistant_indexes: set[int] = set()
+        pending_user = False
+        if isinstance(messages, list):
+            completed_turns: list[int] = []
+            for index, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role", "")
+                if role == "user":
+                    pending_user = True
+                elif role == "assistant" and pending_user:
+                    completed_turns.append(index)
+                    pending_user = False
+            protected_assistant_indexes = set(completed_turns[-RECENT_TOOL_HISTORY_TURNS:])
+
+        for index, item in enumerate(messages if isinstance(messages, list) else []):
+            if not isinstance(item, dict):
+                continue
             role = item.get("role", "")
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
+                if role == "assistant" and index in protected_assistant_indexes:
+                    _append_tool_history_entries(history, normalize_tool_events(item.get("tools"), index))
                 history.append({"role": role, "content": content})
         progress = session.get("task_progress", {})
         plan = progress.get("task_plan") if isinstance(progress, dict) else None
@@ -1568,15 +1757,35 @@ class SessionStore:
         # caller context if possible, otherwise leave events unassigned.
         return ""
 
-    def get_history(self, session_id: str) -> list[dict[str, str]]:
+    def get_history(self, session_id: str) -> list[dict[str, Any]]:
         session = self.ensure_task_plan_recovered(session_id)
         if session is None:
             return []
-        history: list[dict[str, str]] = []
-        for item in session.get("messages", []):
+        history: list[dict[str, Any]] = []
+        messages = session.get("messages", [])
+        protected_assistant_indexes: set[int] = set()
+        pending_user = False
+        if isinstance(messages, list):
+            completed_turns: list[int] = []
+            for index, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role", "")
+                if role == "user":
+                    pending_user = True
+                elif role == "assistant" and pending_user:
+                    completed_turns.append(index)
+                    pending_user = False
+            protected_assistant_indexes = set(completed_turns[-RECENT_TOOL_HISTORY_TURNS:])
+
+        for index, item in enumerate(messages if isinstance(messages, list) else []):
+            if not isinstance(item, dict):
+                continue
             role = item.get("role", "")
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
+                if role == "assistant" and index in protected_assistant_indexes:
+                    _append_tool_history_entries(history, normalize_tool_events(item.get("tools"), index))
                 history.append({"role": role, "content": content})
 
         plan = self.load_task_plan(session_id)
