@@ -1504,9 +1504,8 @@ def _feishu_crud_script_block_reason(content: str) -> str:
     )
     if has_feishu_marker and has_write_intent:
         return (
-            "Feishu/Lark CRUD scripts are blocked. Use the CLI-only Feishu skill "
-            "route with an explicit lark command instead, for example: "
-            "lark bitable add-records-batch <url> <tableId> --json-file <path>."
+            "Direct CRUD automation scripts are blocked when a matching installed skill can handle the operation. "
+            "Select the appropriate skill from the catalog and follow that skill's own command and auth instructions."
         )
     return ""
 
@@ -1518,7 +1517,6 @@ def _blocked_feishu_script_payload(path: str, reason: str) -> str:
             "reason": reason,
             "path": path,
             "suggested_tool": "use_skill",
-            "suggested_skill": "feishu-personal-cli",
         },
         ensure_ascii=False,
         indent=2,

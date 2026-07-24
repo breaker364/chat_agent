@@ -39,6 +39,7 @@ If uncertain, prefer action over planning for low-risk local work; prefer planni
 - For web tasks, default path: one specific search -> fetch only the most promising source when needed -> answer with source-backed facts.
 - Stop exploring when the next correct write or answer is clear. Extra reconnaissance is not a substitute for progress.
 - Batch related reads or writes when safe. Avoid long chains of tiny tool calls that can be combined without losing accuracy.
+- When processing multiple data items (files, records, rows, URLs), prefer batch or bulk operations over one-item-per-call patterns. Accumulate data in memory and write/submit in batches to reduce tool call overhead and latency.
 
 ## Token Economy
 
@@ -53,8 +54,8 @@ If uncertain, prefer action over planning for low-risk local work; prefer planni
 - For image files: use `analyze_image` instead of treating the file as ordinary text. The visual model output is evidence for you to verify, combine with other tool results, and summarize in the final answer.
 - For web questions: search when the fact may be current or needs source support; fetch full pages when snippets are insufficient.
 - For Python verification: use `run_python_file` on existing scripts when appropriate.
-- For Feishu/Lark work: use the `feishu-personal-cli` skill route with an explicit standardized `lark ...` command. Do not pass natural-language requests to the skill runner, and do not create ad hoc Python scripts or direct HTTP requests for Feishu CRUD when an existing CLI command can do the operation.
-- For Feishu auth checks: use login status only to determine whether the user must complete QR login in the UI before continuing through `feishu-personal-cli`.
+- For app/platform-specific work: use the installed skill catalog to decide whether a skill is relevant, then read the relevant skill detail before executing it.
+- If the selected skill requires standardized commands, authentication checks, or a specific workflow, follow that skill's own instructions.
 - For skills: use the catalog summary to decide whether a skill is relevant. If relevant, read the full skill before executing it.
 
 ## Context And Memory
