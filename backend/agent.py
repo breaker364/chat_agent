@@ -145,6 +145,58 @@ def _append_native_history_messages(messages: list[BaseMessage], history_items: 
             )
 
 
+def _repair_dangling_tool_call_messages(messages: list[BaseMessage]) -> None:
+    """Downgrade native tool calls that lack a matching ToolMessage before provider calls."""
+    tool_message_ids = {
+        str(message.tool_call_id)
+        for message in messages
+        if isinstance(message, ToolMessage) and getattr(message, "tool_call_id", None)
+    }
+    if not tool_message_ids and not any(isinstance(message, AIMessage) and message.tool_calls for message in messages):
+        return
+
+    repaired: list[BaseMessage] = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            repaired.append(message)
+            continue
+
+        valid_calls: list[dict[str, Any]] = []
+        dangling_calls: list[dict[str, Any]] = []
+        for tool_call in message.tool_calls:
+            tool_call_id = str(tool_call.get("id") or "")
+            if tool_call_id and tool_call_id in tool_message_ids:
+                valid_calls.append(tool_call)
+            else:
+                dangling_calls.append(tool_call)
+
+        if valid_calls:
+            if len(valid_calls) == len(message.tool_calls):
+                repaired.append(message)
+            else:
+                repaired.append(AIMessage(content=message.content or "", tool_calls=valid_calls))
+                changed = True
+        if dangling_calls:
+            changed = True
+            repaired.append(
+                AIMessage(
+                    content=json.dumps(
+                        {
+                            "dangling_tool_call": True,
+                            "tool_call_ids": [str(call.get("id") or "") for call in dangling_calls],
+                            "tool_names": [str(call.get("name") or "tool") for call in dangling_calls],
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
+            )
+
+    if changed:
+        messages[:] = repaired
+
+
 def _safe_summary(value: Any, limit: int = 240) -> str:
     """Return a short user-safe summary without raw diagnostics or credentials."""
     lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
@@ -1226,6 +1278,7 @@ async def stream_agent_events(
 
     messages.append(HumanMessage(content=effective_message))
 
+    _repair_dangling_tool_call_messages(messages)
     event_stream = agent.astream_events(
         {"messages": messages},
         config=config,
@@ -1314,6 +1367,7 @@ async def stream_agent_events(
                 repair_passes += 1
                 tool_errors.append({"tool": active_tool or "agent_stream", "message": str(exc)})
                 messages.append(HumanMessage(content=build_retry_instruction(f"agent event stream raised: {exc}")))
+                _repair_dangling_tool_call_messages(messages)
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,
@@ -1695,6 +1749,7 @@ async def stream_agent_events(
                         )
                     )
                 )
+                _repair_dangling_tool_call_messages(messages)
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,
@@ -1736,6 +1791,7 @@ async def stream_agent_events(
                     reasons.append("background subagents are unresolved")
                 repair_instruction = build_retry_instruction("; ".join(reasons) or "completion audit failed")
                 messages.append(HumanMessage(content=repair_instruction))
+                _repair_dangling_tool_call_messages(messages)
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,

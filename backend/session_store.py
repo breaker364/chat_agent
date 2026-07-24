@@ -256,13 +256,25 @@ def deduplicate_tool_history_events(events: list[dict[str, Any]]) -> list[dict[s
 
 
 def _append_tool_history_entries(history: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
+    valid_result_ids = {
+        str(event.get("tool_call_id") or "")
+        for event in events
+        if event.get("type") == "tool_result"
+        and not event.get("legacy_unmatched")
+        and not event.get("malformed")
+        and event.get("tool_call_id")
+    }
     index = 0
     while index < len(events):
         event = events[index]
         if event["type"] == "tool_call":
             batch: list[dict[str, Any]] = []
             first_sequence = event["sequence"]
-            while index < len(events) and events[index]["type"] == "tool_call":
+            while (
+                index < len(events)
+                and events[index]["type"] == "tool_call"
+                and str(events[index].get("tool_call_id") or "") in valid_result_ids
+            ):
                 call = events[index]
                 batch.append(
                     {
@@ -273,14 +285,31 @@ def _append_tool_history_entries(history: list[dict[str, Any]], events: list[dic
                     }
                 )
                 index += 1
+            if batch:
+                history.append(
+                    {
+                        "role": "assistant_tool_calls",
+                        "sequence": first_sequence,
+                        "tool_calls": batch,
+                        "protected_tool_history": True,
+                    }
+                )
+                continue
             history.append(
                 {
-                    "role": "assistant_tool_calls",
-                    "sequence": first_sequence,
-                    "tool_calls": batch,
-                    "protected_tool_history": True,
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "dangling_tool_call": True,
+                            "tool_call_id": event.get("tool_call_id"),
+                            "name": event.get("name"),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                 }
             )
+            index += 1
             continue
 
         if event.get("legacy_unmatched"):

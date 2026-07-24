@@ -421,6 +421,88 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual([entry["tool_call_id"] for entry in results], ["call-a", "call-b"])
         self.assertEqual([entry["content"] for entry in results], ["first result", "second result"])
 
+    def test_unmatched_protected_tool_call_does_not_rehydrate_native_tool_call(self):
+        tools = [_tool_call(0, "dangling-call", "lookup", {"query": "missing result"})]
+        self._complete_turn("dangling-history", "question", "answer", tools)
+
+        history = self.store.get_history("dangling-history")
+        messages = self._capture_prompt_messages(history)
+        native_tool_calls = [
+            tool_call
+            for message in messages
+            if isinstance(message, AIMessage) and message.tool_calls
+            for tool_call in message.tool_calls
+        ]
+        diagnostics = [
+            message.content
+            for message in messages
+            if isinstance(message, AIMessage) and not message.tool_calls
+        ]
+
+        self.assertEqual(self.store.load_session("dangling-history")["messages"][-1]["tools"], tools)
+        self.assertEqual(native_tool_calls, [])
+        self.assertTrue(any("dangling_tool_call" in str(content) for content in diagnostics))
+
+    def test_retry_repair_removes_dangling_tool_calls_before_reinvocation(self):
+        class RaisingIterator:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise RuntimeError("invalid chat history")
+
+        class MutatingRetryAgent:
+            def __init__(self):
+                self.calls = []
+
+            def astream_events(self, values, *, config, version):
+                self.calls.append(list(values["messages"]))
+                if len(self.calls) == 1:
+                    values["messages"].append(
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "lookup",
+                                    "args": {"query": "dangling"},
+                                    "id": "dangling-retry-call",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        )
+                    )
+                    return RaisingIterator()
+                return _EventIterator(
+                    [
+                        {"event": "on_chat_model_stream", "name": "model", "data": {"chunk": AIMessage(content="final answer")}},
+                        {"event": "on_chain_end", "name": "LangGraph", "data": {}},
+                    ]
+                )
+
+        def dangling_tool_call_ids(messages):
+            remaining = []
+            for message in messages:
+                if isinstance(message, AIMessage) and message.tool_calls:
+                    remaining.extend(tool_call["id"] for tool_call in message.tool_calls)
+                elif isinstance(message, ToolMessage) and message.tool_call_id in remaining:
+                    remaining.remove(message.tool_call_id)
+            return remaining
+
+        class CompleteAuditor:
+            def invoke(self, messages):
+                return AIMessage(content=json.dumps({"complete": True, "reason": "done", "status": "completed"}))
+
+        agent = MutatingRetryAgent()
+
+        async def collect():
+            with patch("backend.agent.load_llm_config", return_value={}), patch("backend.agent.create_chat_deepseek", return_value=CompleteAuditor()):
+                return [event async for event in stream_agent_events(agent, "request", "retry-repair")]
+
+        asyncio.run(collect())
+
+        self.assertGreaterEqual(len(agent.calls), 2)
+        self.assertEqual(dangling_tool_call_ids(agent.calls[1]), [])
+
     def test_run_loop_continues_before_completion_audit_when_no_final_answer(self):
         audit_calls = {"count": 0}
 
