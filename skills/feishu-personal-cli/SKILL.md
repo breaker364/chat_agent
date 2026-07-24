@@ -1,11 +1,13 @@
 ---
 name: feishu-personal-cli
-description: CLI-only Feishu/Lark personal-session operations for docx, wiki, sheets, bitable, whiteboard, chat, calendar, and minutes. Use when Codex must operate Feishu personal resources through standardized `lark ...` commands only, without natural-language skill routing or reading implementation internals unless debugging a CLI failure.
+description: Standalone CLI-only Feishu/Lark personal-session operations for docx, wiki, sheets, bitable, whiteboard, chat, calendar, and minutes. Executes standardized `lark ...` commands in-process through the lark_tools package. Use when the agent must operate Feishu personal resources through explicit CLI commands only, without natural-language routing.
 ---
 
 # Feishu Personal CLI
 
-Use this skill as the strict CLI interface to the existing Feishu personal-session tooling.
+This is a self-contained CLI-only skill for Feishu/Lark personal-session operations.
+It executes `lark ...` commands in-process through the locally bundled `lark_tools/` package.
+No dependency on the `feishu-personal` skill.
 
 ## Contract
 
