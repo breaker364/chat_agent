@@ -11,14 +11,17 @@ The chat endpoints call `SessionStore.get_history()` before each run. The loader
 - Preserve a lossless, ordered tool transcript in each newly completed assistant turn.
 - Restore the complete transcript for the three most recent completed turns as native LangChain assistant tool-call and tool-result messages.
 - Preserve all tool arguments and result content for those protected turns without application-level truncation.
+- Deduplicate identical protected tool-call/result pairs during history loading to reduce prompt pressure caused by duplicate event emissions.
 - Fail explicitly when protected history cannot fit the configured context budget rather than silently removing protected tool content.
 - Read legacy session records deterministically without changing their on-disk data.
+- Let the agent decide whether more `tool_use` is needed before stopping; continue bounded execution when the agent has not had a final no-more-tools decision point.
 
 **Non-Goals:**
 
 - Reconstruct original runtime IDs that legacy sessions never persisted.
 - Preserve native tool messages for turns older than the three-turn retention window.
 - Replace the tool-result cache, task-output audit log, or current per-run duplicate-call protections.
+- Deduplicate the canonical `messages[*].tools` transcript stored on disk.
 - Change tool behavior, result content, or external tool APIs.
 
 ## Decisions
@@ -46,6 +49,20 @@ The loader will identify the three latest completed user-to-assistant turns. Too
 Before invoking the model, the agent will account for the complete protected tool payload plus system and current-user messages. If it exceeds the configured application context budget, it will return a clear context-capacity error without invoking the model. If the provider rejects the assembled messages for a stricter provider limit, error reporting will preserve the same no-silent-truncation guarantee.
 
 Alternative considered: reduce the protected window or truncate the oldest result dynamically. Both violate the stated requirement.
+
+### Deduplicate the protected history projection, not storage
+
+The session file remains the lossless audit source. `get_history()` will normalize the stored events, pair calls and results, then collapse only identical duplicate call/result pairs before producing protected native-history entries. A duplicate pair is identified by a stable projection key containing the tool name, normalized arguments, and normalized result content. The first occurrence keeps its original order and `tool_call_id`; later identical pairs are omitted from the model context only.
+
+This targets duplicate event emissions such as repeated same-argument tool starts/ends while preserving materially different repeated calls, including same-tool calls whose arguments or result content differ.
+
+Alternative considered: deduplicate all same-name/same-argument calls regardless of result. That could hide legitimate repeated calls that returned different evidence, so result content participates in the key.
+
+### Continue until the agent has decided no more tools are needed
+
+The run loop will not treat an ordinary graph end as sufficient when the model produced no final answer or otherwise ended before a final tool/no-tool decision point. In that case it will append a continuation instruction to the same message list, telling the agent to either call any remaining tools now or provide the final answer if no more tools are needed. The continuation shares the existing bounded repair-pass safety limit and does not reset collected tool history, duplicate suppression, or completed-step state.
+
+Tool errors, unresolved background agents, and policy audit failures can still trigger the existing repair path. The new stop condition specifically covers early graph termination where no final answer was produced, ensuring the agent, not the wrapper, makes the no-more-tools decision before `done` is emitted.
 
 ### Normalize legacy records deterministically
 

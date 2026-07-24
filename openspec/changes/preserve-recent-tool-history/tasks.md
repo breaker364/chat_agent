@@ -30,3 +30,12 @@
 - [x] 5.3 Add tests proving only the latest three completed turns rehydrate native tool messages while older turns keep text history only.
 - [x] 5.4 Add tests for legacy records with missing IDs, repeated names, and unmatched results.
 - [x] 5.5 Add tests for protected context overflow returning an explicit error without invoking the model.
+
+## 6. Context Deduplication and Stop Completion
+
+- [x] 6.1 Add tests proving `get_history()` deduplicates identical protected tool-call/result pairs without mutating canonical `messages[*].tools`.
+- [x] 6.2 Add tests proving materially different repeated tool pairs remain in native rehydration.
+- [x] 6.3 Add tests proving the run loop continues when the graph ends before a usable final answer, giving the agent another chance to use tools or finalize.
+- [x] 6.4 Implement protected-history projection deduplication in the read path only.
+- [x] 6.5 Implement bounded agent continuation before normal stop when no usable final answer exists.
+- [x] 6.6 Validate focused tests, backend tests, and OpenSpec strict validation.

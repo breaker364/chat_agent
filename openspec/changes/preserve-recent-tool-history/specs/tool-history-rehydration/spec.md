@@ -22,6 +22,17 @@ Before invoking the model for a new request, the system SHALL restore tool activ
 - **WHEN** a completed turn contains a call-result sequence followed by another call-result sequence
 - **THEN** the model input SHALL replay both batches in their persisted execution order before the final assistant response message
 
+### Requirement: Deduplicate protected tool-history projection
+Before invoking the model for a new request, the system SHALL deduplicate identical duplicate tool-call/result pairs inside the protected three-turn native rehydration window. Deduplication SHALL apply only to the history projection returned by `get_history()` and SHALL NOT mutate the canonical `messages[*].tools` transcript. Duplicate identity SHALL be based on stable normalized tool name, arguments, and result content; the first occurrence SHALL be retained.
+
+#### Scenario: Duplicate emitted tool pair exists in a protected turn
+- **WHEN** a persisted assistant turn contains two tool-call/result pairs with the same tool name, equivalent arguments, and equivalent result content
+- **THEN** `get_history()` SHALL return one native replay pair for that duplicate identity and SHALL preserve the original stored events unchanged
+
+#### Scenario: Repeated calls have different results
+- **WHEN** a persisted assistant turn contains two calls with the same tool name and equivalent arguments but different result content
+- **THEN** `get_history()` SHALL retain both pairs in the native replay projection
+
 ### Requirement: Limit lossless tool rehydration to three turns
 The system SHALL protect complete tool activity for exactly the three most recent completed conversation turns. It SHALL NOT rehydrate native tool messages from older turns, while continuing to restore their permitted text history under the existing history policy.
 
@@ -35,6 +46,17 @@ The system SHALL NOT truncate, summarize, or omit arguments or result content fr
 #### Scenario: Protected tool results exceed the application budget
 - **WHEN** the complete native tool transcript from the protected window plus required prompt content exceeds the configured context budget
 - **THEN** the system SHALL return a context-capacity error and SHALL NOT invoke the model with a truncated protected transcript
+
+### Requirement: Continue until agent decides no further tool use is needed
+The system SHALL NOT emit a normal completion solely because the graph ended when the agent has not produced a final answer or has not had an explicit final opportunity to decide whether more `tool_use` is required. It SHALL continue the same agent run with a bounded continuation instruction that asks the agent to either call any remaining tools or finalize if no further tools are needed.
+
+#### Scenario: Graph ends before a final answer
+- **WHEN** a model pass ends without a usable final assistant answer and without a terminal capacity or tool-budget failure
+- **THEN** the system SHALL append a continuation instruction and invoke the agent again so it can either perform more `tool_use` or provide the final answer
+
+#### Scenario: Agent provides a usable final answer
+- **WHEN** the agent produces a usable final assistant answer and no bounded repair condition remains
+- **THEN** the system SHALL emit normal completion without adding another continuation pass
 
 ### Requirement: Read legacy tool records deterministically
 The system SHALL read existing assistant records that lack `tool_call_id` without rewriting them. It SHALL assign stable synthetic IDs and pair compatible call and result events in persisted sequence order using per-tool FIFO matching. It SHALL preserve all available legacy arguments and result content.

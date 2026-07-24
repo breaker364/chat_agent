@@ -23,6 +23,37 @@ class CapturingAgent:
             yield event
 
 
+class _EventIterator:
+    def __init__(self, events):
+        self.events = list(events)
+        self.index = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.index >= len(self.events):
+            raise StopAsyncIteration
+        event = self.events[self.index]
+        self.index += 1
+        return event
+
+
+class SequentialAgent:
+    def __init__(self, event_runs=None, before_call=None):
+        self.event_runs = [list(run) for run in (event_runs or [])]
+        self.before_call = before_call
+        self.calls = []
+
+    def astream_events(self, values, *, config, version):
+        call_number = len(self.calls) + 1
+        if self.before_call:
+            self.before_call(call_number)
+        self.calls.append(values["messages"])
+        events = self.event_runs.pop(0) if self.event_runs else []
+        return _EventIterator(events)
+
+
 class JsonRequest:
     def __init__(self, body):
         self.body = body
@@ -352,3 +383,111 @@ class ToolHistoryTests(unittest.TestCase):
         errors = [json.loads(event["data"]) for event in events if event["event"] == "error"]
         self.assertEqual(agent.calls, [])
         self.assertEqual(errors[0]["code"], "protected_context_capacity_exceeded")
+
+    def test_get_history_deduplicates_identical_protected_tool_pairs_without_mutating_storage(self):
+        arguments = {"query": "same"}
+        tools = [
+            _tool_call(0, "call-a", "lookup", arguments),
+            _tool_result(1, "call-a", "lookup", "same result"),
+            _tool_call(2, "call-b", "lookup", {"query": "same"}),
+            _tool_result(3, "call-b", "lookup", "same result"),
+        ]
+        self._complete_turn("dedupe-history", "question", "answer", tools)
+
+        history = self.store.get_history("dedupe-history")
+        stored_tools = self.store.load_session("dedupe-history")["messages"][-1]["tools"]
+        calls = [entry for entry in history if entry.get("role") == "assistant_tool_calls"]
+        results = [entry for entry in history if entry.get("role") == "tool"]
+
+        self.assertEqual(stored_tools, tools)
+        self.assertEqual([call["id"] for entry in calls for call in entry["tool_calls"]], ["call-a"])
+        self.assertEqual([entry["tool_call_id"] for entry in results], ["call-a"])
+        self.assertEqual([entry["content"] for entry in results], ["same result"])
+
+    def test_get_history_keeps_repeated_tool_pairs_when_results_differ(self):
+        tools = [
+            _tool_call(0, "call-a", "lookup", {"query": "same"}),
+            _tool_result(1, "call-a", "lookup", "first result"),
+            _tool_call(2, "call-b", "lookup", {"query": "same"}),
+            _tool_result(3, "call-b", "lookup", "second result"),
+        ]
+        self._complete_turn("dedupe-different-results", "question", "answer", tools)
+
+        history = self.store.get_history("dedupe-different-results")
+        calls = [entry for entry in history if entry.get("role") == "assistant_tool_calls"]
+        results = [entry for entry in history if entry.get("role") == "tool"]
+
+        self.assertEqual([call["id"] for entry in calls for call in entry["tool_calls"]], ["call-a", "call-b"])
+        self.assertEqual([entry["tool_call_id"] for entry in results], ["call-a", "call-b"])
+        self.assertEqual([entry["content"] for entry in results], ["first result", "second result"])
+
+    def test_run_loop_continues_before_completion_audit_when_no_final_answer(self):
+        audit_calls = {"count": 0}
+
+        class CompleteAuditor:
+            def invoke(self, messages):
+                return AIMessage(content=json.dumps({
+                    "complete": True,
+                    "reason": "test auditor says complete",
+                    "required_next_action": "none",
+                    "status": "completed",
+                }))
+
+        def fake_create_chat_deepseek(*args, **kwargs):
+            audit_calls["count"] += 1
+            return CompleteAuditor()
+
+        def before_call(call_number):
+            if call_number == 2:
+                self.assertEqual(audit_calls["count"], 0)
+
+        agent = SequentialAgent(
+            [
+                [{"event": "on_chain_end", "name": "LangGraph", "data": {}}],
+                [
+                    {"event": "on_chat_model_stream", "name": "model", "data": {"chunk": AIMessage(content="final answer")}},
+                    {"event": "on_chain_end", "name": "LangGraph", "data": {}},
+                ],
+            ],
+            before_call=before_call,
+        )
+
+        async def collect():
+            with patch("backend.agent.load_llm_config", return_value={}), patch("backend.agent.create_chat_deepseek", fake_create_chat_deepseek):
+                return [event async for event in stream_agent_events(agent, "request", "continue-before-audit")]
+
+        events = asyncio.run(collect())
+        debug_stages = [json.loads(event["data"]).get("stage") for event in events if event["event"] == "debug"]
+
+        self.assertEqual(len(agent.calls), 2)
+        self.assertIn("agent_tool_use_continuation", debug_stages)
+        self.assertGreaterEqual(audit_calls["count"], 1)
+
+    def test_run_loop_does_not_continue_after_usable_final_answer(self):
+        class CompleteAuditor:
+            def invoke(self, messages):
+                return AIMessage(content=json.dumps({
+                    "complete": True,
+                    "reason": "final answer exists",
+                    "required_next_action": "none",
+                    "status": "completed",
+                }))
+
+        agent = SequentialAgent(
+            [
+                [
+                    {"event": "on_chat_model_stream", "name": "model", "data": {"chunk": AIMessage(content="final answer")}},
+                    {"event": "on_chain_end", "name": "LangGraph", "data": {}},
+                ]
+            ]
+        )
+
+        async def collect():
+            with patch("backend.agent.load_llm_config", return_value={}), patch("backend.agent.create_chat_deepseek", return_value=CompleteAuditor()):
+                return [event async for event in stream_agent_events(agent, "request", "final-answer-stop")]
+
+        events = asyncio.run(collect())
+        done_events = [event for event in events if event["event"] == "done"]
+
+        self.assertEqual(len(agent.calls), 1)
+        self.assertEqual(len(done_events), 1)

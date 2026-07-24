@@ -24,7 +24,7 @@ SYSTEM_PROMPT = load_system_prompt()
 AGENT_POLICY = load_agent_policy()
 
 
-MAX_AGENT_STEPS = 80
+MAX_AGENT_STEPS = 180
 MAX_WEB_SEARCH_CALLS = 10
 MAX_WEB_FETCH_CALLS = 5
 MAX_AGENT_REPAIR_PASSES = 2
@@ -817,6 +817,21 @@ async def stream_agent_events(
             f"Failed or blocked subtasks to repair:\n{failed_step_summary()}\n\n"
             f"Recent debug/tool errors:\n{errors_text}\n\n"
             "Follow the policy above. Re-run only corrected calls for the failed subtask and verify concrete outputs before finalizing."
+        )
+
+    def build_tool_use_continuation_instruction(reason: str) -> str:
+        tool_summary = build_tool_summary()
+        return (
+            f"{AGENT_POLICY}\n\n"
+            "IMPORTANT: You are continuing the same user request because the previous model pass ended "
+            "before a usable final answer was produced. Decide the next step yourself: "
+            "if more tool_use is needed, call the required tool(s) now; if no more tools are needed, "
+            "provide the final answer now. Do not restart completed work or repeat identical successful tool calls.\n\n"
+            f"Reason for continuation: {reason}\n\n"
+            f"Tools already called in this run: {tool_summary}\n\n"
+            f"Completed subtasks that must be reused, not repeated:\n{completed_step_summary()}\n\n"
+            f"Unfinished subtasks, if any:\n{unfinished_step_summary()}\n\n"
+            "Stop only by giving a final answer when you determine no additional tool_use is required."
         )
 
     def looks_incomplete(final_text: str) -> bool:
@@ -1671,6 +1686,35 @@ async def stream_agent_events(
             final_text = collected_text
             if not should_use_collected_text_as_final(final_text) and last_web_search_payload:
                 final_text = build_search_fallback(last_web_search_payload)
+            if looks_incomplete(final_text) and repair_passes < MAX_AGENT_REPAIR_PASSES:
+                repair_passes += 1
+                messages.append(
+                    HumanMessage(
+                        content=build_tool_use_continuation_instruction(
+                            "model pass ended without a usable final answer"
+                        )
+                    )
+                )
+                event_stream = agent.astream_events(
+                    {"messages": messages},
+                    config=config,
+                    version="v2",
+                ).__aiter__()
+                pending_event = None
+                active_tool = None
+                yield {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "agent_tool_use_continuation",
+                            "message": "Model ended without a final answer; continuing so the agent can decide whether more tool_use is needed.",
+                            "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                            "repair_pass": repair_passes,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                continue
             recent_tool_error = bool(tool_errors)
             audit = audit_completion_with_policy(final_text)
             needs_repair = (

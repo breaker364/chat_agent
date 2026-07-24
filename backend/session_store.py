@@ -197,6 +197,64 @@ def normalize_tool_events(tools: Any, turn_index: int) -> list[dict[str, Any]]:
     return normalized
 
 
+def _stable_history_projection_value(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        return str(value)
+
+
+def deduplicate_tool_history_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse identical matched call/result pairs for prompt projection only."""
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    duplicate_call_ids: set[str] = set()
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for event in events:
+        tool_call_id = str(event.get("tool_call_id") or "")
+        if not tool_call_id:
+            continue
+        if event.get("type") == "tool_call":
+            calls_by_id.setdefault(tool_call_id, event)
+            continue
+        if event.get("type") != "tool_result" or event.get("legacy_unmatched") or event.get("malformed"):
+            continue
+        call = calls_by_id.get(tool_call_id)
+        if not call:
+            continue
+        key = (
+            str(call.get("name") or event.get("name") or "tool"),
+            _stable_history_projection_value(call.get("arguments")),
+            _stable_history_projection_value(event.get("content")),
+        )
+        if key in seen_pairs:
+            duplicate_call_ids.add(tool_call_id)
+        else:
+            seen_pairs.add(key)
+
+    if not duplicate_call_ids:
+        return events
+
+    deduped: list[dict[str, Any]] = []
+    for event in events:
+        tool_call_id = str(event.get("tool_call_id") or "")
+        if tool_call_id not in duplicate_call_ids:
+            deduped.append(event)
+            continue
+        if event.get("type") == "tool_call":
+            continue
+        if event.get("type") == "tool_result" and not event.get("legacy_unmatched") and not event.get("malformed"):
+            continue
+        deduped.append(event)
+    return deduped
+
+
 def _append_tool_history_entries(history: list[dict[str, Any]], events: list[dict[str, Any]]) -> None:
     index = 0
     while index < len(events):
@@ -1393,7 +1451,8 @@ class SessionStore:
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
                 if role == "assistant" and index in protected_assistant_indexes:
-                    _append_tool_history_entries(history, normalize_tool_events(item.get("tools"), index))
+                    tool_events = normalize_tool_events(item.get("tools"), index)
+                    _append_tool_history_entries(history, deduplicate_tool_history_events(tool_events))
                 history.append({"role": role, "content": content})
         progress = session.get("task_progress", {})
         plan = progress.get("task_plan") if isinstance(progress, dict) else None
@@ -1785,7 +1844,8 @@ class SessionStore:
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
                 if role == "assistant" and index in protected_assistant_indexes:
-                    _append_tool_history_entries(history, normalize_tool_events(item.get("tools"), index))
+                    tool_events = normalize_tool_events(item.get("tools"), index)
+                    _append_tool_history_entries(history, deduplicate_tool_history_events(tool_events))
                 history.append({"role": role, "content": content})
 
         plan = self.load_task_plan(session_id)
