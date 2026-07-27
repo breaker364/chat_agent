@@ -9,6 +9,7 @@ export function getSessionRun(runs, sessionId) {
     usage: null,
     error: "",
     appendCommands: [],
+    runIdSource: "",
   };
 }
 
@@ -25,6 +26,7 @@ export function startSessionRun(runs, sessionId, runId) {
       usage: null,
       error: "",
       appendCommands: [],
+      runIdSource: runId ? "client" : "",
       startedAt: Date.now(),
       updatedAt: Date.now(),
     },
@@ -100,6 +102,26 @@ export function getSubmitButtonLabel(runs, sessionId) {
   return getSubmitMode(runs, sessionId) === "append" ? "追加到当前任务" : "发送";
 }
 
+export function applyRunAttribution(runs, sessionId, event) {
+  const eventSessionId = event?.session_id || event?.sessionId || "";
+  const eventRunId = event?.run_id || event?.runId || "";
+  if (!eventRunId) return runs || {};
+  if (eventSessionId && eventSessionId !== sessionId) return runs || {};
+  return updateSessionRun(runs, sessionId, () => ({
+    runId: eventRunId,
+    runIdSource: "server",
+  }));
+}
+
+export function getAppendRequestPayload(runs, sessionId, content) {
+  const run = getSessionRun(runs, sessionId);
+  const payload = { content };
+  if (run.runId && run.runIdSource === "server") {
+    payload.run_id = run.runId;
+  }
+  return payload;
+}
+
 export function recordAppendCommandEvent(runs, sessionId, event) {
   const appendId = event?.append_id || event?.appendId || "";
   return updateSessionRun(runs, sessionId, (current) => {
@@ -119,7 +141,10 @@ export function recordAppendCommandEvent(runs, sessionId, event) {
     } else {
       commands.push(normalized);
     }
-    return { appendCommands: commands };
+    return {
+      appendCommands: commands,
+      ...(normalized.run_id ? { runId: normalized.run_id, runIdSource: "server" } : {}),
+    };
   });
 }
 

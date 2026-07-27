@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   appendRunText,
+  applyRunAttribution,
   finishSessionRun,
+  getAppendRequestPayload,
   getSubmitButtonLabel,
   getSubmitEndpoint,
   getSubmitMode,
@@ -89,5 +91,38 @@ describe("session run state", () => {
     expect(shouldClearComposerAfterSubmit({ mode: "append", ok: true })).toBe(true);
     expect(shouldClearComposerAfterSubmit({ mode: "new_run", ok: false })).toBe(false);
     expect(shouldClearComposerAfterSubmit({ mode: "new_run", ok: true })).toBe(true);
+  });
+
+  it("updates the active run id from server SSE attribution", () => {
+    let runs = startSessionRun({}, "session-a", "client-run-a");
+    runs = startSessionRun(runs, "session-b", "client-run-b");
+
+    runs = applyRunAttribution(runs, "session-a", {
+      session_id: "session-a",
+      run_id: "session-a:server-run-a",
+    });
+
+    expect(getSessionRun(runs, "session-a").runId).toBe("session-a:server-run-a");
+    expect(getSessionRun(runs, "session-a").runIdSource).toBe("server");
+    expect(getSessionRun(runs, "session-b").runId).toBe("client-run-b");
+    expect(getSessionRun(runs, "session-b").runIdSource).toBe("client");
+  });
+
+  it("does not send a client-only run id in append payload", () => {
+    let runs = startSessionRun({}, "session-a", "client-run-a");
+
+    expect(getAppendRequestPayload(runs, "session-a", "追加内容")).toEqual({
+      content: "追加内容",
+    });
+
+    runs = applyRunAttribution(runs, "session-a", {
+      session_id: "session-a",
+      run_id: "session-a:server-run-a",
+    });
+
+    expect(getAppendRequestPayload(runs, "session-a", "追加内容")).toEqual({
+      content: "追加内容",
+      run_id: "session-a:server-run-a",
+    });
   });
 });

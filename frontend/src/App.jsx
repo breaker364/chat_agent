@@ -38,7 +38,9 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   appendRunText,
+  applyRunAttribution,
   finishSessionRun,
+  getAppendRequestPayload,
   getSubmitButtonLabel,
   getSubmitEndpoint,
   getSubmitMode,
@@ -1697,16 +1699,11 @@ export default function App() {
     }
 
     if (isAppendMode) {
-      const appendRun = getSessionRun(sessionRuns, ensuredSessionId);
-      const appendRunId = appendRun.runId || "";
       try {
         const resp = await fetch(getSubmitEndpoint(API_BASE, sessionRuns, ensuredSessionId), {
           method: "POST",
           headers: { "Content-Type": "application/json; charset=utf-8" },
-          body: JSON.stringify({
-            content: text,
-            run_id: appendRunId,
-          }),
+          body: JSON.stringify(getAppendRequestPayload(sessionRuns, ensuredSessionId, text)),
         });
         let payload = {};
         try {
@@ -1835,6 +1832,9 @@ export default function App() {
         parsed = JSON.parse(rawData);
       } catch {
         parsed = rawData;
+      }
+      if (parsed && typeof parsed === "object" && parsed.run_id) {
+        setSessionRuns((prev) => applyRunAttribution(prev, ensuredSessionId, parsed));
       }
 
       if (eventType === "text") {
