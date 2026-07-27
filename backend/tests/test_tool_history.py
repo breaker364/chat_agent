@@ -693,6 +693,69 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertIn("agent_tool_use_continuation", debug_stages)
         self.assertGreaterEqual(audit_calls["count"], 1)
 
+    def test_run_loop_forces_final_when_plan_complete_and_primary_result_registered(self):
+        session_id = "force-final-primary-result"
+        self.store.set_task_plan(
+            session_id,
+            [
+                {
+                    "task_id": "create_output",
+                    "content": "Create output",
+                    "activeForm": "Creating output",
+                    "status": "completed",
+                    "details": "Output created",
+                    "result_ref": "tmp/result.md",
+                }
+            ],
+            source="model",
+            reason="test",
+        )
+        self.store.record_primary_result(
+            session_id,
+            {
+                "type": "file",
+                "title": "Result",
+                "path": "tmp/result.md",
+                "summary": "Primary result is ready.",
+                "source_tool": "record_primary_result",
+            },
+        )
+
+        agent = SequentialAgent(
+            [
+                [
+                    {"event": "on_tool_start", "name": "record_primary_result", "run_id": "primary-result-call", "data": {"input": {"path": "tmp/result.md"}}},
+                    {
+                        "event": "on_tool_end",
+                        "name": "record_primary_result",
+                        "run_id": "primary-result-call",
+                        "data": {"output": json.dumps({"success": True, "primary_result": {"path": "tmp/result.md"}}, ensure_ascii=False)},
+                    },
+                    {"event": "on_chain_end", "name": "LangGraph", "data": {}},
+                ],
+                [
+                    {"event": "on_chat_model_stream", "name": "model", "data": {"chunk": AIMessage(content="should not continue")}},
+                    {"event": "on_chain_end", "name": "LangGraph", "data": {}},
+                ],
+            ]
+        )
+
+        async def collect():
+            with patch("backend.agent.SessionStore", return_value=self.store), patch(
+                "backend.agent.create_chat_deepseek",
+                side_effect=AssertionError("completion audit should not run after forced finalization"),
+            ):
+                return [event async for event in stream_agent_events(agent, "request", session_id)]
+
+        events = asyncio.run(collect())
+        done_text = json.loads(next(event["data"] for event in events if event["event"] == "done"))
+        debug_stages = [json.loads(event["data"]).get("stage") for event in events if event["event"] == "debug"]
+
+        self.assertEqual(len(agent.calls), 1)
+        self.assertIn("forced_final_after_completion_gate", debug_stages)
+        self.assertIn("tmp/result.md", done_text)
+        self.assertIn("Primary result is ready.", done_text)
+
     def test_run_loop_does_not_continue_after_usable_final_answer(self):
         class CompleteAuditor:
             def invoke(self, messages):

@@ -886,6 +886,68 @@ async def stream_agent_events(
             "Stop only by giving a final answer when you determine no additional tool_use is required."
         )
 
+    def completion_gate_context() -> dict[str, Any] | None:
+        """Return persisted completion context when this run should stop immediately."""
+        current_run_recorded_primary = any(
+            (tool_name or "").lower() == "record_primary_result"
+            for tool_name in tool_call_names
+        )
+        if not current_run_recorded_primary:
+            return None
+        try:
+            context = SessionStore(Path.cwd()).get_resume_context(session_id)
+        except Exception:
+            return None
+
+        primary = context.get("primary_result")
+        completed = context.get("completed_todos")
+        unfinished = context.get("unfinished_todos")
+        if not isinstance(primary, dict):
+            return None
+        if str(primary.get("source_tool") or "") != "record_primary_result":
+            return None
+        if not isinstance(completed, list) or not completed:
+            return None
+        if not isinstance(unfinished, list) or unfinished:
+            return None
+        return context
+
+    def forced_completion_response(context: dict[str, Any]) -> str:
+        primary = context.get("primary_result") if isinstance(context, dict) else {}
+        if not isinstance(primary, dict):
+            primary = {}
+        completed = context.get("completed_todos") if isinstance(context, dict) else []
+        if not isinstance(completed, list):
+            completed = []
+
+        title = str(primary.get("title") or primary.get("type") or "Result").strip()
+        target = str(
+            primary.get("url")
+            or primary.get("path")
+            or primary.get("token")
+            or primary.get("table_id")
+            or ""
+        ).strip()
+        summary = str(primary.get("summary") or "").strip()
+
+        lines = ["任务已完成。", "", "**主要结果**"]
+        if target:
+            lines.append(f"- {title}: {target}")
+        else:
+            lines.append(f"- {title}")
+        if summary:
+            lines.append(f"- 摘要: {summary}")
+        if completed:
+            lines.extend(["", "**已完成事项**"])
+            for todo in completed[:8]:
+                if not isinstance(todo, dict):
+                    continue
+                label = str(todo.get("content") or todo.get("task_id") or "").strip()
+                detail = str(todo.get("details") or todo.get("result_ref") or "completed").strip()
+                if label:
+                    lines.append(f"- {label}: {detail}")
+        return "\n".join(lines).strip()
+
     def looks_incomplete(final_text: str) -> bool:
         return not bool((final_text or "").strip())
 
@@ -1650,6 +1712,29 @@ async def stream_agent_events(
                     ensure_ascii=False,
                 ),
             }
+            forced_context = completion_gate_context()
+            if forced_context:
+                final_text = forced_completion_response(forced_context)
+                yield {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "forced_final_after_completion_gate",
+                            "message": "All task plan todos are completed and a primary result is registered; stopping without another model/tool pass.",
+                            "elapsed_seconds": elapsed_seconds,
+                            "tool": tool_name,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                yield {
+                    "event": "done",
+                    "data": json.dumps(
+                        ensure_completion_summary(final_text, status="completed"),
+                        ensure_ascii=False,
+                    ),
+                }
+                return
 
         elif kind == "on_chat_model_start":
             current_model_usage = {}
@@ -1740,6 +1825,28 @@ async def stream_agent_events(
             final_text = collected_text
             if not should_use_collected_text_as_final(final_text) and last_web_search_payload:
                 final_text = build_search_fallback(last_web_search_payload)
+            forced_context = completion_gate_context()
+            if forced_context and looks_incomplete(final_text):
+                final_text = forced_completion_response(forced_context)
+                yield {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "forced_final_after_completion_gate",
+                            "message": "All task plan todos are completed and a primary result is registered; stopping before repair continuation.",
+                            "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                yield {
+                    "event": "done",
+                    "data": json.dumps(
+                        ensure_completion_summary(final_text, status="completed"),
+                        ensure_ascii=False,
+                    ),
+                }
+                return
             if looks_incomplete(final_text) and repair_passes < MAX_AGENT_REPAIR_PASSES:
                 repair_passes += 1
                 messages.append(
