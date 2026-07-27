@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import Runnable
 from langgraph.prebuilt import create_react_agent
 
 from .config import create_chat_deepseek, load_llm_config
 from .prompts import load_agent_policy, load_system_prompt
+from .session_events import get_session_event_hub
 from .session_store import SessionStore
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
-from .runtime_context import current_run_id
+from .runtime_context import current_run_id, current_session_id
 from .run_append import consume_pending_append_commands
 from .tools import get_all_tools, _normalize_tool_payload_for_key
 from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
@@ -39,6 +41,122 @@ _SENSITIVE_TEXT_RE = re.compile(
     r"(?:api[_-]?key|authorization|token|password|secret|cookie|credential)\s*[:=]?\s*\S+",
     re.IGNORECASE,
 )
+
+
+def _append_marker(sequence: int) -> str:
+    return f"用户追加指令（运行中补充，第 {sequence} 条）："
+
+
+def _record_append_command_injected(session_id: str, command_payload: dict[str, Any]) -> None:
+    try:
+        SessionStore(Path.cwd()).record_append_command_event(session_id, command_payload)
+    except Exception:
+        pass
+    try:
+        get_session_event_hub().publish(
+            session_id,
+            {
+                "stage": "append_command_injected",
+                "message": "Injected appended instruction before the next model call.",
+                "session_id": session_id,
+                "run_id": command_payload.get("run_id"),
+                "append_id": command_payload.get("append_id"),
+                "status": command_payload.get("status"),
+                "sequence": command_payload.get("sequence"),
+            },
+        )
+    except Exception:
+        pass
+
+
+def _inject_pending_append_commands_into_messages(
+    session_id: str,
+    run_id: str,
+    messages: list[BaseMessage],
+) -> list[dict[str, Any]]:
+    normalized_session_id = str(session_id or "default").strip() or "default"
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        return []
+    commands = consume_pending_append_commands(normalized_session_id, normalized_run_id)
+    if not commands:
+        return []
+    injected: list[dict[str, Any]] = []
+    for command in commands:
+        payload = command.to_dict()
+        messages.append(HumanMessage(content=f"{_append_marker(command.sequence)}\n{command.content}"))
+        _record_append_command_injected(normalized_session_id, payload)
+        injected.append(payload)
+    return injected
+
+
+def _copy_input_with_appendable_messages(input_value: Any) -> tuple[Any, list[BaseMessage] | None]:
+    if isinstance(input_value, dict):
+        raw_messages = input_value.get("messages")
+        if isinstance(raw_messages, (list, tuple)):
+            copied_messages = list(raw_messages)
+            return {**input_value, "messages": copied_messages}, copied_messages
+        return input_value, None
+    if isinstance(input_value, (list, tuple)):
+        copied_messages = list(input_value)
+        return copied_messages, copied_messages
+    return input_value, None
+
+
+def _inject_pending_append_commands_into_model_input(input_value: Any) -> Any:
+    rewritten_input, messages = _copy_input_with_appendable_messages(input_value)
+    if messages is None:
+        return input_value
+    session_id = current_session_id()
+    run_id = current_run_id()
+    if not session_id or not run_id:
+        return input_value
+    _inject_pending_append_commands_into_messages(session_id, run_id, messages)
+    return rewritten_input
+
+
+class AppendAwareChatModel(Runnable[Any, Any]):
+    """Runnable proxy that checks run-scoped append commands before model calls."""
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> "AppendAwareChatModel":
+        return AppendAwareChatModel(self._model.bind_tools(*args, **kwargs))
+
+    def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        injected_input = _inject_pending_append_commands_into_model_input(input)
+        if config is None:
+            return self._model.invoke(injected_input, **kwargs)
+        return self._model.invoke(injected_input, config, **kwargs)
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        injected_input = _inject_pending_append_commands_into_model_input(input)
+        if config is None:
+            return await self._model.ainvoke(injected_input, **kwargs)
+        return await self._model.ainvoke(injected_input, config, **kwargs)
+
+    def stream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        injected_input = _inject_pending_append_commands_into_model_input(input)
+        if config is None:
+            return self._model.stream(injected_input, **kwargs)
+        return self._model.stream(injected_input, config, **kwargs)
+
+    async def astream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        injected_input = _inject_pending_append_commands_into_model_input(input)
+        if config is None:
+            async for chunk in self._model.astream(injected_input, **kwargs):
+                yield chunk
+        else:
+            async for chunk in self._model.astream(injected_input, config, **kwargs):
+                yield chunk
+
+
+def wrap_chat_model_with_append_injection(model: Any) -> AppendAwareChatModel:
+    return AppendAwareChatModel(model)
 
 
 def estimate_tokens_from_text(text: str) -> int:
@@ -458,7 +576,7 @@ async def build_agent(
 ) -> Any:
     """Build and return a compiled LangGraph react agent."""
     cfg = load_llm_config(config_path)
-    llm = create_chat_deepseek(cfg)
+    llm = wrap_chat_model_with_append_injection(create_chat_deepseek(cfg))
     tools = await get_all_tools(workspace_dir=workspace_dir)
     agent = create_react_agent(
         model=llm,
@@ -1032,21 +1150,7 @@ async def stream_agent_events(
         run_id = current_run_id()
         if not run_id:
             return []
-        commands = consume_pending_append_commands(session_id, run_id)
-        if not commands:
-            return []
-        injected: list[dict[str, Any]] = []
-        store = SessionStore(Path.cwd())
-        for command in commands:
-            payload = command.to_dict()
-            marker = f"用户追加指令（运行中补充，第 {command.sequence} 条）："
-            messages.append(HumanMessage(content=f"{marker}\n{command.content}"))
-            try:
-                store.record_append_command_event(session_id, payload)
-            except Exception:
-                pass
-            injected.append(payload)
-        return injected
+        return _inject_pending_append_commands_into_messages(session_id, run_id, messages)
 
     def append_injected_debug_events(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []

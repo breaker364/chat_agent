@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
 
 from backend import main as main_module
-from backend.agent import stream_agent_events
+from backend.agent import build_agent, stream_agent_events
 from backend.main import app
 from backend.runtime_context import bind_runtime_context, reset_runtime_context
 from backend.session_store import SessionStore
@@ -54,6 +54,24 @@ class JsonRequest:
 class CompleteAuditor:
     def invoke(self, _messages):
         return AIMessage(content=json.dumps({"complete": True, "reason": "done", "status": "completed"}))
+
+
+class RecordingChatModel:
+    def __init__(self):
+        self.calls = []
+        self.bound_tools = []
+
+    def bind_tools(self, tools):
+        self.bound_tools.append(list(tools))
+        return self
+
+    def invoke(self, input, *args, **kwargs):
+        self.calls.append(("invoke", input))
+        return AIMessage(content="ok")
+
+    def stream(self, input, *args, **kwargs):
+        self.calls.append(("stream", input))
+        yield AIMessage(content="ok")
 
 
 class RunAppendTests(unittest.TestCase):
@@ -175,6 +193,68 @@ class RunAppendTests(unittest.TestCase):
         self.assertIn("append_command_injected", debug_stages)
         progress = self.store.load_session(session_id)["task_progress"]
         self.assertEqual(progress["append_commands"][0]["status"], "injected")
+
+    def test_build_agent_model_injects_pending_appends_on_invoke_and_stream(self):
+        session_id = "model-call-inject-session"
+        run = self._acquire_run(session_id)
+        llm = RecordingChatModel()
+
+        def fake_create_react_agent(*, model, tools, state_schema):
+            return model.bind_tools(tools)
+
+        async def fake_get_all_tools(*args, **kwargs):
+            return []
+
+        with patch("backend.main.get_session_store", return_value=self.store):
+            first = self._client().post(
+                f"/sessions/{session_id}/runs/current/append",
+                json={"content": "invoke 前追加", "run_id": run["run_id"]},
+            )
+        self.assertEqual(first.status_code, 200)
+
+        context_tokens = bind_runtime_context(session_id, run["run_id"])
+        try:
+            with patch("backend.agent.SessionStore", return_value=self.store), patch(
+                "backend.agent.load_llm_config", return_value={}
+            ), patch("backend.agent.create_chat_deepseek", return_value=llm), patch(
+                "backend.agent.get_all_tools", fake_get_all_tools
+            ), patch("backend.agent.create_react_agent", fake_create_react_agent):
+                model = asyncio.run(build_agent())
+                model.invoke({"messages": [HumanMessage(content="原始任务")]})
+
+            invoke_messages = llm.calls[0][1]["messages"]
+            invoke_joined = "\n".join(
+                message.content for message in invoke_messages if isinstance(message, HumanMessage)
+            )
+            self.assertIn("原始任务", invoke_joined)
+            self.assertIn("用户追加指令", invoke_joined)
+            self.assertIn("invoke 前追加", invoke_joined)
+            self.assertEqual(invoke_joined.count("invoke 前追加"), 1)
+
+            with patch("backend.main.get_session_store", return_value=self.store):
+                second = self._client().post(
+                    f"/sessions/{session_id}/runs/current/append",
+                    json={"content": "stream 前追加", "run_id": run["run_id"]},
+                )
+            self.assertEqual(second.status_code, 200)
+
+            with patch("backend.agent.SessionStore", return_value=self.store):
+                list(model.stream({"messages": [HumanMessage(content="第二轮任务")]}))
+
+            stream_messages = llm.calls[1][1]["messages"]
+            stream_joined = "\n".join(
+                message.content for message in stream_messages if isinstance(message, HumanMessage)
+            )
+            self.assertIn("第二轮任务", stream_joined)
+            self.assertIn("用户追加指令", stream_joined)
+            self.assertIn("stream 前追加", stream_joined)
+            self.assertNotIn("invoke 前追加", stream_joined)
+
+            progress = self.store.load_session(session_id)["task_progress"]
+            statuses = [command["status"] for command in progress["append_commands"]]
+            self.assertEqual(statuses, ["injected", "injected"])
+        finally:
+            reset_runtime_context(context_tokens)
 
     def test_multiple_append_commands_preserve_fifo_order_and_session_scope(self):
         run_a = self._acquire_run("append-a")
