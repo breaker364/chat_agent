@@ -17,6 +17,8 @@ from .prompts import load_agent_policy, load_system_prompt
 from .session_store import SessionStore
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
+from .runtime_context import current_run_id
+from .run_append import consume_pending_append_commands
 from .tools import get_all_tools, _normalize_tool_payload_for_key
 from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
 
@@ -1026,6 +1028,49 @@ async def stream_agent_events(
             "- 根据异常摘要调整调用；如果是命令格式问题，改用标准 CLI 命令后重试。"
         )
 
+    def inject_pending_append_commands() -> list[dict[str, Any]]:
+        run_id = current_run_id()
+        if not run_id:
+            return []
+        commands = consume_pending_append_commands(session_id, run_id)
+        if not commands:
+            return []
+        injected: list[dict[str, Any]] = []
+        store = SessionStore(Path.cwd())
+        for command in commands:
+            payload = command.to_dict()
+            marker = f"用户追加指令（运行中补充，第 {command.sequence} 条）："
+            messages.append(HumanMessage(content=f"{marker}\n{command.content}"))
+            try:
+                store.record_append_command_event(session_id, payload)
+            except Exception:
+                pass
+            injected.append(payload)
+        return injected
+
+    def append_injected_debug_events(commands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for command in commands:
+            events.append(
+                {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "append_command_injected",
+                            "message": "Injected appended instruction before the next model call.",
+                            "elapsed_seconds": max(0, int(time.monotonic() - run_started_at)),
+                            "session_id": session_id,
+                            "run_id": command.get("run_id"),
+                            "append_id": command.get("append_id"),
+                            "status": command.get("status"),
+                            "sequence": command.get("sequence"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+        return events
+
     async def summarize_exception_for_user(exc_text: str) -> str:
         context = build_exception_analysis_context(
             exc_text=exc_text,
@@ -1341,6 +1386,7 @@ async def stream_agent_events(
     messages.append(HumanMessage(content=effective_message))
 
     _repair_dangling_tool_call_messages(messages)
+    injected_append_commands = inject_pending_append_commands()
     event_stream = agent.astream_events(
         {"messages": messages},
         config=config,
@@ -1370,6 +1416,8 @@ async def stream_agent_events(
             ensure_ascii=False,
         ),
     }
+    for append_event in append_injected_debug_events(injected_append_commands):
+        yield append_event
 
     heartbeat_interval = 1.0
     pending_event: asyncio.Task[Any] | None = None
@@ -1430,6 +1478,7 @@ async def stream_agent_events(
                 tool_errors.append({"tool": active_tool or "agent_stream", "message": str(exc)})
                 messages.append(HumanMessage(content=build_retry_instruction(f"agent event stream raised: {exc}")))
                 _repair_dangling_tool_call_messages(messages)
+                injected_append_commands = inject_pending_append_commands()
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,
@@ -1456,6 +1505,8 @@ async def stream_agent_events(
                     next_step="重试未完成的步骤。",
                     progress={"current": 2, "total": 3, "label": "调整处理"},
                 )
+                for append_event in append_injected_debug_events(injected_append_commands):
+                    yield append_event
                 continue
             error_message = await summarize_exception_for_user(str(exc))
             yield activity_frame(
@@ -1857,6 +1908,7 @@ async def stream_agent_events(
                     )
                 )
                 _repair_dangling_tool_call_messages(messages)
+                injected_append_commands = inject_pending_append_commands()
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,
@@ -1876,6 +1928,8 @@ async def stream_agent_events(
                         ensure_ascii=False,
                     ),
                 }
+                for append_event in append_injected_debug_events(injected_append_commands):
+                    yield append_event
                 continue
             recent_tool_error = bool(tool_errors)
             audit = audit_completion_with_policy(final_text)
@@ -1899,6 +1953,7 @@ async def stream_agent_events(
                 repair_instruction = build_retry_instruction("; ".join(reasons) or "completion audit failed")
                 messages.append(HumanMessage(content=repair_instruction))
                 _repair_dangling_tool_call_messages(messages)
+                injected_append_commands = inject_pending_append_commands()
                 event_stream = agent.astream_events(
                     {"messages": messages},
                     config=config,
@@ -1921,6 +1976,8 @@ async def stream_agent_events(
                         ensure_ascii=False,
                     ),
                 }
+                for append_event in append_injected_debug_events(injected_append_commands):
+                    yield append_event
                 tool_errors.clear()
                 continue
             yield {

@@ -39,10 +39,15 @@ import remarkGfm from "remark-gfm";
 import {
   appendRunText,
   finishSessionRun,
+  getSubmitButtonLabel,
+  getSubmitEndpoint,
+  getSubmitMode,
   getSessionRun,
   isSessionRunning,
+  recordAppendCommandEvent,
   replaceRunEvents,
   setRunText,
+  shouldClearComposerAfterSubmit,
   startSessionRun,
   updateSessionRun,
 } from "./sessionRunState";
@@ -1054,6 +1059,9 @@ export default function App() {
   const [contextStats, setContextStats] = useState(null);
   const activeRun = getSessionRun(sessionRuns, activeSessionId);
   const loading = isSessionRunning(sessionRuns, activeSessionId);
+  const submitMode = getSubmitMode(sessionRuns, activeSessionId);
+  const appendMode = submitMode === "append";
+  const submitButtonLabel = getSubmitButtonLabel(sessionRuns, activeSessionId);
   const streamingText = activeRun.streamingText || "";
   const toolEvents = activeRun.toolEvents || [];
   const activityItems = activeRun.activityItems || [];
@@ -1674,7 +1682,11 @@ export default function App() {
   const handleSend = useCallback(async () => {
     const text = input.trim();
     const filesToUpload = [...pendingFiles];
-    if ((!text && !filesToUpload.length) || loading) return;
+    const mode = getSubmitMode(sessionRuns, activeSessionId);
+    const isAppendMode = mode === "append";
+    if (isAppendMode && !text) return;
+    if (!isAppendMode && (!text && !filesToUpload.length)) return;
+    if (loading && !isAppendMode) return;
 
     let ensuredSessionId = activeSessionId;
     if (!ensuredSessionId) {
@@ -1682,6 +1694,86 @@ export default function App() {
       setActiveSessionId(ensuredSessionId);
       activeSessionIdRef.current = ensuredSessionId;
       writeLastSessionId(ensuredSessionId);
+    }
+
+    if (isAppendMode) {
+      const appendRun = getSessionRun(sessionRuns, ensuredSessionId);
+      const appendRunId = appendRun.runId || "";
+      try {
+        const resp = await fetch(getSubmitEndpoint(API_BASE, sessionRuns, ensuredSessionId), {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({
+            content: text,
+            run_id: appendRunId,
+          }),
+        });
+        let payload = {};
+        try {
+          payload = await resp.json();
+        } catch {
+          payload = {};
+        }
+        if (!resp.ok) {
+          throw new Error(payload.message || `Append failed: HTTP ${resp.status}`);
+        }
+        setSessionRuns((prev) => {
+          const withAppend = recordAppendCommandEvent(prev, ensuredSessionId, {
+            ...payload,
+            content: text,
+            status: payload.status || "queued",
+          });
+          return updateSessionRun(withAppend, ensuredSessionId, (current) => ({
+            error: "",
+            activityItems: mergeActivityItems(current.activityItems || [], {
+              state: "working",
+              summary: "已收到追加指令，等待注入当前任务。",
+              next_step: "下一次模型调用前会带上该追加内容。",
+              progress: { current: 2, total: 3, label: "追加指令" },
+            }),
+            debugEvents: [
+              ...(current.debugEvents || []),
+              {
+                type: "debug",
+                stage: "append_command_queued",
+                message: "Append command queued for the active run.",
+                elapsed_seconds: null,
+                details: payload,
+              },
+            ],
+          }));
+        });
+        if (shouldClearComposerAfterSubmit({ mode, ok: true })) {
+          setInput("");
+        }
+      } catch (err) {
+        setSessionRuns((prev) =>
+          updateSessionRun(prev, ensuredSessionId, (current) => ({
+            error: err.message,
+            activityItems: mergeActivityItems(current.activityItems || [], {
+              state: "judging",
+              summary: "追加指令未发送成功。",
+              judgment: err.message,
+              next_step: "请确认当前任务仍在运行，或作为新消息发送。",
+              progress: { current: 2, total: 3, label: "追加指令" },
+            }),
+            debugEvents: [
+              ...(current.debugEvents || []),
+              {
+                type: "debug",
+                stage: "append_command_rejected",
+                message: err.message,
+                elapsed_seconds: null,
+                details: {},
+              },
+            ],
+          }))
+        );
+        if (shouldClearComposerAfterSubmit({ mode, ok: false })) {
+          setInput("");
+        }
+      }
+      return;
     }
 
     const controller = new AbortController();
@@ -1769,6 +1861,39 @@ export default function App() {
           stage,
           details,
         });
+        if (String(stage || "").startsWith("append_command_")) {
+          const status =
+            stage === "append_command_injected"
+              ? "injected"
+              : stage === "append_command_not_applied"
+                ? "not_applied"
+                : stage === "append_command_rejected"
+                  ? "rejected"
+                  : parsed?.status || "queued";
+          setSessionRuns((prev) => {
+            const withAppend = parsed?.append_id
+              ? recordAppendCommandEvent(prev, ensuredSessionId, { ...parsed, status })
+              : prev;
+            return updateSessionRun(withAppend, ensuredSessionId, (current) => ({
+              activityItems: mergeActivityItems(current.activityItems || [], {
+                state: status === "rejected" || status === "not_applied" ? "judging" : "working",
+                summary:
+                  status === "injected"
+                    ? "追加指令已注入当前任务。"
+                    : status === "not_applied"
+                      ? "追加指令未在任务结束前生效。"
+                      : status === "rejected"
+                        ? "追加指令被拒绝。"
+                        : "追加指令已排队。",
+                next_step:
+                  status === "injected"
+                    ? "继续等待当前任务输出。"
+                    : "等待当前任务下一步处理。",
+                progress: { current: 2, total: 3, label: "追加指令" },
+              }),
+            }));
+          });
+        }
       } else if (eventType === "tool_call") {
         pushToolEvent({
           type: "tool_call",
@@ -1894,6 +2019,7 @@ export default function App() {
     input,
     loading,
     pendingFiles,
+    sessionRuns,
     refreshSessions,
     loadSession,
     uploadPendingFiles,
@@ -2107,9 +2233,9 @@ export default function App() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Send a message or drop files here"
+                placeholder={appendMode ? "追加指令到当前运行中的任务" : "Send a message or drop files here"}
                 rows={1}
-                disabled={loading}
+                disabled={false}
               />
               {loading ? (
                 <button className="stop-btn" onClick={handleStop} title="Stop current request">
@@ -2118,14 +2244,15 @@ export default function App() {
               ) : null}
               <button
                 className="send-btn"
+                title={submitButtonLabel}
                 onClick={handleSend}
-                disabled={loading || (!input.trim() && !pendingFiles.length)}
+                disabled={appendMode ? !input.trim() : (!input.trim() && !pendingFiles.length)}
               >
-                {loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+                {appendMode ? <Send size={18} /> : loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
               </button>
             </div>
             <div className={`composer-meta ${attachmentError ? "has-error" : ""}`}>
-              <span>{attachmentError || "Enter to send · Shift+Enter for a new line · up to 10 files, 25 MB each"}</span>
+              <span>{attachmentError || (appendMode ? "当前任务运行中：Enter 会追加到当前任务 · Shift+Enter 换行" : "Enter to send · Shift+Enter for a new line · up to 10 files, 25 MB each")}</span>
               <span>{input.length.toLocaleString()} chars</span>
             </div>
           </div>

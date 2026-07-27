@@ -498,6 +498,7 @@ class SessionStore:
             "primary_result": None,
             "stage_results": {},
             "artifacts": [],
+            "append_commands": [],
             "updated_at": _now_iso(),
         }
 
@@ -682,6 +683,36 @@ class SessionStore:
             progress["stage_results"] = {}
         if "artifacts" not in progress or not isinstance(progress.get("artifacts"), list):
             progress["artifacts"] = []
+        if "append_commands" not in progress or not isinstance(progress.get("append_commands"), list):
+            progress["append_commands"] = []
+        progress["updated_at"] = _now_iso()
+        self.save_session(session)
+        return session
+
+    def record_append_command_event(self, session_id: str, command: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", self.default_progress())
+        commands = progress.setdefault("append_commands", [])
+        append_id = str(command.get("append_id") or "").strip()
+        normalized = {
+            "append_id": append_id,
+            "session_id": str(command.get("session_id") or session_id),
+            "run_id": str(command.get("run_id") or ""),
+            "content": str(command.get("content") or ""),
+            "sequence": command.get("sequence"),
+            "status": str(command.get("status") or ""),
+            "created_at": command.get("created_at"),
+            "updated_at": command.get("updated_at") or _now_iso(),
+        }
+        replaced = False
+        for index, item in enumerate(commands):
+            if isinstance(item, dict) and item.get("append_id") == append_id:
+                commands[index] = {**item, **normalized}
+                replaced = True
+                break
+        if not replaced:
+            commands.append(normalized)
+        progress["append_commands"] = commands[-100:]
         progress["updated_at"] = _now_iso()
         self.save_session(session)
         return session

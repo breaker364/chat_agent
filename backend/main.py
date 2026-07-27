@@ -23,6 +23,11 @@ from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manag
 from .subagents import built_in_subagents, read_subagent_task_state
 from .token_counter import count_message_tokens, count_text_tokens, normalize_usage
 from .runtime_context import bind_runtime_context, reset_runtime_context
+from .run_append import (
+    clear_run_append_commands,
+    enqueue_append_command,
+    finalize_pending_append_commands,
+)
 from .tools import clear_tool_dedupe_cache
 from .feishu_web_login import (
     FeishuWebSessionStore,
@@ -113,6 +118,35 @@ def _release_session_run(session_id: str, run_id: str) -> None:
         active = _ACTIVE_RUNS.get(normalized_session_id)
         if active and active.get("run_id") == run_id:
             _ACTIVE_RUNS.pop(normalized_session_id, None)
+    finalize_pending_append_commands(normalized_session_id, run_id, status="not_applied")
+    clear_run_append_commands(normalized_session_id, run_id)
+
+
+def _finalize_unapplied_append_commands(store: SessionStore, session_id: str, run_id: str) -> None:
+    finalized = finalize_pending_append_commands(session_id, run_id, status="not_applied")
+    for command in finalized:
+        payload = command.to_dict()
+        store.record_append_command_event(session_id, payload)
+        get_session_event_hub().publish(
+            session_id,
+            {
+                "stage": "append_command_not_applied",
+                "message": "Appended instruction was not applied before the run finished.",
+                "session_id": session_id,
+                "run_id": run_id,
+                "append_id": command.append_id,
+                "status": command.status,
+                "sequence": command.sequence,
+            },
+        )
+    clear_run_append_commands(session_id, run_id)
+
+
+def _get_active_session_run(session_id: str) -> dict[str, Any] | None:
+    normalized_session_id = str(session_id or "default").strip() or "default"
+    with _ACTIVE_RUNS_LOCK:
+        active = _ACTIVE_RUNS.get(normalized_session_id)
+        return dict(active) if active else None
 
 
 def _active_run_error_payload(session_id: str, active_run: dict[str, Any] | None) -> dict[str, Any]:
@@ -891,6 +925,95 @@ async def delete_session(session_id: str) -> JSONResponse:
     return JSONResponse({"ok": True, "session_id": session_id})
 
 
+@app.post("/sessions/{session_id}/runs/current/append")
+async def append_to_current_run(session_id: str, request: Request) -> JSONResponse:
+    body = await request.json()
+    content = str(body.get("content") if "content" in body else body.get("message", "")).strip()
+    expected_run_id = str(body.get("run_id") or "").strip()
+    normalized_session_id = str(session_id or "default").strip() or "default"
+    active_run = _get_active_session_run(normalized_session_id)
+
+    if not content:
+        payload = {
+            "error": "empty_append",
+            "message": "Append command cannot be empty.",
+            "session_id": normalized_session_id,
+            "run_id": expected_run_id,
+            "status": "rejected",
+        }
+        if active_run:
+            get_session_event_hub().publish(
+                normalized_session_id,
+                {
+                    "stage": "append_command_rejected",
+                    "message": payload["message"],
+                    "session_id": normalized_session_id,
+                    "run_id": str(active_run.get("run_id") or ""),
+                    "reason": "empty_append",
+                },
+            )
+        return JSONResponse(payload, status_code=400)
+
+    if not active_run:
+        return JSONResponse(
+            {
+                "error": "no_active_run",
+                "message": "No active run is available for this session. Send the text as a normal new message instead.",
+                "session_id": normalized_session_id,
+                "run_id": expected_run_id,
+                "status": "rejected",
+            },
+            status_code=409,
+        )
+
+    active_run_id = str(active_run.get("run_id") or "")
+    if expected_run_id and expected_run_id != active_run_id:
+        payload = {
+            "error": "stale_run",
+            "message": "The target run is no longer active. Send the text as a normal new message instead.",
+            "session_id": normalized_session_id,
+            "run_id": active_run_id,
+            "expected_run_id": expected_run_id,
+            "status": "rejected",
+        }
+        get_session_event_hub().publish(
+            normalized_session_id,
+            {
+                "stage": "append_command_rejected",
+                "message": payload["message"],
+                "session_id": normalized_session_id,
+                "run_id": active_run_id,
+                "reason": "stale_run",
+            },
+        )
+        return JSONResponse(payload, status_code=409)
+
+    command = enqueue_append_command(normalized_session_id, active_run_id, content)
+    command_payload = command.to_dict()
+    get_session_store().record_append_command_event(normalized_session_id, command_payload)
+    get_session_event_hub().publish(
+        normalized_session_id,
+        {
+            "stage": "append_command_queued",
+            "message": "Received appended instruction for the active run.",
+            "session_id": normalized_session_id,
+            "run_id": active_run_id,
+            "append_id": command.append_id,
+            "status": command.status,
+            "sequence": command.sequence,
+        },
+    )
+    return JSONResponse(
+        {
+            "append_id": command.append_id,
+            "session_id": normalized_session_id,
+            "run_id": active_run_id,
+            "status": command.status,
+            "sequence": command.sequence,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chat endpoints
 # ---------------------------------------------------------------------------
@@ -1159,6 +1282,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
             event_hub.unsubscribe(session["session_id"], event_queue)
             reset_runtime_context(context_tokens)
             clear_tool_dedupe_cache(run_id)
+            _finalize_unapplied_append_commands(store, session["session_id"], run_id)
             _release_session_run(session["session_id"], run_id)
 
     return EventSourceResponse(event_generator())
@@ -1287,6 +1411,10 @@ async def chat_sync(request: Request) -> JSONResponse:
         )
         return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})
     finally:
+        try:
+            _finalize_unapplied_append_commands(store, session["session_id"], run_id)
+        except Exception:
+            pass
         _release_session_run(session["session_id"], run_id)
 
 

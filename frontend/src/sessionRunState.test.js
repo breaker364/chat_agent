@@ -3,8 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   appendRunText,
   finishSessionRun,
+  getSubmitButtonLabel,
+  getSubmitEndpoint,
+  getSubmitMode,
   getSessionRun,
   isSessionRunning,
+  recordAppendCommandEvent,
+  shouldClearComposerAfterSubmit,
   pushRunEvent,
   startSessionRun,
 } from "./sessionRunState";
@@ -43,5 +48,46 @@ describe("session run state", () => {
     expect(getSessionRun(runs, "session-a").status).toBe("stopped");
     expect(isSessionRunning(runs, "session-a")).toBe(false);
     expect(isSessionRunning(runs, "session-b")).toBe(true);
+  });
+
+  it("routes running-session submit to append endpoint", () => {
+    const runs = startSessionRun({}, "session-a", "run-a");
+
+    expect(getSubmitMode(runs, "session-a")).toBe("append");
+    expect(getSubmitEndpoint("/api", runs, "session-a")).toBe(
+      "/api/sessions/session-a/runs/current/append"
+    );
+    expect(getSubmitButtonLabel(runs, "session-a")).toBe("追加到当前任务");
+  });
+
+  it("routes idle-session submit to normal chat stream", () => {
+    const runs = startSessionRun({}, "session-a", "run-a");
+
+    expect(getSubmitMode(runs, "session-b")).toBe("new_run");
+    expect(getSubmitEndpoint("/api", runs, "session-b")).toBe("/api/chat/stream");
+    expect(getSubmitButtonLabel(runs, "session-b")).toBe("发送");
+  });
+
+  it("records append status only on the originating session", () => {
+    let runs = startSessionRun({}, "session-a", "run-a");
+    runs = startSessionRun(runs, "session-b", "run-b");
+
+    runs = recordAppendCommandEvent(runs, "session-a", {
+      append_id: "append-1",
+      run_id: "run-a",
+      status: "queued",
+      content: "追加内容",
+    });
+
+    expect(getSessionRun(runs, "session-a").appendCommands).toHaveLength(1);
+    expect(getSessionRun(runs, "session-a").appendCommands[0].status).toBe("queued");
+    expect(getSessionRun(runs, "session-b").appendCommands).toEqual([]);
+  });
+
+  it("keeps append text recoverable when append submit fails", () => {
+    expect(shouldClearComposerAfterSubmit({ mode: "append", ok: false })).toBe(false);
+    expect(shouldClearComposerAfterSubmit({ mode: "append", ok: true })).toBe(true);
+    expect(shouldClearComposerAfterSubmit({ mode: "new_run", ok: false })).toBe(false);
+    expect(shouldClearComposerAfterSubmit({ mode: "new_run", ok: true })).toBe(true);
   });
 });
