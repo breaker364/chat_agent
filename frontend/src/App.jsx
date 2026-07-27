@@ -36,6 +36,16 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  appendRunText,
+  finishSessionRun,
+  getSessionRun,
+  isSessionRunning,
+  replaceRunEvents,
+  setRunText,
+  startSessionRun,
+  updateSessionRun,
+} from "./sessionRunState";
 import "./App.css";
 
 const API_BASE = "";
@@ -1012,11 +1022,7 @@ export default function App() {
   const [pendingFiles, setPendingFiles] = useState([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [streamingText, setStreamingText] = useState("");
-  const [toolEvents, setToolEvents] = useState([]);
-  const [activityItems, setActivityItems] = useState([]);
-  const [debugEvents, setDebugEvents] = useState([]);
+  const [sessionRuns, setSessionRuns] = useState({});
   const [subagentTasks, setSubagentTasks] = useState([]);
   const [subagentNotifications, setSubagentNotifications] = useState([]);
   const [taskProgress, setTaskProgress] = useState(null);
@@ -1025,7 +1031,8 @@ export default function App() {
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const chatAreaRef = useRef(null);
   const chatEndRef = useRef(null);
-  const abortRef = useRef(null);
+  const abortControllersRef = useRef(new Map());
+  const activeSessionIdRef = useRef("");
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
   const dragDepthRef = useRef(0);
@@ -1045,6 +1052,12 @@ export default function App() {
   const [feishuPolling, setFeishuPolling] = useState(false);
   const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
+  const activeRun = getSessionRun(sessionRuns, activeSessionId);
+  const loading = isSessionRunning(sessionRuns, activeSessionId);
+  const streamingText = activeRun.streamingText || "";
+  const toolEvents = activeRun.toolEvents || [];
+  const activityItems = activeRun.activityItems || [];
+  const debugEvents = activeRun.debugEvents || [];
 
   const defaultAssistantMessage = useMemo(
     () => ({
@@ -1191,6 +1204,7 @@ export default function App() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       setActiveSessionId(data.session_id);
+      activeSessionIdRef.current = data.session_id;
       writeLastSessionId(data.session_id);
       setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
       setSubagentTasks(data.subagent_tasks || []);
@@ -1211,6 +1225,10 @@ export default function App() {
     if (!activeSessionId) return null;
     return loadSession(activeSessionId, { scrollToBottom: false });
   }, [activeSessionId, loadSession]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (!shouldAutoScroll) return;
@@ -1274,6 +1292,7 @@ export default function App() {
         }
         const sessionId = makeSessionId();
         setActiveSessionId(sessionId);
+        activeSessionIdRef.current = sessionId;
         writeLastSessionId(sessionId);
         setMessages([defaultAssistantMessage]);
         setSessions((prev) => prev);
@@ -1303,6 +1322,7 @@ export default function App() {
   const handleCreateSession = useCallback(async () => {
     const sessionId = makeSessionId();
     setActiveSessionId(sessionId);
+    activeSessionIdRef.current = sessionId;
     writeLastSessionId(sessionId);
     try {
       await fetch(`${API_BASE}/sessions`, {
@@ -1314,6 +1334,7 @@ export default function App() {
       await loadSession(sessionId, { scrollToBottom: true });
     } catch {
       setActiveSessionId(sessionId);
+      activeSessionIdRef.current = sessionId;
       setMessages([defaultAssistantMessage]);
       setSessions((prev) => [
         {
@@ -1324,13 +1345,10 @@ export default function App() {
         ...prev,
       ]);
     }
-    setDebugEvents([]);
-    setToolEvents([]);
-    setActivityItems([]);
+    setSessionRuns((prev) => replaceRunEvents(replaceRunEvents(replaceRunEvents(prev, sessionId, "debugEvents", []), sessionId, "toolEvents", []), sessionId, "activityItems", []));
     setSubagentTasks([]);
     setSubagentNotifications([]);
     setTaskProgress(null);
-    setStreamingText("");
     setPendingFiles([]);
     setAttachmentError("");
   }, [defaultAssistantMessage, loadSession, refreshSessions]);
@@ -1368,6 +1386,7 @@ export default function App() {
         await loadSession(rememberedSessionId, { scrollToBottom: true });
       } else {
         setActiveSessionId(rememberedSessionId);
+        activeSessionIdRef.current = rememberedSessionId;
         writeLastSessionId(rememberedSessionId);
         setMessages([defaultAssistantMessage]);
       }
@@ -1380,22 +1399,29 @@ export default function App() {
   }, [activeSessionId, defaultAssistantMessage, loadSession, refreshSessions, sessions]);
 
   const handleStop = useCallback(() => {
-    if (!abortRef.current) return;
-    abortRef.current.abort();
-    abortRef.current = null;
-    setLoading(false);
-    setStreamingText("");
-    setToolEvents((prev) => [...prev, { type: "progress", message: "Request stopped by user.", elapsed_seconds: null }]);
-    setDebugEvents((prev) => [
-      ...prev,
-      {
-        type: "debug",
-        stage: "user_abort",
-        message: "Request aborted from UI.",
-        elapsed_seconds: null,
-        details: {},
-      },
-    ]);
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId) return;
+    const controller = abortControllersRef.current.get(sessionId);
+    if (!controller) return;
+    controller.abort();
+    abortControllersRef.current.delete(sessionId);
+    setSessionRuns((prev) => finishSessionRun(prev, sessionId, "stopped", {
+      streamingText: "",
+      toolEvents: [
+        ...(getSessionRun(prev, sessionId).toolEvents || []),
+        { type: "progress", message: "Request stopped by user.", elapsed_seconds: null },
+      ],
+      debugEvents: [
+        ...(getSessionRun(prev, sessionId).debugEvents || []),
+        {
+          type: "debug",
+          stage: "user_abort",
+          message: "Request aborted from UI.",
+          elapsed_seconds: null,
+          details: {},
+        },
+      ],
+    }));
   }, []);
 
   // --- Skill system helpers ---
@@ -1654,22 +1680,32 @@ export default function App() {
     if (!ensuredSessionId) {
       ensuredSessionId = makeSessionId();
       setActiveSessionId(ensuredSessionId);
+      activeSessionIdRef.current = ensuredSessionId;
       writeLastSessionId(ensuredSessionId);
     }
 
-    setLoading(true);
-    setStreamingText("");
-    setToolEvents([]);
-    setDebugEvents([]);
-
     const controller = new AbortController();
-    abortRef.current = controller;
+    const runId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    abortControllersRef.current.set(ensuredSessionId, controller);
+    setSessionRuns((prev) => startSessionRun(prev, ensuredSessionId, runId));
 
     const runState = { assistantContent: "", tools: [], debug: [], activities: [], usage: null };
+    const appendVisibleMessage = (message) => {
+      if (activeSessionIdRef.current === ensuredSessionId) {
+        setMessages((prev) => [...prev, message]);
+      }
+    };
 
     function pushActivity(activity) {
       runState.activities = mergeActivityItems(runState.activities, activity);
-      setActivityItems([...runState.activities]);
+      setSessionRuns((prev) =>
+        updateSessionRun(prev, ensuredSessionId, () => ({
+          activityItems: [...runState.activities],
+        }))
+      );
     }
 
     function pushToolEvent(event) {
@@ -1679,7 +1715,11 @@ export default function App() {
       } else {
         runState.tools.push(event);
       }
-      setToolEvents([...runState.tools]);
+      setSessionRuns((prev) =>
+        updateSessionRun(prev, ensuredSessionId, () => ({
+          toolEvents: [...runState.tools],
+        }))
+      );
     }
 
     function pushDebugEvent(event) {
@@ -1689,7 +1729,11 @@ export default function App() {
       } else {
         runState.debug.push(event);
       }
-      setDebugEvents([...runState.debug]);
+      setSessionRuns((prev) =>
+        updateSessionRun(prev, ensuredSessionId, () => ({
+          debugEvents: [...runState.debug],
+        }))
+      );
     }
 
     function dispatchSseEvent(eventType, rawData) {
@@ -1703,7 +1747,7 @@ export default function App() {
 
       if (eventType === "text") {
         runState.assistantContent += String(parsed);
-        setStreamingText(runState.assistantContent);
+        setSessionRuns((prev) => appendRunText(prev, ensuredSessionId, String(parsed)));
       } else if (eventType === "progress") {
         pushToolEvent({
           type: "progress",
@@ -1747,7 +1791,7 @@ export default function App() {
         });
       } else if (eventType === "done") {
         runState.assistantContent = String(parsed || runState.assistantContent);
-        setStreamingText(runState.assistantContent);
+        setSessionRuns((prev) => setRunText(prev, ensuredSessionId, runState.assistantContent));
       }
     }
 
@@ -1762,7 +1806,7 @@ export default function App() {
       setInput("");
       setPendingFiles([]);
       setAttachmentError("");
-      setMessages((prev) => [...prev, userMsg]);
+      appendVisibleMessage(userMsg);
 
       const resp = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
@@ -1794,44 +1838,41 @@ export default function App() {
         parseSseChunk(`${buffer}\n\n`, dispatchSseEvent);
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
+      appendVisibleMessage({
+        role: "assistant",
+        content: runState.assistantContent || "(no text reply)",
+        tools: runState.tools,
+        activities: runState.activities,
+        usage: runState.usage || {},
+      });
+      setSessionRuns((prev) => finishSessionRun(prev, ensuredSessionId, "completed", { streamingText: "" }));
+      await refreshSessions();
+      if (activeSessionIdRef.current === ensuredSessionId) {
+        await loadSession(ensuredSessionId, { scrollToBottom: false });
+      }
+    } catch (err) {
+      if (err.name === "AbortError") {
+        appendVisibleMessage({
           role: "assistant",
-          content: runState.assistantContent || "(no text reply)",
+          content: runState.assistantContent || "(stopped)",
           tools: runState.tools,
           activities: runState.activities,
           usage: runState.usage || {},
-        },
-      ]);
-      await refreshSessions();
-      await loadSession(ensuredSessionId, { scrollToBottom: false });
-    } catch (err) {
-      if (err.name === "AbortError") {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: runState.assistantContent || "(stopped)",
-            tools: runState.tools,
-            activities: runState.activities,
-            usage: runState.usage || {},
-          },
-        ]);
+        });
+        setSessionRuns((prev) => finishSessionRun(prev, ensuredSessionId, "stopped", { streamingText: "" }));
         await new Promise((resolve) => window.setTimeout(resolve, 300));
         await refreshSessions();
-        await loadSession(ensuredSessionId, { scrollToBottom: false });
+        if (activeSessionIdRef.current === ensuredSessionId) {
+          await loadSession(ensuredSessionId, { scrollToBottom: false });
+        }
       } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `Request failed: ${err.message}`,
-            tools: runState.tools,
-            activities: runState.activities,
-            usage: runState.usage || {},
-          },
-        ]);
+        appendVisibleMessage({
+          role: "assistant",
+          content: `Request failed: ${err.message}`,
+          tools: runState.tools,
+          activities: runState.activities,
+          usage: runState.usage || {},
+        });
         pushDebugEvent({
           type: "debug",
           stage: "frontend_error",
@@ -1839,13 +1880,13 @@ export default function App() {
           elapsed_seconds: null,
           details: {},
         });
+        setSessionRuns((prev) => finishSessionRun(prev, ensuredSessionId, "failed", {
+          error: err.message,
+          streamingText: "",
+        }));
       }
     } finally {
-      setLoading(false);
-      setStreamingText("");
-      setToolEvents([]);
-      setActivityItems([]);
-      abortRef.current = null;
+      abortControllersRef.current.delete(ensuredSessionId);
     }
   }, [
     activeSessionId,
@@ -1871,10 +1912,26 @@ export default function App() {
     }
   };
 
+  const visibleSessions = useMemo(
+    () =>
+      sessions.map((session) => {
+        if (!isSessionRunning(sessionRuns, session.session_id)) return session;
+        return {
+          ...session,
+          task_progress: {
+            ...(session.task_progress || {}),
+            status: "running",
+            message: "Agent run started.",
+          },
+        };
+      }),
+    [sessions, sessionRuns]
+  );
+
   return (
     <div className="app-shell">
       <SessionSidebar
-        sessions={sessions}
+        sessions={visibleSessions}
         activeSessionId={activeSessionId}
         collapsed={sessionSidebarCollapsed}
         onToggleCollapsed={() => setSessionSidebarCollapsed((prev) => !prev)}
@@ -2088,7 +2145,7 @@ export default function App() {
         ]}
         loading={loading}
         onToggle={() => setDebugOpen((v) => !v)}
-        onClear={() => setDebugEvents([])}
+        onClear={() => setSessionRuns((prev) => replaceRunEvents(prev, activeSessionId, "debugEvents", []))}
       />
       {debugOpen ? (
         <aside className="subagent-sidebar">

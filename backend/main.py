@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 import asyncio
 import re
 import time
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -22,7 +22,8 @@ from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
 from .subagents import built_in_subagents, read_subagent_task_state
 from .token_counter import count_message_tokens, count_text_tokens, normalize_usage
-from .tools import _CURRENT_RUN_ID_ENV, _CURRENT_SESSION_ID_ENV, clear_tool_dedupe_cache
+from .runtime_context import bind_runtime_context, reset_runtime_context
+from .tools import clear_tool_dedupe_cache
 from .feishu_web_login import (
     FeishuWebSessionStore,
     bootstrap_feishu_session,
@@ -65,6 +66,8 @@ async def bootstrap_feishu_auth_on_startup() -> None:
 _agent: Any = None
 _agent_lock: Any = None
 _session_store: SessionStore | None = None
+_ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
+_ACTIVE_RUNS_LOCK = RLock()
 
 
 def _get_lock():
@@ -85,6 +88,55 @@ def get_session_store() -> SessionStore:
 
 def get_subagent_manager() -> Any:
     return get_runtime_subagent_manager()
+
+
+def _acquire_session_run(session_id: str, endpoint: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    normalized_session_id = str(session_id or "default").strip() or "default"
+    with _ACTIVE_RUNS_LOCK:
+        active = _ACTIVE_RUNS.get(normalized_session_id)
+        if active:
+            return None, dict(active)
+        run = {
+            "session_id": normalized_session_id,
+            "run_id": f"{normalized_session_id}:{uuid4().hex}",
+            "endpoint": endpoint,
+            "status": "running",
+            "started_at": time.time(),
+        }
+        _ACTIVE_RUNS[normalized_session_id] = run
+        return dict(run), None
+
+
+def _release_session_run(session_id: str, run_id: str) -> None:
+    normalized_session_id = str(session_id or "default").strip() or "default"
+    with _ACTIVE_RUNS_LOCK:
+        active = _ACTIVE_RUNS.get(normalized_session_id)
+        if active and active.get("run_id") == run_id:
+            _ACTIVE_RUNS.pop(normalized_session_id, None)
+
+
+def _active_run_error_payload(session_id: str, active_run: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "error": "session_run_active",
+        "message": "A foreground run is already active for this session.",
+        "session_id": session_id,
+        "run_id": str((active_run or {}).get("run_id") or ""),
+        "status": "running",
+    }
+
+
+def _with_run_attribution(event: dict[str, Any], parsed: Any, session_id: str, run_id: str) -> dict[str, Any]:
+    if not isinstance(parsed, dict):
+        return event
+    payload = {
+        **parsed,
+        "session_id": session_id,
+        "run_id": run_id,
+    }
+    return {
+        "event": str(event.get("event") or ""),
+        "data": json.dumps(payload, ensure_ascii=False),
+    }
 
 
 def _workspace() -> Path:
@@ -854,11 +906,28 @@ async def chat_stream(request: Request) -> EventSourceResponse:
     if not message.strip():
         return EventSourceResponse([{"event": "error", "data": "Message cannot be empty"}])
 
-    agent = await get_agent()
     store = get_session_store()
     session = store.create_or_get_session(session_id, first_message=message)
-    stored_history = store.get_history(session["session_id"])
-    merged_history = _merge_history(stored_history, history)
+    run, active_run = _acquire_session_run(session["session_id"], "chat_stream")
+    if active_run:
+        return EventSourceResponse(
+            [
+                {
+                    "event": "error",
+                    "data": json.dumps(_active_run_error_payload(session["session_id"], active_run), ensure_ascii=False),
+                }
+            ]
+        )
+    run_id = str(run["run_id"])
+
+    try:
+        agent = await get_agent()
+        stored_history = store.get_history(session["session_id"])
+        merged_history = _merge_history(stored_history, history)
+    except Exception:
+        _release_session_run(session["session_id"], run_id)
+        clear_tool_dedupe_cache(run_id)
+        raise
 
     store.append_message(
         session["session_id"],
@@ -885,11 +954,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
         interrupted = False
         terminal_status = ""
         terminal_failure_reason = ""
-        previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
-        previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
-        run_id = f"{session['session_id']}:{uuid4().hex}"
-        os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
-        os.environ[_CURRENT_RUN_ID_ENV] = run_id
+        context_tokens = bind_runtime_context(session["session_id"], run_id)
         event_hub = get_session_event_hub()
         event_queue = event_hub.subscribe(session["session_id"])
         try:
@@ -906,7 +971,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                 if pending_subagent in done:
                     subagent_event = pending_subagent.result()
                     pending_subagent = asyncio.create_task(event_queue.get())
-                    yield {
+                    subagent_debug_event = {
                         "event": "debug",
                         "data": json.dumps(
                             {
@@ -918,6 +983,12 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             ensure_ascii=False,
                         ),
                     }
+                    yield _with_run_attribution(
+                        subagent_debug_event,
+                        json.loads(subagent_debug_event["data"]),
+                        session["session_id"],
+                        run_id,
+                    )
 
                 if pending_agent in done:
                     try:
@@ -1050,7 +1121,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                         interrupted = True
                         break
                     if not private_transcript_event:
-                        yield event
+                        yield _with_run_attribution(event, parsed, session["session_id"], run_id)
         finally:
             if not turn_finalized and (assistant_text.strip() or assistant_tools):
                 partial_text = assistant_text.strip() or "(stopped before text reply)"
@@ -1086,15 +1157,9 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                     usage=partial_usage,
                 )
             event_hub.unsubscribe(session["session_id"], event_queue)
-            if previous_session_env is None:
-                os.environ.pop(_CURRENT_SESSION_ID_ENV, None)
-            else:
-                os.environ[_CURRENT_SESSION_ID_ENV] = previous_session_env
-            if previous_run_env is None:
-                os.environ.pop(_CURRENT_RUN_ID_ENV, None)
-            else:
-                os.environ[_CURRENT_RUN_ID_ENV] = previous_run_env
+            reset_runtime_context(context_tokens)
             clear_tool_dedupe_cache(run_id)
+            _release_session_run(session["session_id"], run_id)
 
     return EventSourceResponse(event_generator())
 
@@ -1111,120 +1176,118 @@ async def chat_sync(request: Request) -> JSONResponse:
 
     store = get_session_store()
     session = store.create_or_get_session(session_id, first_message=message)
-    stored_history = store.get_history(session["session_id"])
-    merged_history = _merge_history(stored_history, history)
+    run, active_run = _acquire_session_run(session["session_id"], "chat_sync")
+    if active_run:
+        return JSONResponse(_active_run_error_payload(session["session_id"], active_run), status_code=409)
 
-    store.append_message(
-        session["session_id"],
-        "user",
-        message,
-        tools=[],
-        usage={"content_tokens": count_text_tokens(message)},
-    )
-    store.update_progress(
-        session["session_id"],
-        status="running",
-        active_tool=None,
-        message="Agent run started.",
-        elapsed_seconds=0,
-        last_debug_stage="agent_start",
-    )
-
-    agent = await get_agent()
-    final_text = ""
-    tools: list[dict[str, Any]] = []
-    pending_tool_ids: dict[str, list[str]] = {}
-    run_usage: dict[str, Any] = {}
-    terminal_status = ""
-    terminal_failure_reason = ""
-    previous_session_env = os.environ.get(_CURRENT_SESSION_ID_ENV)
-    previous_run_env = os.environ.get(_CURRENT_RUN_ID_ENV)
-    run_id = f"{session['session_id']}:{uuid4().hex}"
-    os.environ[_CURRENT_SESSION_ID_ENV] = session["session_id"]
-    os.environ[_CURRENT_RUN_ID_ENV] = run_id
+    run_id = str(run["run_id"])
+    context_tokens = None
     try:
-        async for event in stream_agent_events(agent, message, session["session_id"], merged_history):
-            event_type = event["event"]
-            try:
-                parsed = json.loads(event["data"])
-            except Exception:
-                parsed = event["data"]
-            if event_type == "text":
-                final_text += str(parsed)
-            elif event_type == "tool_transcript_call":
-                transcript_event = _assistant_tool_transcript_event(
-                    "tool_call", parsed, len(tools), pending_tool_ids
-                )
-                tools.append(transcript_event)
-                store.append_tool_event(
-                    session["session_id"],
-                    event_type="tool_call",
-                    tool_name=transcript_event["name"],
-                    tool_call_id=transcript_event["tool_call_id"],
-                    arguments=transcript_event.get("arguments"),
-                )
-            elif event_type == "tool_call":
-                pass
-            elif event_type == "tool_transcript_result":
-                transcript_event = _assistant_tool_transcript_event(
-                    "tool_result", parsed, len(tools), pending_tool_ids
-                )
-                tools.append(transcript_event)
-                store.append_tool_event(
-                    session["session_id"],
-                    event_type="tool_result",
-                    tool_name=transcript_event["name"],
-                    tool_call_id=transcript_event["tool_call_id"],
-                    content=transcript_event.get("content"),
-                )
-            elif event_type == "tool_result":
-                pass
-            elif event_type == "error" and isinstance(parsed, dict):
-                final_text = str(parsed.get("message") or final_text)
-                if parsed.get("code") == "protected_context_capacity_exceeded":
-                    terminal_status = "failed"
-                    terminal_failure_reason = final_text
-            elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
-                run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
-            elif event_type == "debug" and parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
-                run_usage = {
-                    **run_usage,
-                    **(parsed.get("usage") or {}),
-                }
-            elif event_type == "done":
-                final_text = str(parsed or final_text)
-    finally:
-        if previous_session_env is None:
-            os.environ.pop(_CURRENT_SESSION_ID_ENV, None)
-        else:
-            os.environ[_CURRENT_SESSION_ID_ENV] = previous_session_env
-        if previous_run_env is None:
-            os.environ.pop(_CURRENT_RUN_ID_ENV, None)
-        else:
-            os.environ[_CURRENT_RUN_ID_ENV] = previous_run_env
-        clear_tool_dedupe_cache(run_id)
+        stored_history = store.get_history(session["session_id"])
+        merged_history = _merge_history(stored_history, history)
 
-    final_text = _finalize_agent_response(
-        store=store,
-        session_id=session["session_id"],
-        user_message=message,
-        final_text=final_text,
-        tools=tools,
-        status=terminal_status or ("completed" if final_text.strip() else "failed"),
-        failure_reason=terminal_failure_reason or ("" if final_text.strip() else "Agent returned no final text."),
-    )
-    final_usage = normalize_usage(run_usage, output_text=final_text)
-    store.replace_last_assistant_message(session["session_id"], final_text, tools=tools, usage=final_usage)
-    store.update_progress(
-        session["session_id"],
-        status="idle" if not terminal_status else terminal_status,
-        active_tool=None,
-        message="Ready to continue." if not terminal_status else terminal_failure_reason,
-        elapsed_seconds=0,
-        last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
-        usage=final_usage,
-    )
-    return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})
+        store.append_message(
+            session["session_id"],
+            "user",
+            message,
+            tools=[],
+            usage={"content_tokens": count_text_tokens(message)},
+        )
+        store.update_progress(
+            session["session_id"],
+            status="running",
+            active_tool=None,
+            message="Agent run started.",
+            elapsed_seconds=0,
+            last_debug_stage="agent_start",
+        )
+
+        agent = await get_agent()
+        final_text = ""
+        tools: list[dict[str, Any]] = []
+        pending_tool_ids: dict[str, list[str]] = {}
+        run_usage: dict[str, Any] = {}
+        terminal_status = ""
+        terminal_failure_reason = ""
+        context_tokens = bind_runtime_context(session["session_id"], run_id)
+        try:
+            async for event in stream_agent_events(agent, message, session["session_id"], merged_history):
+                event_type = event["event"]
+                try:
+                    parsed = json.loads(event["data"])
+                except Exception:
+                    parsed = event["data"]
+                if event_type == "text":
+                    final_text += str(parsed)
+                elif event_type == "tool_transcript_call":
+                    transcript_event = _assistant_tool_transcript_event(
+                        "tool_call", parsed, len(tools), pending_tool_ids
+                    )
+                    tools.append(transcript_event)
+                    store.append_tool_event(
+                        session["session_id"],
+                        event_type="tool_call",
+                        tool_name=transcript_event["name"],
+                        tool_call_id=transcript_event["tool_call_id"],
+                        arguments=transcript_event.get("arguments"),
+                    )
+                elif event_type == "tool_call":
+                    pass
+                elif event_type == "tool_transcript_result":
+                    transcript_event = _assistant_tool_transcript_event(
+                        "tool_result", parsed, len(tools), pending_tool_ids
+                    )
+                    tools.append(transcript_event)
+                    store.append_tool_event(
+                        session["session_id"],
+                        event_type="tool_result",
+                        tool_name=transcript_event["name"],
+                        tool_call_id=transcript_event["tool_call_id"],
+                        content=transcript_event.get("content"),
+                    )
+                elif event_type == "tool_result":
+                    pass
+                elif event_type == "error" and isinstance(parsed, dict):
+                    final_text = str(parsed.get("message") or final_text)
+                    if parsed.get("code") == "protected_context_capacity_exceeded":
+                        terminal_status = "failed"
+                        terminal_failure_reason = final_text
+                elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
+                    run_usage.setdefault("input_tokens", parsed.get("context_token_estimate", 0))
+                elif event_type == "debug" and parsed.get("stage") == "model_usage" and isinstance(parsed.get("usage"), dict):
+                    run_usage = {
+                        **run_usage,
+                        **(parsed.get("usage") or {}),
+                    }
+                elif event_type == "done":
+                    final_text = str(parsed or final_text)
+        finally:
+            reset_runtime_context(context_tokens)
+            clear_tool_dedupe_cache(run_id)
+
+        final_text = _finalize_agent_response(
+            store=store,
+            session_id=session["session_id"],
+            user_message=message,
+            final_text=final_text,
+            tools=tools,
+            status=terminal_status or ("completed" if final_text.strip() else "failed"),
+            failure_reason=terminal_failure_reason or ("" if final_text.strip() else "Agent returned no final text."),
+        )
+        final_usage = normalize_usage(run_usage, output_text=final_text)
+        store.replace_last_assistant_message(session["session_id"], final_text, tools=tools, usage=final_usage)
+        store.update_progress(
+            session["session_id"],
+            status="idle" if not terminal_status else terminal_status,
+            active_tool=None,
+            message="Ready to continue." if not terminal_status else terminal_failure_reason,
+            elapsed_seconds=0,
+            last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
+            usage=final_usage,
+        )
+        return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})
+    finally:
+        _release_session_run(session["session_id"], run_id)
 
 
 if __name__ == "__main__":

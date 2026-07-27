@@ -1,13 +1,15 @@
 import asyncio
 import json
-import tempfile
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, ToolMessage
 
 from backend.agent import _append_native_history_messages, stream_agent_events
+from backend import tools as runtime_tools
 from backend.main import get_session, chat_stream, chat_sync
 from backend.session_store import SessionStore
 
@@ -91,11 +93,14 @@ def _tool_result(sequence, tool_call_id, name, content):
 
 class ToolHistoryTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.store = SessionStore(Path(self.temp_dir.name))
+        temp_root = Path.cwd() / "tmp" / "unittest"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_path = temp_root / f"{self._testMethodName}-{uuid4().hex}"
+        self.temp_path.mkdir(parents=True, exist_ok=False)
+        self.store = SessionStore(self.temp_path)
 
     def tearDown(self):
-        self.temp_dir.cleanup()
+        shutil.rmtree(self.temp_path, ignore_errors=True)
 
     def _complete_turn(self, session_id, user_text, assistant_text, tools):
         self.store.append_message(session_id, "user", user_text)
@@ -191,6 +196,149 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual([event["tool_call_id"] for event in stored_tools], ["call-a", "call-a", "call-b", "call-b"])
         self.assertEqual([event["arguments"] for event in stored_tools if event["type"] == "tool_call"], [complete_arguments, complete_arguments])
         self.assertEqual([event["content"] for event in stored_tools if event["type"] == "tool_result"], ["first", "second"])
+
+    def test_concurrent_chat_runs_keep_runtime_context_isolated_by_session(self):
+        arrivals = []
+        release = asyncio.Event()
+
+        async def fake_stream_agent_events(_agent, message, session_id, _history):
+            arrivals.append(session_id)
+            if len(arrivals) == 2:
+                release.set()
+            await asyncio.wait_for(release.wait(), timeout=1)
+            observed_session_id = runtime_tools._current_session_id()
+            observed_run_id = runtime_tools._current_run_id()
+            yield {
+                "event": "done",
+                "data": json.dumps(
+                    {
+                        "message": f"{message}:{observed_session_id}",
+                        "observed_session_id": observed_session_id,
+                        "observed_run_id": observed_run_id,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+
+        async def fake_get_agent():
+            return object()
+
+        async def run_concurrently():
+            with patch("backend.main.get_session_store", return_value=self.store), patch("backend.main.get_agent", fake_get_agent), patch("backend.main.stream_agent_events", fake_stream_agent_events):
+                first = asyncio.create_task(chat_sync(JsonRequest({"message": "first", "session_id": "parallel-a"})))
+                second = asyncio.create_task(chat_sync(JsonRequest({"message": "second", "session_id": "parallel-b"})))
+                return await asyncio.gather(first, second)
+
+        responses = asyncio.run(run_concurrently())
+
+        payloads = [json.loads(response.body) for response in responses]
+        self.assertEqual({payload["session_id"] for payload in payloads}, {"parallel-a", "parallel-b"})
+        self.assertIn("first:parallel-a", self.store.load_session("parallel-a")["messages"][-1]["content"])
+        self.assertIn("second:parallel-b", self.store.load_session("parallel-b")["messages"][-1]["content"])
+        self.assertEqual(runtime_tools._current_session_id(), "")
+        self.assertEqual(runtime_tools._current_run_id(), "")
+
+    def test_chat_rejects_second_foreground_run_for_same_session_without_appending_message(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = []
+
+        async def fake_stream_agent_events(_agent, message, session_id, _history):
+            calls.append((session_id, message))
+            if len(calls) == 1:
+                first_started.set()
+                await asyncio.wait_for(release_first.wait(), timeout=1)
+            yield {"event": "done", "data": json.dumps(f"done:{message}", ensure_ascii=False)}
+
+        async def fake_get_agent():
+            return object()
+
+        async def run_duplicate_requests():
+            with patch("backend.main.get_session_store", return_value=self.store), patch("backend.main.get_agent", fake_get_agent), patch("backend.main.stream_agent_events", fake_stream_agent_events):
+                first = asyncio.create_task(chat_sync(JsonRequest({"message": "first", "session_id": "same-session"})))
+                await asyncio.wait_for(first_started.wait(), timeout=1)
+                second_response = await chat_sync(JsonRequest({"message": "second", "session_id": "same-session"}))
+                release_first.set()
+                first_response = await first
+                return first_response, second_response
+
+        first_response, second_response = asyncio.run(run_duplicate_requests())
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 409)
+        second_payload = json.loads(second_response.body)
+        self.assertEqual(second_payload["error"], "session_run_active")
+        session = self.store.load_session("same-session")
+        self.assertEqual([message["role"] for message in session["messages"]], ["user", "assistant"])
+        self.assertEqual(session["messages"][0]["content"], "first")
+        self.assertIn("done:first", session["messages"][1]["content"])
+
+    def test_chat_allows_same_session_run_after_prior_run_finishes(self):
+        calls = []
+
+        async def fake_stream_agent_events(_agent, message, _session_id, _history):
+            calls.append(message)
+            yield {"event": "done", "data": json.dumps(f"done:{message}", ensure_ascii=False)}
+
+        async def fake_get_agent():
+            return object()
+
+        async def run_requests():
+            with patch("backend.main.get_session_store", return_value=self.store), patch("backend.main.get_agent", fake_get_agent), patch("backend.main.stream_agent_events", fake_stream_agent_events):
+                first = await chat_sync(JsonRequest({"message": "first", "session_id": "repeat-session"}))
+                second = await chat_sync(JsonRequest({"message": "second", "session_id": "repeat-session"}))
+                return first, second
+
+        first_response, second_response = asyncio.run(run_requests())
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(calls, ["first", "second"])
+
+    def test_chat_clears_per_run_dedupe_cache_after_sync_run(self):
+        observed_run_ids = []
+
+        async def fake_stream_agent_events(_agent, _message, _session_id, _history):
+            run_id = runtime_tools._current_run_id()
+            observed_run_ids.append(run_id)
+            runtime_tools._TOOL_DEDUPE_CACHE[run_id] = {"call": "result"}
+            yield {"event": "done", "data": json.dumps("done", ensure_ascii=False)}
+
+        async def fake_get_agent():
+            return object()
+
+        request = JsonRequest({"message": "request", "session_id": "dedupe-cleanup"})
+        with patch("backend.main.get_session_store", return_value=self.store), patch("backend.main.get_agent", fake_get_agent), patch("backend.main.stream_agent_events", fake_stream_agent_events):
+            response = asyncio.run(chat_sync(request))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(observed_run_ids), 1)
+        self.assertNotIn(observed_run_ids[0], runtime_tools._TOOL_DEDUPE_CACHE)
+
+    def test_chat_stream_adds_session_and_run_attribution_to_structured_events(self):
+        async def fake_stream_agent_events(_agent, _message, _session_id, _history):
+            yield {
+                "event": "progress",
+                "data": json.dumps({"message": "working"}, ensure_ascii=False),
+            }
+            yield {"event": "done", "data": json.dumps("final", ensure_ascii=False)}
+
+        async def fake_get_agent():
+            return object()
+
+        request = StreamRequest({"message": "request", "session_id": "attributed-stream"})
+        with patch("backend.main.get_session_store", return_value=self.store), patch("backend.main.get_agent", fake_get_agent), patch("backend.main.stream_agent_events", fake_stream_agent_events), patch("backend.main.EventSourceResponse", lambda generator: generator):
+            generator = asyncio.run(chat_stream(request))
+
+            async def consume():
+                return [event async for event in generator]
+
+            events = asyncio.run(consume())
+
+        progress_payload = json.loads(next(event["data"] for event in events if event["event"] == "progress"))
+        self.assertEqual(progress_payload["session_id"], "attributed-stream")
+        self.assertTrue(progress_payload["run_id"].startswith("attributed-stream:"))
+        self.assertEqual(progress_payload["message"], "working")
 
     def test_chat_stream_hides_private_tool_transcript_events_from_clients(self):
         complete_arguments = {"query": "same call", "runtime": {"secret": "retain"}}

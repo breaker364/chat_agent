@@ -42,6 +42,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_mcd_mcp_config
+from .runtime_context import copy_runtime_context, current_run_id, current_session_id
 from .vision import analyze_image_file, analyze_image_files
 from .feishu_web_login import (
     FeishuWebSessionStore,
@@ -116,13 +117,17 @@ _TOOL_FAILED_CACHE_TTL_SECONDS = 10
 
 def _run_coro_in_thread(coro: Any) -> Any:
     queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+    runtime_context = copy_runtime_context()
 
     def _target() -> None:
-        try:
-            result = asyncio.run(coro)
-            queue.put((True, result))
-        except Exception as exc:
-            queue.put((False, exc))
+        def _run() -> None:
+            try:
+                result = asyncio.run(coro)
+                queue.put((True, result))
+            except Exception as exc:
+                queue.put((False, exc))
+
+        runtime_context.run(_run)
 
     thread = Thread(target=_target, daemon=True)
     thread.start()
@@ -134,13 +139,17 @@ def _run_coro_in_thread(coro: Any) -> Any:
 
 def _run_coro_in_thread_with_timeout(coro: Any, timeout_seconds: int) -> Any:
     queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+    runtime_context = copy_runtime_context()
 
     def _target() -> None:
-        try:
-            result = asyncio.run(coro)
-            queue.put((True, result))
-        except Exception as exc:
-            queue.put((False, exc))
+        def _run() -> None:
+            try:
+                result = asyncio.run(coro)
+                queue.put((True, result))
+            except Exception as exc:
+                queue.put((False, exc))
+
+        runtime_context.run(_run)
 
     thread = Thread(target=_target, daemon=True)
     thread.start()
@@ -151,7 +160,6 @@ def _run_coro_in_thread_with_timeout(coro: Any, timeout_seconds: int) -> Any:
     if ok:
         return value
     raise value
-
 
 def _canonical_json(payload: Any) -> str:
     try:
@@ -358,11 +366,11 @@ def _arguments_hash(payload: Any) -> str:
 
 
 def _current_run_id() -> str:
-    return os.environ.get(_CURRENT_RUN_ID_ENV, "").strip()
+    return current_run_id()
 
 
 def _current_session_id() -> str:
-    return os.environ.get(_CURRENT_SESSION_ID_ENV, "").strip()
+    return current_session_id()
 
 
 def _tool_policy(tool_name: str) -> dict[str, Any]:
@@ -964,7 +972,7 @@ def _feishu_session_store() -> FeishuWebSessionStore:
 
 
 def _current_session_id() -> str:
-    return (os.environ.get(_CURRENT_SESSION_ID_ENV) or "").strip()
+    return current_session_id()
 
 
 def _load_feishu_session_payload() -> dict[str, Any]:
