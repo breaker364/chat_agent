@@ -85,7 +85,6 @@ _TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
     "web_search": 900,
     "web_fetch": 900,
     "fetch_webpage": 900,
-    "get_subagent_task": 30,
     "feishu_login_status": 60,
     "analyze_image": 3600,
 }
@@ -383,6 +382,10 @@ def _tool_policy(tool_name: str) -> dict[str, Any]:
         "ttl_seconds": ttl_seconds,
         "side_effect": side_effect,
     }
+
+
+def _uses_same_run_dedupe(policy: dict[str, Any]) -> bool:
+    return bool(policy.get("cacheable") or policy.get("side_effect"))
 
 
 def _now_ms() -> int:
@@ -701,9 +704,10 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
     if not tool_name:
         return tool_obj
     policy = _tool_policy(tool_name)
+    same_run_dedupe = _uses_same_run_dedupe(policy)
 
     def cached_func(**kwargs: Any) -> str:
-        cache = _run_cache_for_current_request()
+        cache = _run_cache_for_current_request() if same_run_dedupe else None
         cache_key = _dedupe_key(tool_name, kwargs)
         if cache is not None and cache_key in cache:
             result_text = cache[cache_key]
@@ -786,7 +790,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             raise
 
     async def cached_coroutine(**kwargs: Any) -> str:
-        cache = _run_cache_for_current_request()
+        cache = _run_cache_for_current_request() if same_run_dedupe else None
         cache_key = _dedupe_key(tool_name, kwargs)
 
         # Fast path: result already cached from a previous call in this run.
@@ -817,7 +821,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
         # wait for it to complete and reuse its result instead of sending a
         # duplicate request. This prevents parallel duplicates from the same
         # model turn (e.g. calling get-current-date twice simultaneously).
-        pending_map = _pending_for_current_request()
+        pending_map = _pending_for_current_request() if same_run_dedupe else None
         if pending_map is not None and cache_key in pending_map:
             event: asyncio.Event = pending_map[cache_key]
             await event.wait()

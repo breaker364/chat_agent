@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from backend.agent import _append_native_history_messages, stream_agent_events
 from backend import tools as runtime_tools
 from backend.main import get_session, chat_stream, chat_sync
+from backend.runtime_context import bind_runtime_context, reset_runtime_context
 from backend.session_store import SessionStore
 
 
@@ -314,6 +315,33 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(observed_run_ids), 1)
         self.assertNotIn(observed_run_ids[0], runtime_tools._TOOL_DEDUPE_CACHE)
+
+    def test_get_subagent_task_reflects_status_changes_within_same_run(self):
+        agent_id = "subagent-dynamic-status"
+        state = {"agent_id": agent_id, "status": "running"}
+        manager_calls = []
+        wrapped_tool = runtime_tools._wrap_tool_with_run_dedupe(runtime_tools.get_subagent_task)
+        run_id = f"subagent-status-{uuid4().hex}"
+
+        def fake_get_task(received_agent_id, workspace_dir=None):
+            manager_calls.append(received_agent_id)
+            return dict(state)
+
+        tokens = bind_runtime_context("", run_id)
+        try:
+            with patch.object(runtime_tools._SUBAGENT_MANAGER, "get_task", side_effect=fake_get_task):
+                first = json.loads(wrapped_tool.invoke({"agent_id": agent_id}))
+                state["status"] = "idle"
+                state["result"] = "done"
+                second = json.loads(wrapped_tool.invoke({"agent_id": agent_id}))
+        finally:
+            reset_runtime_context(tokens)
+            runtime_tools.clear_tool_dedupe_cache(run_id)
+
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "idle")
+        self.assertEqual(second["result"], "done")
+        self.assertEqual(manager_calls, [agent_id, agent_id])
 
     def test_chat_stream_adds_session_and_run_attribution_to_structured_events(self):
         async def fake_stream_agent_events(_agent, _message, _session_id, _history):

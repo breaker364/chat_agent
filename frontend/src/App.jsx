@@ -85,6 +85,21 @@ function makeSessionId() {
   return `session-${Date.now()}`;
 }
 
+function makeDraftSession(sessionId) {
+  return {
+    session_id: sessionId,
+    title: "New Session",
+    message_count: 0,
+    is_draft: true,
+    task_progress: { status: "idle" },
+  };
+}
+
+function replaceDraftSession(sessions, sessionId) {
+  const draft = makeDraftSession(sessionId);
+  return [draft, ...(sessions || []).filter((session) => !session.is_draft && session.session_id !== sessionId)];
+}
+
 function readLastSessionId() {
   try {
     return window.localStorage.getItem(LAST_SESSION_STORAGE_KEY) || "";
@@ -1284,14 +1299,11 @@ export default function App() {
           await loadSession((matchedSession || sessionList[0]).session_id, { scrollToBottom: true });
         } else {
           const sessionId = makeSessionId();
-          const resp = await fetch(`${API_BASE}/sessions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json; charset=utf-8" },
-            body: JSON.stringify({ session_id: sessionId }),
-          });
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          await refreshSessions();
-          await loadSession(sessionId, { scrollToBottom: true });
+          setActiveSessionId(sessionId);
+          activeSessionIdRef.current = sessionId;
+          writeLastSessionId(sessionId);
+          setMessages([defaultAssistantMessage]);
+          setSessions((prev) => replaceDraftSession(prev, sessionId));
         }
       } catch {
         const fallbackSessions = await refreshSessions();
@@ -1334,34 +1346,15 @@ export default function App() {
     setActiveSessionId(sessionId);
     activeSessionIdRef.current = sessionId;
     writeLastSessionId(sessionId);
-    try {
-      await fetch(`${API_BASE}/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ session_id: sessionId }),
-      });
-      await refreshSessions();
-      await loadSession(sessionId, { scrollToBottom: true });
-    } catch {
-      setActiveSessionId(sessionId);
-      activeSessionIdRef.current = sessionId;
-      setMessages([defaultAssistantMessage]);
-      setSessions((prev) => [
-        {
-          session_id: sessionId,
-          title: "New Session",
-          task_progress: { status: "idle" },
-        },
-        ...prev,
-      ]);
-    }
+    setMessages([defaultAssistantMessage]);
+    setSessions((prev) => replaceDraftSession(prev, sessionId));
     setSessionRuns((prev) => replaceRunEvents(replaceRunEvents(replaceRunEvents(prev, sessionId, "debugEvents", []), sessionId, "toolEvents", []), sessionId, "activityItems", []));
     setSubagentTasks([]);
     setSubagentNotifications([]);
     setTaskProgress(null);
     setPendingFiles([]);
     setAttachmentError("");
-  }, [defaultAssistantMessage, loadSession, refreshSessions]);
+  }, [defaultAssistantMessage]);
 
   const handleRenameSession = useCallback(async (event, session) => {
     event.preventDefault();

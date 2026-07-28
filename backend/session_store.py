@@ -400,6 +400,13 @@ class SessionStore:
             and isinstance(data.get("messages", []), list)
         )
 
+    def _is_empty_default_placeholder_session(self, data: dict[str, Any]) -> bool:
+        return (
+            self._looks_like_chat_session(data)
+            and not data.get("messages")
+            and str(data.get("title") or "").strip() == "New Session"
+        )
+
     def _migrate_legacy_sidecars(self, session_id: str) -> None:
         for legacy_path, folder_path in (
             (self.legacy_task_journal_path(session_id), self.task_journal_path(session_id)),
@@ -430,6 +437,8 @@ class SessionStore:
             except Exception:
                 continue
             if not self._looks_like_chat_session(data):
+                continue
+            if self._is_empty_default_placeholder_session(data):
                 continue
             session_id = data.get("session_id", path.stem)
             if session_id in seen_session_ids:
