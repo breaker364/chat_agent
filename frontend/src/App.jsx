@@ -10,6 +10,7 @@ import {
   Globe,
   Clock,
   TerminalSquare,
+  FileImage,
   PanelRightOpen,
   PanelRightClose,
   Square,
@@ -65,11 +66,64 @@ const MAX_HISTORY_ITEM_CHARS = 4000;
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const COMPOSER_MAX_HEIGHT = 176;
+const IMAGE_MIME_PREFIX = "image/";
+const IMAGE_EXTENSION_BY_TYPE = {
+  "image/bmp": "bmp",
+  "image/gif": "gif",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/svg+xml": "svg",
+  "image/tiff": "tif",
+  "image/webp": "webp",
+};
 
 function formatFileSize(size) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isImageFile(file) {
+  return String(file?.type || "").toLowerCase().startsWith(IMAGE_MIME_PREFIX);
+}
+
+function imageExtensionFromType(type) {
+  const normalizedType = String(type || "").toLowerCase();
+  if (IMAGE_EXTENSION_BY_TYPE[normalizedType]) return IMAGE_EXTENSION_BY_TYPE[normalizedType];
+  const subtype = normalizedType.startsWith(IMAGE_MIME_PREFIX)
+    ? normalizedType.slice(IMAGE_MIME_PREFIX.length).split(/[+;]/)[0]
+    : "";
+  return subtype || "png";
+}
+
+function ensureImageFileName(file) {
+  if (!isImageFile(file) || file.name) return file;
+  const extension = imageExtensionFromType(file.type);
+  return new File([file], `pasted-image-${Date.now()}.${extension}`, {
+    type: file.type,
+    lastModified: file.lastModified,
+  });
+}
+
+function filesFromDataTransfer(dataTransfer) {
+  return Array.from(dataTransfer?.files || []);
+}
+
+function imageFilesFromClipboard(clipboardData) {
+  const itemFiles = Array.from(clipboardData?.items || [])
+    .filter((item) => item.kind === "file" && String(item.type || "").toLowerCase().startsWith(IMAGE_MIME_PREFIX))
+    .map((item) => item.getAsFile())
+    .filter(isImageFile);
+  const directFiles = filesFromDataTransfer(clipboardData).filter(isImageFile);
+  return (itemFiles.length ? itemFiles : directFiles).map(ensureImageFileName);
+}
+
+function dataTransferHasImage(dataTransfer) {
+  const items = Array.from(dataTransfer?.items || []);
+  if (items.some((item) => String(item.type || "").toLowerCase().startsWith(IMAGE_MIME_PREFIX))) return true;
+  return filesFromDataTransfer(dataTransfer).some(isImageFile);
 }
 
 function buildAttachmentMessage(text, uploadedFiles) {
@@ -1043,6 +1097,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [pendingFiles, setPendingFiles] = useState([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [isDraggingImages, setIsDraggingImages] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
   const [sessionRuns, setSessionRuns] = useState({});
   const [subagentTasks, setSubagentTasks] = useState([]);
@@ -1164,18 +1219,23 @@ export default function App() {
     event.preventDefault();
     dragDepthRef.current += 1;
     setIsDraggingFiles(true);
+    setIsDraggingImages(dataTransferHasImage(event.dataTransfer));
   }, []);
 
   const handleDragOver = useCallback((event) => {
     if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
+    setIsDraggingImages(dataTransferHasImage(event.dataTransfer));
   }, []);
 
   const handleDragLeave = useCallback((event) => {
     event.preventDefault();
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+    if (dragDepthRef.current === 0) {
+      setIsDraggingFiles(false);
+      setIsDraggingImages(false);
+    }
   }, []);
 
   const handleDrop = useCallback(
@@ -1184,7 +1244,17 @@ export default function App() {
       event.preventDefault();
       dragDepthRef.current = 0;
       setIsDraggingFiles(false);
+      setIsDraggingImages(false);
       addPendingFiles(event.dataTransfer.files);
+    },
+    [addPendingFiles]
+  );
+
+  const handlePaste = useCallback(
+    (event) => {
+      const imageFiles = imageFilesFromClipboard(event.clipboardData);
+      if (!imageFiles.length) return;
+      addPendingFiles(imageFiles);
     },
     [addPendingFiles]
   );
@@ -2168,15 +2238,15 @@ export default function App() {
           <div className="composer-shell">
             {isDraggingFiles ? (
               <div className="composer-drop-prompt">
-                <Paperclip size={18} />
-                Drop files to attach
+                {isDraggingImages ? <FileImage size={18} /> : <Paperclip size={18} />}
+                {isDraggingImages ? "Drop images to upload" : "Drop files to attach"}
               </div>
             ) : null}
             {pendingFiles.length ? (
               <div className="attachment-list">
                 {pendingFiles.map((file, index) => (
                   <div className="attachment-chip" key={`${file.name}-${file.size}-${file.lastModified}`}>
-                    <FileText size={14} />
+                    {isImageFile(file) ? <FileImage size={14} /> : <FileText size={14} />}
                     <span className="attachment-name" title={file.name}>{file.name}</span>
                     <span className="attachment-size">{formatFileSize(file.size)}</span>
                     <button
@@ -2226,6 +2296,7 @@ export default function App() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
                 placeholder={appendMode ? "追加指令到当前运行中的任务" : "Send a message or drop files here"}
                 rows={1}
                 disabled={false}
@@ -2245,7 +2316,7 @@ export default function App() {
               </button>
             </div>
             <div className={`composer-meta ${attachmentError ? "has-error" : ""}`}>
-              <span>{attachmentError || (appendMode ? "当前任务运行中：Enter 会追加到当前任务 · Shift+Enter 换行" : "Enter to send · Shift+Enter for a new line · up to 10 files, 25 MB each")}</span>
+              <span>{attachmentError || (appendMode ? "当前任务运行中：Enter 会追加到当前任务 · Shift+Enter 换行" : "Enter to send · Shift+Enter for a new line · drop or paste images · up to 10 files, 25 MB each")}</span>
               <span>{input.length.toLocaleString()} chars</span>
             </div>
           </div>
