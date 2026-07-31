@@ -102,7 +102,7 @@ body,
    Session Sidebar (left)
    ============================================================ */
 .session-sidebar {
-  width: 280px;
+  width: var(--session-sidebar-width, 280px);
   flex-shrink: 0;
   border-right: 1px solid var(--border);
   background: var(--bg-primary);
@@ -113,6 +113,47 @@ body,
 
 .session-sidebar.collapsed {
   width: 68px;
+}
+
+.column-resizer {
+  position: relative;
+  flex: 0 0 8px;
+  width: 8px;
+  min-width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+}
+
+.column-resizer::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 50%;
+  width: 1px;
+  border-radius: var(--radius-full);
+  background: var(--border-light);
+  transform: translateX(-50%);
+  transition:
+    width var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out);
+}
+
+.column-resizer:hover::before,
+.column-resizer:focus-visible::before {
+  width: 3px;
+  background: var(--accent);
+}
+
+.column-resizer:focus-visible {
+  outline: none;
+}
+
+body.is-resizing-columns,
+body.is-resizing-columns * {
+  cursor: col-resize !important;
+  user-select: none;
 }
 
 .session-sidebar-header {
@@ -326,11 +367,12 @@ body,
   padding: 12px 24px 0;
   flex-shrink: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   gap: 10px;
 }
 
-.knowledge-panel {
+.knowledge-panel,
+.feishu-panel {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
@@ -341,11 +383,24 @@ body,
   gap: 10px;
 }
 
-.knowledge-panel-header {
+.knowledge-panel.collapsed,
+.feishu-panel.collapsed {
+  padding: 8px 12px;
+  gap: 0;
+}
+
+.knowledge-panel-header,
+.feishu-panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+}
+
+.knowledge-panel-header > div:first-child,
+.feishu-panel-title {
+  min-width: 0;
 }
 
 .knowledge-panel-title {
@@ -372,6 +427,39 @@ body,
 
 .knowledge-mode-toggle input {
   accent-color: var(--accent);
+}
+
+.knowledge-mode-toggle span {
+  white-space: nowrap;
+}
+
+.knowledge-panel-header-right,
+.feishu-panel-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.knowledge-collapse-btn,
+.feishu-collapse-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-surface-2);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.knowledge-collapse-btn:hover,
+.feishu-collapse-btn:hover {
+  color: var(--text);
+  border-color: var(--border-accent);
 }
 
 .knowledge-panel-actions {
@@ -837,24 +925,6 @@ body,
   font-size: 12px;
 }
 
-.feishu-panel {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-sm);
-  padding: 12px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.feishu-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
 .feishu-panel-title {
   display: flex;
   align-items: center;
@@ -862,31 +932,6 @@ body,
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
-}
-
-.feishu-panel-header-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.feishu-collapse-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--bg-surface-2);
-  color: var(--text-tertiary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all var(--duration-fast) var(--ease-out);
-}
-
-.feishu-collapse-btn:hover {
-  color: var(--text);
-  border-color: var(--border-accent);
 }
 
 .feishu-status {
@@ -1719,7 +1764,7 @@ body,
    ============================================================ */
 .debug-sidebar {
   flex-shrink: 0;
-  width: 360px;
+  width: var(--debug-sidebar-width, 360px);
   border-left: 1px solid var(--border);
   background: var(--bg-primary);
   display: flex;
@@ -1874,11 +1919,12 @@ body,
    ============================================================ */
 .subagent-sidebar {
   flex-shrink: 0;
-  width: 300px;
+  width: var(--subagent-sidebar-width, 300px);
   border-left: 1px solid var(--border);
   background: var(--bg-primary);
   display: flex;
   flex-direction: column;
+  transition: width var(--duration-slow) var(--ease-out);
 }
 
 .subagent-sidebar-header {
@@ -2156,7 +2202,12 @@ input:focus-visible {
    ============================================================ */
 @media (max-width: 960px) {
   .session-sidebar {
-    width: 220px;
+    width: min(var(--session-sidebar-width, 280px), 34vw);
+  }
+
+  .column-resizer,
+  .subagent-sidebar {
+    display: none;
   }
 
   .debug-sidebar {
@@ -2175,6 +2226,23 @@ input:focus-visible {
 
 @media (max-width: 600px) {
   .session-sidebar {
+    display: none;
+  }
+
+  .top-panels {
+    padding: 10px 16px 0;
+  }
+
+  .knowledge-panel-header,
+  .feishu-panel-header {
+    align-items: flex-start;
+  }
+
+  .knowledge-panel-header-right {
+    gap: 6px;
+  }
+
+  .knowledge-mode-toggle span {
     display: none;
   }
 
@@ -2200,10 +2268,6 @@ input:focus-visible {
 
   .debug-sidebar {
     width: min(88vw, 360px);
-  }
-
-  .subagent-sidebar {
-    display: none;
   }
 }
 

@@ -59,12 +59,25 @@ const API_BASE = "";
 const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
 const SESSION_SIDEBAR_COLLAPSED_KEY = "chat-agent:session-sidebar-collapsed";
 const DEBUG_SIDEBAR_COLLAPSED_KEY = "chat-agent:debug-sidebar-collapsed";
+const KNOWLEDGE_PANEL_COLLAPSED_KEY = "chat-agent:knowledge-panel-collapsed";
 const FEISHU_PANEL_COLLAPSED_KEY = "chat-agent:feishu-panel-collapsed";
+const SESSION_SIDEBAR_WIDTH_KEY = "chat-agent:session-sidebar-width";
+const DEBUG_SIDEBAR_WIDTH_KEY = "chat-agent:debug-sidebar-width";
+const SUBAGENT_SIDEBAR_WIDTH_KEY = "chat-agent:subagent-sidebar-width";
 const MAX_HISTORY_ITEMS = 12;
 const MAX_HISTORY_ITEM_CHARS = 4000;
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const COMPOSER_MAX_HEIGHT = 176;
+const SESSION_SIDEBAR_DEFAULT_WIDTH = 280;
+const SESSION_SIDEBAR_MIN_WIDTH = 180;
+const SESSION_SIDEBAR_MAX_WIDTH = 420;
+const DEBUG_SIDEBAR_DEFAULT_WIDTH = 360;
+const DEBUG_SIDEBAR_MIN_WIDTH = 260;
+const DEBUG_SIDEBAR_MAX_WIDTH = 560;
+const SUBAGENT_SIDEBAR_DEFAULT_WIDTH = 300;
+const SUBAGENT_SIDEBAR_MIN_WIDTH = 240;
+const SUBAGENT_SIDEBAR_MAX_WIDTH = 480;
 const IMAGE_MIME_PREFIX = "image/";
 const IMAGE_EXTENSION_BY_TYPE = {
   "image/bmp": "bmp",
@@ -211,6 +224,22 @@ function writeDebugCollapsed(collapsed) {
   }
 }
 
+function readKnowledgeCollapsed() {
+  try {
+    return window.localStorage.getItem(KNOWLEDGE_PANEL_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeKnowledgeCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(KNOWLEDGE_PANEL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
 function readFeishuCollapsed() {
   try {
     return window.localStorage.getItem(FEISHU_PANEL_COLLAPSED_KEY) === "1";
@@ -222,6 +251,29 @@ function readFeishuCollapsed() {
 function writeFeishuCollapsed(collapsed) {
   try {
     window.localStorage.setItem(FEISHU_PANEL_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
+
+function clampNumber(value, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return min;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function readStoredWidth(key, fallback, min, max) {
+  try {
+    const stored = window.localStorage.getItem(key);
+    return stored == null ? fallback : clampNumber(stored, min, max);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredWidth(key, width) {
+  try {
+    window.localStorage.setItem(key, String(width));
   } catch {
     // Ignore localStorage failures.
   }
@@ -687,15 +739,20 @@ function FeishuLoginPanel({
   onLogout,
 }) {
   return (
-    <section className="feishu-panel">
+    <section className={`feishu-panel ${collapsed ? "collapsed" : ""}`}>
       <div className="feishu-panel-header">
         <div className="feishu-panel-title">
           <QrCode size={16} />
           <span>Feishu Web Login</span>
         </div>
         <div className="feishu-panel-header-right">
-          <button className="feishu-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? "Expand login panel" : "Collapse login panel"}>
-            {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+          <button
+            className="feishu-collapse-btn"
+            onClick={onToggleCollapsed}
+            title={collapsed ? "Show web login panel" : "Hide web login panel"}
+            aria-label={collapsed ? "Show web login panel" : "Hide web login panel"}
+          >
+            {collapsed ? <Expand size={14} /> : <Minimize size={14} />}
           </button>
           <div className={`feishu-status ${status?.logged_in ? "connected" : "disconnected"}`}>
             {status?.logged_in ? "connected" : "not logged in"}
@@ -735,12 +792,28 @@ function FeishuLoginPanel({
             </div>
           ) : null}
         </>
-      ) : (
-        <div className="feishu-panel-collapsed-note">
-          {status?.logged_in ? "Session active" : "Expand to log in"}
-        </div>
-      )}
+      ) : null}
     </section>
+  );
+}
+
+function ColumnResizer({ label, onPointerDown, onStep }) {
+  const handleKeyDown = (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    onStep(event.key === "ArrowRight" ? 24 : -24);
+  };
+
+  return (
+    <div
+      className="column-resizer"
+      role="separator"
+      aria-label={label}
+      aria-orientation="vertical"
+      tabIndex={0}
+      onPointerDown={onPointerDown}
+      onKeyDown={handleKeyDown}
+    />
   );
 }
 
@@ -1355,7 +1428,9 @@ function KnowledgePanel({
   enabled,
   loading,
   status,
+  collapsed,
   onToggleEnabled,
+  onToggleCollapsed,
   onImportFiles,
   onSync,
   onDeleteDocument,
@@ -1375,7 +1450,7 @@ function KnowledgePanel({
 
   return (
     <section
-      className="knowledge-panel"
+      className={`knowledge-panel ${collapsed ? "collapsed" : ""}`}
       aria-label="Knowledge base"
       onDrop={handleDrop}
       onDragOver={handleDragOver}
@@ -1385,67 +1460,82 @@ function KnowledgePanel({
           <div className="knowledge-panel-title">Knowledge Base</div>
           <div className="knowledge-panel-subtitle">{documents.length} documents / {formatKnowledgeCounts(status)}</div>
         </div>
-        <label className="knowledge-mode-toggle">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(event) => onToggleEnabled(event.target.checked)}
-            disabled={loading}
-          />
-          <span>Use knowledge base</span>
-        </label>
+        <div className="knowledge-panel-header-right">
+          <label className="knowledge-mode-toggle">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => onToggleEnabled(event.target.checked)}
+              disabled={loading}
+            />
+            <span>Use knowledge base</span>
+          </label>
+          <button
+            type="button"
+            className="knowledge-collapse-btn"
+            onClick={onToggleCollapsed}
+            title={collapsed ? "Show knowledge base panel" : "Hide knowledge base panel"}
+            aria-label={collapsed ? "Show knowledge base panel" : "Hide knowledge base panel"}
+          >
+            {collapsed ? <Expand size={14} /> : <Minimize size={14} />}
+          </button>
+        </div>
       </div>
-      <div className="knowledge-panel-actions">
-        <button
-          type="button"
-          className="knowledge-action-btn"
-          onClick={() => importInputRef.current?.click()}
-          disabled={loading}
-        >
-          <Paperclip size={14} />
-          Import
-        </button>
-        <input
-          ref={importInputRef}
-          className="file-input"
-          type="file"
-          multiple
-          aria-label="Import knowledge files"
-          onChange={(event) => {
-            onImportFiles(event.target.files);
-            event.target.value = "";
-          }}
-          disabled={loading}
-        />
-        <button
-          type="button"
-          className="knowledge-action-btn"
-          onClick={onOpenCenter}
-          disabled={loading}
-          aria-label="Open knowledge center"
-        >
-          <FileText size={14} />
-          Browse
-        </button>
-        <button
-          type="button"
-          className="knowledge-action-btn"
-          onClick={onSync}
-          disabled={loading}
-          aria-label="Sync knowledge"
-        >
-          {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
-          Sync
-        </button>
-      </div>
-      <div className="knowledge-documents">
-        {documents.length ? (
-          <div className="knowledge-empty">{documents.length} indexed documents. Open the center to inspect files and chunks.</div>
-        ) : (
-          <div className="knowledge-empty">Drop files here or import documents.</div>
-        )}
-      </div>
-      <KnowledgeSyncDetails status={status} />
+      {!collapsed ? (
+        <>
+          <div className="knowledge-panel-actions">
+            <button
+              type="button"
+              className="knowledge-action-btn"
+              onClick={() => importInputRef.current?.click()}
+              disabled={loading}
+            >
+              <Paperclip size={14} />
+              Import
+            </button>
+            <input
+              ref={importInputRef}
+              className="file-input"
+              type="file"
+              multiple
+              aria-label="Import knowledge files"
+              onChange={(event) => {
+                onImportFiles(event.target.files);
+                event.target.value = "";
+              }}
+              disabled={loading}
+            />
+            <button
+              type="button"
+              className="knowledge-action-btn"
+              onClick={onOpenCenter}
+              disabled={loading}
+              aria-label="Open knowledge center"
+            >
+              <FileText size={14} />
+              Browse
+            </button>
+            <button
+              type="button"
+              className="knowledge-action-btn"
+              onClick={onSync}
+              disabled={loading}
+              aria-label="Sync knowledge"
+            >
+              {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+              Sync
+            </button>
+          </div>
+          <div className="knowledge-documents">
+            {documents.length ? (
+              <div className="knowledge-empty">{documents.length} indexed documents. Open the center to inspect files and chunks.</div>
+            ) : (
+              <div className="knowledge-empty">Drop files here or import documents.</div>
+            )}
+          </div>
+          <KnowledgeSyncDetails status={status} />
+        </>
+      ) : null}
     </section>
   );
 }
@@ -1473,6 +1563,16 @@ export default function App() {
   const [taskProgress, setTaskProgress] = useState(null);
   const [debugOpen, setDebugOpen] = useState(!readDebugCollapsed());
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(readSidebarCollapsed);
+  const [knowledgePanelCollapsed, setKnowledgePanelCollapsed] = useState(readKnowledgeCollapsed);
+  const [sessionSidebarWidth, setSessionSidebarWidth] = useState(() =>
+    readStoredWidth(SESSION_SIDEBAR_WIDTH_KEY, SESSION_SIDEBAR_DEFAULT_WIDTH, SESSION_SIDEBAR_MIN_WIDTH, SESSION_SIDEBAR_MAX_WIDTH)
+  );
+  const [debugSidebarWidth, setDebugSidebarWidth] = useState(() =>
+    readStoredWidth(DEBUG_SIDEBAR_WIDTH_KEY, DEBUG_SIDEBAR_DEFAULT_WIDTH, DEBUG_SIDEBAR_MIN_WIDTH, DEBUG_SIDEBAR_MAX_WIDTH)
+  );
+  const [subagentSidebarWidth, setSubagentSidebarWidth] = useState(() =>
+    readStoredWidth(SUBAGENT_SIDEBAR_WIDTH_KEY, SUBAGENT_SIDEBAR_DEFAULT_WIDTH, SUBAGENT_SIDEBAR_MIN_WIDTH, SUBAGENT_SIDEBAR_MAX_WIDTH)
+  );
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const chatAreaRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -1832,8 +1932,39 @@ export default function App() {
   }, [debugOpen]);
 
   useEffect(() => {
+    writeKnowledgeCollapsed(knowledgePanelCollapsed);
+  }, [knowledgePanelCollapsed]);
+
+  useEffect(() => {
     writeFeishuCollapsed(feishuPanelCollapsed);
   }, [feishuPanelCollapsed]);
+
+  useEffect(() => {
+    writeStoredWidth(SESSION_SIDEBAR_WIDTH_KEY, sessionSidebarWidth);
+  }, [sessionSidebarWidth]);
+
+  useEffect(() => {
+    writeStoredWidth(DEBUG_SIDEBAR_WIDTH_KEY, debugSidebarWidth);
+  }, [debugSidebarWidth]);
+
+  useEffect(() => {
+    writeStoredWidth(SUBAGENT_SIDEBAR_WIDTH_KEY, subagentSidebarWidth);
+  }, [subagentSidebarWidth]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const viewport = window.innerWidth || 1200;
+      const sideMax = Math.max(SESSION_SIDEBAR_MIN_WIDTH, Math.min(SESSION_SIDEBAR_MAX_WIDTH, Math.floor(viewport * 0.36)));
+      const debugMax = Math.max(DEBUG_SIDEBAR_MIN_WIDTH, Math.min(DEBUG_SIDEBAR_MAX_WIDTH, Math.floor(viewport * 0.44)));
+      const subagentMax = Math.max(SUBAGENT_SIDEBAR_MIN_WIDTH, Math.min(SUBAGENT_SIDEBAR_MAX_WIDTH, Math.floor(viewport * 0.38)));
+      setSessionSidebarWidth((width) => clampNumber(width, SESSION_SIDEBAR_MIN_WIDTH, sideMax));
+      setDebugSidebarWidth((width) => clampNumber(width, DEBUG_SIDEBAR_MIN_WIDTH, debugMax));
+      setSubagentSidebarWidth((width) => clampNumber(width, SUBAGENT_SIDEBAR_MIN_WIDTH, subagentMax));
+    };
+    window.addEventListener("resize", handleResize);
+    handleResize();
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     refreshKnowledgeCenter().catch(() => {});
@@ -2616,8 +2747,68 @@ export default function App() {
     [sessions, sessionRuns]
   );
 
+  const startColumnResize = useCallback((column, event) => {
+    if (event.button != null && event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const config = {
+      sessions: {
+        initial: sessionSidebarWidth,
+        direction: 1,
+        min: SESSION_SIDEBAR_MIN_WIDTH,
+        max: SESSION_SIDEBAR_MAX_WIDTH,
+        setWidth: setSessionSidebarWidth,
+      },
+      debug: {
+        initial: debugSidebarWidth,
+        direction: -1,
+        min: DEBUG_SIDEBAR_MIN_WIDTH,
+        max: DEBUG_SIDEBAR_MAX_WIDTH,
+        setWidth: setDebugSidebarWidth,
+      },
+      subagents: {
+        initial: subagentSidebarWidth,
+        direction: -1,
+        min: SUBAGENT_SIDEBAR_MIN_WIDTH,
+        max: SUBAGENT_SIDEBAR_MAX_WIDTH,
+        setWidth: setSubagentSidebarWidth,
+      },
+    }[column];
+    if (!config) return;
+
+    const handlePointerMove = (moveEvent) => {
+      const delta = moveEvent.clientX - startX;
+      config.setWidth(clampNumber(config.initial + delta * config.direction, config.min, config.max));
+    };
+    const stopResize = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopResize);
+      document.body.classList.remove("is-resizing-columns");
+    };
+
+    document.body.classList.add("is-resizing-columns");
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", stopResize);
+  }, [debugSidebarWidth, sessionSidebarWidth, subagentSidebarWidth]);
+
+  const stepColumnWidth = useCallback((column, delta) => {
+    if (column === "sessions") {
+      setSessionSidebarWidth((width) => clampNumber(width + delta, SESSION_SIDEBAR_MIN_WIDTH, SESSION_SIDEBAR_MAX_WIDTH));
+    } else if (column === "debug") {
+      setDebugSidebarWidth((width) => clampNumber(width - delta, DEBUG_SIDEBAR_MIN_WIDTH, DEBUG_SIDEBAR_MAX_WIDTH));
+    } else if (column === "subagents") {
+      setSubagentSidebarWidth((width) => clampNumber(width - delta, SUBAGENT_SIDEBAR_MIN_WIDTH, SUBAGENT_SIDEBAR_MAX_WIDTH));
+    }
+  }, []);
+
+  const shellStyle = {
+    "--session-sidebar-width": `${sessionSidebarWidth}px`,
+    "--debug-sidebar-width": `${debugSidebarWidth}px`,
+    "--subagent-sidebar-width": `${subagentSidebarWidth}px`,
+  };
+
   return (
-    <div className="app-shell">
+    <div className="app-shell" style={shellStyle}>
       <SessionSidebar
         sessions={visibleSessions}
         activeSessionId={activeSessionId}
@@ -2628,6 +2819,13 @@ export default function App() {
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
       />
+      {!sessionSidebarCollapsed ? (
+        <ColumnResizer
+          label="Resize sessions column"
+          onPointerDown={(event) => startColumnResize("sessions", event)}
+          onStep={(delta) => stepColumnWidth("sessions", delta)}
+        />
+      ) : null}
 
       <div className="app-container">
         <header className="app-header">
@@ -2666,7 +2864,9 @@ export default function App() {
             enabled={knowledgeMode}
             loading={knowledgeLoading}
             status={knowledgeStatus}
+            collapsed={knowledgePanelCollapsed}
             onToggleEnabled={setKnowledgeMode}
+            onToggleCollapsed={() => setKnowledgePanelCollapsed((prev) => !prev)}
             onImportFiles={importKnowledgeFiles}
             onSync={syncKnowledge}
             onDeleteDocument={deleteKnowledgeDocument}
@@ -2680,6 +2880,8 @@ export default function App() {
             loginState={feishuLoginState}
             loading={feishuLoading}
             polling={feishuPolling}
+            collapsed={feishuPanelCollapsed}
+            onToggleCollapsed={() => setFeishuPanelCollapsed((prev) => !prev)}
             onInit={handleFeishuInit}
             onRefresh={handleFeishuRefreshClick}
             onLogout={handleFeishuLogout}
@@ -2838,6 +3040,13 @@ export default function App() {
         </footer>
       </div>
 
+      {debugOpen ? (
+        <ColumnResizer
+          label="Resize debug column"
+          onPointerDown={(event) => startColumnResize("debug", event)}
+          onStep={(delta) => stepColumnWidth("debug", delta)}
+        />
+      ) : null}
       <DebugSidebar
         open={debugOpen}
         events={[
@@ -2853,6 +3062,13 @@ export default function App() {
         onToggle={() => setDebugOpen((v) => !v)}
         onClear={() => setSessionRuns((prev) => replaceRunEvents(prev, activeSessionId, "debugEvents", []))}
       />
+      {debugOpen ? (
+        <ColumnResizer
+          label="Resize subagents column"
+          onPointerDown={(event) => startColumnResize("subagents", event)}
+          onStep={(delta) => stepColumnWidth("subagents", delta)}
+        />
+      ) : null}
       {debugOpen ? (
         <aside className="subagent-sidebar">
           <TaskProgressPanel progress={taskProgress} onRefresh={refreshActiveSession} />

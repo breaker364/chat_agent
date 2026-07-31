@@ -306,4 +306,31 @@ describe("App knowledge base controls", () => {
     expect(await screen.findByText(/bad\.pdf/)).toBeTruthy();
     expect(screen.getByText(/PDF text extraction produced no text/)).toBeTruthy();
   });
+
+  it("collapses knowledge and web login panels to compact headers", async () => {
+    renderWithFetch(async (url) => {
+      if (url === "/feishu/session") {
+        return jsonResponse({ logged_in: true, has_session: true, issued_at: 1785466251, metadata: {} });
+      }
+      if (url === "/sessions") return jsonResponse({ sessions: [] });
+      if (url === "/knowledge/documents") {
+        return jsonResponse({
+          documents: [
+            { doc_id: "doc-1", collection: "default", title: "brief.md", source_uri: "brief.md", chunk_count: 1 },
+          ],
+        });
+      }
+      return jsonResponse({ error: "unexpected request" }, { status: 404 });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /hide knowledge base panel/i }));
+    expect(screen.queryByRole("button", { name: /sync knowledge/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /show knowledge base panel/i })).toBeTruthy();
+    expect(screen.getByText(/1 documents \/ ready/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /hide web login panel/i }));
+    expect(screen.queryByRole("button", { name: /init qr/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /show web login panel/i })).toBeTruthy();
+    expect(screen.getByText(/connected/i)).toBeTruthy();
+  });
 });
