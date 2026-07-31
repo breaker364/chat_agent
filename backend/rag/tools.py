@@ -62,21 +62,22 @@ def build_knowledge_tools(
     config = load_rag_config(config_overrides)
     if not config.enabled:
         return []
-    kb = PersonalKnowledgeBase(
-        workspace_root=workspace_root,
-        store_path=config.knowledge_store_path,
-        chunker_config=config.chunking,
-        reranker_enabled=config.reranker.enabled,
-    )
+    def knowledge_base() -> PersonalKnowledgeBase:
+        return PersonalKnowledgeBase(
+            workspace_root=workspace_root,
+            store_path=config.knowledge_store_path,
+            chunker_config=config.chunking,
+            reranker_enabled=config.reranker.enabled,
+        )
 
     def knowledge_import_files(collection: str, paths: list[str], metadata: dict[str, Any] | None = None) -> str:
-        return json.dumps(kb.import_files(collection, paths, metadata=metadata), ensure_ascii=False, indent=2)
+        return json.dumps(knowledge_base().import_files(collection, paths, metadata=metadata), ensure_ascii=False, indent=2)
 
     def knowledge_sync(collection: str | None = None, dry_run: bool = False) -> str:
-        return json.dumps(kb.sync(collection=collection, dry_run=dry_run), ensure_ascii=False, indent=2)
+        return json.dumps(knowledge_base().sync(collection=collection, dry_run=dry_run), ensure_ascii=False, indent=2)
 
     def knowledge_index_files(collection: str, paths: list[str], refresh: bool = False, metadata: dict[str, Any] | None = None) -> str:
-        return json.dumps(kb.index_files(collection, paths, refresh=refresh, metadata=metadata), ensure_ascii=False, indent=2)
+        return json.dumps(knowledge_base().index_files(collection, paths, refresh=refresh, metadata=metadata), ensure_ascii=False, indent=2)
 
     def knowledge_search(
         query: str,
@@ -86,19 +87,23 @@ def build_knowledge_tools(
         include_scores: bool = True,
     ) -> str:
         return json.dumps(
-            kb.search(query, collection=collection, filters=filters, top_k=top_k, include_scores=include_scores),
+            knowledge_base().search(query, collection=collection, filters=filters, top_k=top_k, include_scores=include_scores),
             ensure_ascii=False,
             indent=2,
         )
 
     def knowledge_list_collections() -> str:
-        return json.dumps(kb.list_collections(), ensure_ascii=False, indent=2)
+        return json.dumps(knowledge_base().list_collections(), ensure_ascii=False, indent=2)
 
     def knowledge_list_documents(collection: str | None = None) -> str:
-        return json.dumps(kb.list_documents(collection), ensure_ascii=False, indent=2)
+        return json.dumps(knowledge_base().list_documents(collection), ensure_ascii=False, indent=2)
 
     def knowledge_delete_document(doc_id: str | None = None, collection: str | None = None, source_uri: str | None = None) -> str:
-        return json.dumps(kb.delete_document(doc_id=doc_id, collection=collection, source_uri=source_uri), ensure_ascii=False, indent=2)
+        return json.dumps(
+            knowledge_base().delete_document(doc_id=doc_id, collection=collection, source_uri=source_uri),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     def knowledge_evaluate(run_id: str = "rag-smoke", sample_limit: int | None = None) -> str:
         dataset = BenchmarkDataset(

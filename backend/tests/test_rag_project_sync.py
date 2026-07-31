@@ -168,6 +168,32 @@ class RagProjectSyncTests(unittest.TestCase):
         synced = json.loads(tools["knowledge_sync"].invoke({"collection": "tooling"}))
         self.assertEqual(synced["counts"]["indexed"], 1)
 
+    def test_knowledge_tools_reload_indexes_written_after_tool_creation(self):
+        _, PersonalKnowledgeBase, build_knowledge_tools = _load_symbols()
+        tools = {
+            tool.name: tool
+            for tool in build_knowledge_tools(
+                workspace_root=self.workspace,
+                config_overrides={"enabled": True, "knowledge_store_path": str(self.store_dir)},
+            )
+        }
+
+        collection_dir = self.store_dir / "documents" / "notes"
+        collection_dir.mkdir(parents=True)
+        source = collection_dir / "late.md"
+        source.write_text("# Late\nfresh reload token", encoding="utf-8")
+        external_kb = PersonalKnowledgeBase(workspace_root=self.workspace, store_path=self.store_dir)
+        external_kb.sync(collection="notes")
+
+        listed = json.loads(tools["knowledge_list_documents"].invoke({"collection": "notes"}))
+        collections = json.loads(tools["knowledge_list_collections"].invoke({}))
+        found = json.loads(tools["knowledge_search"].invoke({"query": "fresh reload token", "collection": "notes"}))
+
+        collection_counts = {item["collection"]: item["document_count"] for item in collections}
+        self.assertEqual(collection_counts["notes"], 1)
+        self.assertEqual([item["title"] for item in listed], ["late.md"])
+        self.assertEqual(found["results"][0]["source_ref"], "late.md")
+
     def test_knowledge_http_endpoints_import_sync_list_and_delete_documents(self):
         from backend import main as main_module
         from backend.main import app
