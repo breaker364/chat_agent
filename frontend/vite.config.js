@@ -24,6 +24,7 @@ export default defineConfig({
       "/skills": backendTarget,
       "/feishu": backendTarget,
       "/uploads": backendTarget,
+      "/knowledge": backendTarget,
     },
   },
 });

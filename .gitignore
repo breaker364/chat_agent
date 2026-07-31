@@ -35,6 +35,11 @@ frontend/dist/
 tmp_*
 skills/pisces-ebom-matcher
 tmp/
+knowledge_base/documents/
+knowledge_base/index/
+knowledge_base/manifests/
+knowledge_base/models/
+knowledge_base/reports/
 snake-game/
 tools/
 skills/GordenPPTSkill-main

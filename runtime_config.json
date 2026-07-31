@@ -22,6 +22,22 @@
   "feishu": {
     "session_cookie": ""
   },
+  "rag": {
+    "enabled": true,
+    "knowledge_store_path": "knowledge_base",
+    "model_cache_path": "knowledge_base/models",
+    "vector_backend": "qdrant",
+    "embedding_provider": "huggingface_local",
+    "embedding_model": "bge-m3",
+    "embedding_dimension": 1024,
+    "sparse_backend": "qdrant_sparse_or_bm25",
+    "hybrid_fusion": "rrf",
+    "reranker_provider": "huggingface_local",
+    "reranker_model": "bge-reranker-v2-m3",
+    "reranker_enabled_by_default": false,
+    "reranker_candidate_top_k": 50,
+    "final_top_k": 8
+  },
   "checkers_game": {
     "backend_host": "0.0.0.0",
     "backend_port": 5000,

@@ -42,7 +42,6 @@ import {
   applyRunAttribution,
   finishSessionRun,
   getAppendRequestPayload,
-  getSubmitButtonLabel,
   getSubmitEndpoint,
   getSubmitMode,
   getSessionRun,
@@ -1090,6 +1089,367 @@ function ChatMessageContent({ content }) {
   );
 }
 
+function parseJsonLike(value) {
+  if (value && typeof value === "object") return value;
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function extractKnowledgeCitations(tools = []) {
+  const citations = [];
+  for (const item of tools || []) {
+    if ((item?.name || "").toLowerCase() !== "knowledge_search") continue;
+    const payload = parseJsonLike(item.content);
+    const results = Array.isArray(payload?.results) ? payload.results : [];
+    for (const result of results) {
+      citations.push({
+        id: result.citation_id || result.chunk_id || result.doc_id || "knowledge-source",
+        title: result.title || result.source_ref || result.source_uri || "Knowledge source",
+        collection: result.collection || "",
+        snippet: result.snippet || "",
+        heading: Array.isArray(result.heading_path) ? result.heading_path.join(" / ") : "",
+      });
+    }
+  }
+  return citations;
+}
+
+function KnowledgeCitations({ tools }) {
+  const citations = extractKnowledgeCitations(tools);
+  if (!citations.length) return null;
+  return (
+    <div className="knowledge-citations">
+      <div className="knowledge-citations-title">Knowledge citations</div>
+      {citations.map((citation, index) => (
+        <div className="knowledge-citation" key={`${citation.id}-${index}`}>
+          <div className="knowledge-citation-source">
+            <FileText size={13} />
+            <span>{citation.title}</span>
+            <code>{citation.id}</code>
+          </div>
+          <div className="knowledge-citation-meta">
+            {[citation.collection, citation.heading].filter(Boolean).join(" / ")}
+          </div>
+          {citation.snippet ? <div className="knowledge-citation-snippet">{citation.snippet}</div> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function formatKnowledgeCounts(status) {
+  const counts = status?.counts || {};
+  const parts = ["indexed", "refreshed", "unchanged", "skipped", "failed", "deleted"]
+    .filter((key) => counts[key])
+    .map((key) => `${key} ${counts[key]}`);
+  if (parts.length) return parts.join(" / ");
+  if (status?.message) return status.message;
+  return "ready";
+}
+
+function knowledgeFileName(value) {
+  const raw = String(value || "");
+  return raw.split(/[\\/]/).filter(Boolean).pop() || raw || "document";
+}
+
+function knowledgeStatusClass(status) {
+  return `knowledge-status-${String(status || "unknown").replace(/[^a-z0-9_-]+/gi, "_").toLowerCase()}`;
+}
+
+function knowledgeSyncDetails(status) {
+  return Array.isArray(status?.files)
+    ? status.files.filter((item) => ["failed", "skipped", "unsupported"].includes(String(item.status || "").toLowerCase()))
+    : [];
+}
+
+function KnowledgeSyncDetails({ status }) {
+  const details = knowledgeSyncDetails(status);
+  if (!details.length) return null;
+  return (
+    <div className="knowledge-sync-details" aria-label="Knowledge sync details">
+      {details.slice(0, 4).map((item, index) => (
+        <div className="knowledge-sync-detail" key={`${item.path || item.source_uri || index}`}>
+          <span className={`knowledge-status-pill ${knowledgeStatusClass(item.status)}`}>{item.status || "issue"}</span>
+          <span className="knowledge-sync-path">{knowledgeFileName(item.path || item.source_uri)}</span>
+          {item.reason ? <span className="knowledge-sync-reason">{item.reason}</span> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function KnowledgeCenter({
+  open,
+  documents,
+  sources,
+  detail,
+  detailLoading,
+  loading,
+  onClose,
+  onInspect,
+  onRefresh,
+  onDeleteDocument,
+}) {
+  const [query, setQuery] = useState("");
+  const [collection, setCollection] = useState("all");
+  if (!open) return null;
+
+  const sourceRows = sources?.length
+    ? sources
+    : (documents || []).map((doc) => ({
+        ...doc,
+        title: doc.title || knowledgeFileName(doc.source_uri),
+        status: doc.status || "indexed",
+      }));
+  const collections = Array.from(
+    new Set(sourceRows.map((item) => item.collection).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleRows = sourceRows.filter((item) => {
+    const matchesCollection = collection === "all" || item.collection === collection;
+    const haystack = [item.title, item.source_uri, item.status, item.reason, item.collection]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return matchesCollection && (!normalizedQuery || haystack.includes(normalizedQuery));
+  });
+  const selectedDocument = detail?.document || null;
+
+  return (
+    <div className="knowledge-center-overlay" role="dialog" aria-modal="true" aria-label="Knowledge Center">
+      <section className="knowledge-center">
+        <header className="knowledge-center-header">
+          <div>
+            <div className="knowledge-center-title">Knowledge Center</div>
+            <div className="knowledge-center-subtitle">{sourceRows.length} source files / {documents.length} indexed documents</div>
+          </div>
+          <div className="knowledge-center-actions">
+            <button type="button" className="knowledge-action-btn" onClick={onRefresh} disabled={loading}>
+              {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+              Refresh
+            </button>
+            <button type="button" className="knowledge-center-close" onClick={onClose} aria-label="Close knowledge center">
+              <X size={17} />
+            </button>
+          </div>
+        </header>
+
+        <div className="knowledge-center-toolbar">
+          <div className="knowledge-search">
+            <Search size={15} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search knowledge files"
+              aria-label="Search knowledge files"
+            />
+          </div>
+        </div>
+
+        <div className="knowledge-center-body">
+          <aside className="knowledge-center-sidebar" aria-label="Knowledge collections">
+            <button
+              type="button"
+              className={`knowledge-collection-btn ${collection === "all" ? "active" : ""}`}
+              onClick={() => setCollection("all")}
+            >
+              All
+            </button>
+            {collections.map((item) => (
+              <button
+                type="button"
+                className={`knowledge-collection-btn ${collection === item ? "active" : ""}`}
+                onClick={() => setCollection(item)}
+                key={item}
+              >
+                {item}
+              </button>
+            ))}
+          </aside>
+
+          <section className="knowledge-source-list" aria-label="Knowledge source files">
+            <div className="knowledge-source-header">
+              <span>File</span>
+              <span>Status</span>
+              <span>Chunks</span>
+            </div>
+            {visibleRows.length ? (
+              visibleRows.map((item) => {
+                const title = item.title || knowledgeFileName(item.source_uri);
+                return (
+                  <div className="knowledge-source-row" key={`${item.source_uri || item.doc_id}-${title}`}>
+                    <button
+                      type="button"
+                      className="knowledge-source-title"
+                      onClick={() => onInspect(item)}
+                      aria-label={`Inspect ${title}`}
+                      disabled={!item.doc_id}
+                    >
+                      <FileText size={15} />
+                      <span>{title}</span>
+                    </button>
+                    <span className={`knowledge-status-pill ${knowledgeStatusClass(item.status)}`}>{item.status || "unknown"}</span>
+                    <span className="knowledge-source-chunks">{item.chunk_count || 0}</span>
+                    <div className="knowledge-source-meta">
+                      {[item.collection ? `collection ${item.collection}` : "", item.reason].filter(Boolean).join(" / ")}
+                    </div>
+                    {item.doc_id || item.source_uri ? (
+                      <button
+                        type="button"
+                        className="knowledge-source-delete"
+                        onClick={() => onDeleteDocument(item)}
+                        aria-label={`Delete ${title}`}
+                        disabled={loading}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })
+            ) : (
+              <div className="knowledge-center-empty">No matching knowledge files.</div>
+            )}
+          </section>
+
+          <aside className="knowledge-detail-panel" aria-label="Knowledge document detail">
+            {detailLoading ? (
+              <div className="knowledge-center-empty"><Loader2 className="spin" size={16} /> Loading document...</div>
+            ) : selectedDocument ? (
+              <>
+                <div className="knowledge-detail-title">{selectedDocument.title || selectedDocument.doc_id}</div>
+                <div className="knowledge-detail-meta">
+                  {[selectedDocument.collection, selectedDocument.source_type, `${selectedDocument.chunk_count || 0} chunks`]
+                    .filter(Boolean)
+                    .join(" / ")}
+                </div>
+                <div className="knowledge-detail-path">{selectedDocument.source_uri}</div>
+                <div className="knowledge-chunk-list">
+                  {(detail?.chunks || []).map((chunk) => (
+                    <div className="knowledge-chunk-card" key={chunk.chunk_id}>
+                      <div className="knowledge-chunk-header">
+                        <code>{chunk.citation_id || chunk.chunk_id}</code>
+                        <span>{chunk.heading_path?.length ? chunk.heading_path.join(" / ") : `chunk ${chunk.ordinal ?? ""}`}</span>
+                      </div>
+                      <pre>{chunk.text}</pre>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="knowledge-center-empty">Select an indexed document.</div>
+            )}
+          </aside>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function KnowledgePanel({
+  documents,
+  enabled,
+  loading,
+  status,
+  onToggleEnabled,
+  onImportFiles,
+  onSync,
+  onDeleteDocument,
+  onOpenCenter,
+}) {
+  const importInputRef = useRef(null);
+  const handleDrop = (event) => {
+    if (!event.dataTransfer.files.length) return;
+    event.preventDefault();
+    onImportFiles(event.dataTransfer.files);
+  };
+  const handleDragOver = (event) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  return (
+    <section
+      className="knowledge-panel"
+      aria-label="Knowledge base"
+      onDrop={handleDrop}
+      onDragOver={handleDragOver}
+    >
+      <div className="knowledge-panel-header">
+        <div>
+          <div className="knowledge-panel-title">Knowledge Base</div>
+          <div className="knowledge-panel-subtitle">{documents.length} documents / {formatKnowledgeCounts(status)}</div>
+        </div>
+        <label className="knowledge-mode-toggle">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) => onToggleEnabled(event.target.checked)}
+            disabled={loading}
+          />
+          <span>Use knowledge base</span>
+        </label>
+      </div>
+      <div className="knowledge-panel-actions">
+        <button
+          type="button"
+          className="knowledge-action-btn"
+          onClick={() => importInputRef.current?.click()}
+          disabled={loading}
+        >
+          <Paperclip size={14} />
+          Import
+        </button>
+        <input
+          ref={importInputRef}
+          className="file-input"
+          type="file"
+          multiple
+          aria-label="Import knowledge files"
+          onChange={(event) => {
+            onImportFiles(event.target.files);
+            event.target.value = "";
+          }}
+          disabled={loading}
+        />
+        <button
+          type="button"
+          className="knowledge-action-btn"
+          onClick={onOpenCenter}
+          disabled={loading}
+          aria-label="Open knowledge center"
+        >
+          <FileText size={14} />
+          Browse
+        </button>
+        <button
+          type="button"
+          className="knowledge-action-btn"
+          onClick={onSync}
+          disabled={loading}
+          aria-label="Sync knowledge"
+        >
+          {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+          Sync
+        </button>
+      </div>
+      <div className="knowledge-documents">
+        {documents.length ? (
+          <div className="knowledge-empty">{documents.length} indexed documents. Open the center to inspect files and chunks.</div>
+        ) : (
+          <div className="knowledge-empty">Drop files here or import documents.</div>
+        )}
+      </div>
+      <KnowledgeSyncDetails status={status} />
+    </section>
+  );
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -1099,6 +1459,14 @@ export default function App() {
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isDraggingImages, setIsDraggingImages] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
+  const [knowledgeMode, setKnowledgeMode] = useState(false);
+  const [knowledgeDocuments, setKnowledgeDocuments] = useState([]);
+  const [knowledgeSources, setKnowledgeSources] = useState([]);
+  const [knowledgeStatus, setKnowledgeStatus] = useState({ message: "ready" });
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeCenterOpen, setKnowledgeCenterOpen] = useState(false);
+  const [knowledgeDetail, setKnowledgeDetail] = useState(null);
+  const [knowledgeDetailLoading, setKnowledgeDetailLoading] = useState(false);
   const [sessionRuns, setSessionRuns] = useState({});
   const [subagentTasks, setSubagentTasks] = useState([]);
   const [subagentNotifications, setSubagentNotifications] = useState([]);
@@ -1133,7 +1501,6 @@ export default function App() {
   const loading = isSessionRunning(sessionRuns, activeSessionId);
   const submitMode = getSubmitMode(sessionRuns, activeSessionId);
   const appendMode = submitMode === "append";
-  const submitButtonLabel = getSubmitButtonLabel(sessionRuns, activeSessionId);
   const streamingText = activeRun.streamingText || "";
   const toolEvents = activeRun.toolEvents || [];
   const activityItems = activeRun.activityItems || [];
@@ -1212,6 +1579,132 @@ export default function App() {
       throw new Error(payload.error || `Upload failed with HTTP ${response.status}`);
     }
     return payload.files || [];
+  }, []);
+
+  const refreshKnowledgeDocuments = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/documents`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const payload = await resp.json();
+      setKnowledgeDocuments(Array.isArray(payload.documents) ? payload.documents : []);
+      return payload.documents || [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const refreshKnowledgeSources = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/sources`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const payload = await resp.json();
+      setKnowledgeSources(Array.isArray(payload.sources) ? payload.sources : []);
+      return payload.sources || [];
+    } catch {
+      setKnowledgeSources([]);
+      return [];
+    }
+  }, []);
+
+  const refreshKnowledgeCenter = useCallback(async () => {
+    const [documents, sources] = await Promise.all([
+      refreshKnowledgeDocuments(),
+      refreshKnowledgeSources(),
+    ]);
+    return { documents, sources };
+  }, [refreshKnowledgeDocuments, refreshKnowledgeSources]);
+
+  const importKnowledgeFiles = useCallback(async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    const formData = new FormData();
+    formData.append("collection", "default");
+    files.forEach((file) => formData.append("files", file, file.name));
+    setKnowledgeLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/import`, {
+        method: "POST",
+        body: formData,
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(payload.error || `Import failed with HTTP ${resp.status}`);
+      setKnowledgeStatus(payload);
+      await refreshKnowledgeCenter();
+    } catch (err) {
+      setKnowledgeStatus({ message: err.message || "import failed", counts: { failed: files.length } });
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  }, [refreshKnowledgeCenter]);
+
+  const syncKnowledge = useCallback(async () => {
+    setKnowledgeLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ collection: null }),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(payload.error || `Sync failed with HTTP ${resp.status}`);
+      setKnowledgeStatus(payload);
+      await refreshKnowledgeCenter();
+    } catch (err) {
+      setKnowledgeStatus({ message: err.message || "sync failed", counts: { failed: 1 } });
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  }, [refreshKnowledgeCenter]);
+
+  const deleteKnowledgeDocument = useCallback(async (doc) => {
+    if (!doc?.doc_id && !doc?.source_uri) return;
+    setKnowledgeLoading(true);
+    try {
+      const deleteUrl = doc.source_uri
+        ? `${API_BASE}/knowledge/sources?source_uri=${encodeURIComponent(doc.source_uri)}`
+        : `${API_BASE}/knowledge/documents/${encodeURIComponent(doc.doc_id)}?remove_source=true`;
+      const resp = await fetch(deleteUrl, {
+        method: "DELETE",
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(payload.error || `Delete failed with HTTP ${resp.status}`);
+      setKnowledgeStatus({ ...payload, message: "deleted" });
+      setKnowledgeDetail((current) => (
+        current?.document?.doc_id === doc.doc_id || current?.document?.source_uri === doc.source_uri ? null : current
+      ));
+      await refreshKnowledgeCenter();
+    } catch (err) {
+      setKnowledgeStatus({ message: err.message || "delete failed", counts: { failed: 1 } });
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  }, [refreshKnowledgeCenter]);
+
+  const inspectKnowledgeDocument = useCallback(async (doc) => {
+    if (!doc?.doc_id) return;
+    setKnowledgeCenterOpen(true);
+    setKnowledgeDetailLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/documents/${encodeURIComponent(doc.doc_id)}`);
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(payload.error || `Document load failed with HTTP ${resp.status}`);
+      setKnowledgeDetail(payload);
+    } catch (err) {
+      setKnowledgeDetail({
+        document: {
+          doc_id: doc.doc_id,
+          title: doc.title || knowledgeFileName(doc.source_uri),
+          source_uri: doc.source_uri || "",
+          collection: doc.collection || "",
+          source_type: doc.source_type || "",
+          chunk_count: 0,
+          latest_error: err.message || "document load failed",
+        },
+        chunks: [],
+      });
+    } finally {
+      setKnowledgeDetailLoading(false);
+    }
   }, []);
 
   const handleDragEnter = useCallback((event) => {
@@ -1341,6 +1834,10 @@ export default function App() {
   useEffect(() => {
     writeFeishuCollapsed(feishuPanelCollapsed);
   }, [feishuPanelCollapsed]);
+
+  useEffect(() => {
+    refreshKnowledgeCenter().catch(() => {});
+  }, [refreshKnowledgeCenter]);
 
   useEffect(() => {
     if (!activeSessionId) return undefined;
@@ -2003,6 +2500,7 @@ export default function App() {
           message: requestText,
           session_id: ensuredSessionId,
           history: currentHistory,
+          knowledge_mode: knowledgeMode,
         }),
         signal: controller.signal,
       });
@@ -2082,6 +2580,7 @@ export default function App() {
     input,
     loading,
     pendingFiles,
+    knowledgeMode,
     sessionRuns,
     refreshSessions,
     loadSession,
@@ -2162,6 +2661,20 @@ export default function App() {
         </header>
 
         <div className="top-panels">
+          <KnowledgePanel
+            documents={knowledgeDocuments}
+            enabled={knowledgeMode}
+            loading={knowledgeLoading}
+            status={knowledgeStatus}
+            onToggleEnabled={setKnowledgeMode}
+            onImportFiles={importKnowledgeFiles}
+            onSync={syncKnowledge}
+            onDeleteDocument={deleteKnowledgeDocument}
+            onOpenCenter={() => {
+              setKnowledgeCenterOpen(true);
+              refreshKnowledgeCenter().catch(() => {});
+            }}
+          />
           <FeishuLoginPanel
             status={feishuStatus}
             loginState={feishuLoginState}
@@ -2193,6 +2706,7 @@ export default function App() {
                   <div className="message-body">
                     <ChatMessageContent content={msg.content} />
                     <MessageTokenUsage role={msg.role} usage={msg.usage} />
+                    {msg.role === "assistant" ? <KnowledgeCitations tools={msg.tools} /> : null}
                   </div>
                 </div>
                 {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
@@ -2308,7 +2822,8 @@ export default function App() {
               ) : null}
               <button
                 className="send-btn"
-                title={submitButtonLabel}
+                title={appendMode ? "Append command" : "Send message"}
+                aria-label={appendMode ? "Append command" : "Send message"}
                 onClick={handleSend}
                 disabled={appendMode ? !input.trim() : (!input.trim() && !pendingFiles.length)}
               >
@@ -2362,6 +2877,19 @@ export default function App() {
           </div>
         </aside>
       ) : null}
+
+      <KnowledgeCenter
+        open={knowledgeCenterOpen}
+        documents={knowledgeDocuments}
+        sources={knowledgeSources}
+        detail={knowledgeDetail}
+        detailLoading={knowledgeDetailLoading}
+        loading={knowledgeLoading}
+        onClose={() => setKnowledgeCenterOpen(false)}
+        onInspect={inspectKnowledgeDocument}
+        onRefresh={refreshKnowledgeCenter}
+        onDeleteDocument={deleteKnowledgeDocument}
+      />
 
       {/* Skill Popup */}
       {showSkillPopup && (

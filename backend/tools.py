@@ -2764,12 +2764,19 @@ _AGENT_TOOLS: list[Any] = [
 
 async def get_all_tools(
     workspace_dir: str | Path | None = None,
+    rag_config_overrides: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Return the complete tool list: local search, file ops, and 12306 tools."""
     if workspace_dir is not None:
         set_allowed_root(workspace_dir)
     workspace = Path(workspace_dir or os.getcwd()).resolve()
     tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
+    try:
+        from .rag.tools import build_knowledge_tools
+
+        tools.extend(build_knowledge_tools(workspace_root=workspace, config_overrides=rag_config_overrides))
+    except Exception as exc:
+        logger.warning("RAG tools unavailable: %s", exc)
     tools.extend(build_skill_tools(workspace))
     try:
         ticket_tools = await load_12306_tools(cwd=str(workspace_dir or os.getcwd()))

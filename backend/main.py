@@ -188,6 +188,108 @@ def _safe_upload_component(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def _project_knowledge_base():
+    from .rag.service import PersonalKnowledgeBase
+
+    workspace = _workspace()
+    return PersonalKnowledgeBase(workspace_root=workspace, store_path=workspace / "knowledge_base")
+
+
+def _knowledge_mode_message(message: str, enabled: bool) -> str:
+    if not enabled:
+        return message
+    return (
+        f"{message}\n\n"
+        "Use the personal knowledge base for this answer. Call knowledge_search before answering, "
+        "ground factual claims in retrieved chunks, and include personal knowledge citations. "
+        "If the knowledge base does not contain enough evidence, say so."
+    )
+
+
+@app.get("/knowledge/documents")
+async def list_knowledge_documents(collection: str | None = None) -> JSONResponse:
+    kb = _project_knowledge_base()
+    return JSONResponse({"documents": kb.list_documents(collection)})
+
+
+@app.get("/knowledge/sources")
+async def list_knowledge_sources(collection: str | None = None) -> JSONResponse:
+    kb = _project_knowledge_base()
+    return JSONResponse({"sources": kb.list_source_files(collection)})
+
+
+@app.delete("/knowledge/sources")
+async def delete_knowledge_source(source_uri: str = "") -> JSONResponse:
+    if not source_uri.strip():
+        return JSONResponse({"error": "source_uri is required"}, status_code=400)
+    kb = _project_knowledge_base()
+    result = kb.delete_source_file(source_uri)
+    if result.get("error"):
+        status_code = 404 if result["error"] == "source file not found" else 400
+        return JSONResponse(result, status_code=status_code)
+    return JSONResponse(result)
+
+
+@app.get("/knowledge/documents/{doc_id}")
+async def get_knowledge_document(doc_id: str) -> JSONResponse:
+    kb = _project_knowledge_base()
+    detail = kb.get_document_detail(doc_id)
+    if detail is None:
+        return JSONResponse({"error": "Knowledge document not found."}, status_code=404)
+    return JSONResponse(detail)
+
+
+@app.post("/knowledge/import")
+async def import_knowledge_documents(
+    collection: str = Form("default"),
+    files: list[UploadFile] = File(...),
+) -> JSONResponse:
+    if not files:
+        return JSONResponse({"error": "At least one file is required."}, status_code=400)
+    kb = _project_knowledge_base()
+    imported: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for upload in files:
+        try:
+            content = await upload.read()
+            result = kb.import_file_bytes(collection, upload.filename or "document", content)
+            imported.extend(result.get("imported", []))
+            skipped.extend(result.get("skipped", []))
+        finally:
+            await upload.close()
+    return JSONResponse(
+        {
+            "collection": _safe_upload_component(collection, "default"),
+            "imported": imported,
+            "skipped": skipped,
+            "counts": {"imported": len(imported), "skipped": len(skipped)},
+        }
+    )
+
+
+@app.post("/knowledge/sync")
+async def sync_knowledge_documents(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    kb = _project_knowledge_base()
+    return JSONResponse(
+        kb.sync(
+            collection=body.get("collection"),
+            dry_run=bool(body.get("dry_run", False)),
+        )
+    )
+
+
+@app.delete("/knowledge/documents/{doc_id}")
+async def delete_knowledge_document(doc_id: str, remove_source: bool = False) -> JSONResponse:
+    kb = _project_knowledge_base()
+    return JSONResponse(kb.delete_document(doc_id=doc_id, remove_source=remove_source))
+
+
 @app.post("/uploads")
 async def upload_files(
     session_id: str = Form("default"),
@@ -1025,6 +1127,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
     message = body.get("message", "")
     session_id = str(body.get("session_id", "default")).strip() or "default"
     history = body.get("history", None)
+    agent_message = _knowledge_mode_message(message, bool(body.get("knowledge_mode", False)))
 
     if not message.strip():
         return EventSourceResponse([{"event": "error", "data": "Message cannot be empty"}])
@@ -1081,7 +1184,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
         event_hub = get_session_event_hub()
         event_queue = event_hub.subscribe(session["session_id"])
         try:
-            agent_iter = stream_agent_events(agent, message, session["session_id"], merged_history).__aiter__()
+            agent_iter = stream_agent_events(agent, agent_message, session["session_id"], merged_history).__aiter__()
             pending_agent = asyncio.create_task(agent_iter.__anext__())
             pending_subagent = asyncio.create_task(event_queue.get())
 
@@ -1294,6 +1397,7 @@ async def chat_sync(request: Request) -> JSONResponse:
     message = body.get("message", "")
     session_id = str(body.get("session_id", "default")).strip() or "default"
     history = body.get("history", None)
+    agent_message = _knowledge_mode_message(message, bool(body.get("knowledge_mode", False)))
 
     if not message.strip():
         return JSONResponse({"error": "Message cannot be empty"}, status_code=400)
@@ -1335,7 +1439,7 @@ async def chat_sync(request: Request) -> JSONResponse:
         terminal_failure_reason = ""
         context_tokens = bind_runtime_context(session["session_id"], run_id)
         try:
-            async for event in stream_agent_events(agent, message, session["session_id"], merged_history):
+            async for event in stream_agent_events(agent, agent_message, session["session_id"], merged_history):
                 event_type = event["event"]
                 try:
                     parsed = json.loads(event["data"])

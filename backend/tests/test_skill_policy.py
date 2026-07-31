@@ -29,3 +29,23 @@ def test_backend_policy_does_not_hardcode_specific_skill_routing():
             offenders.append(str(path.relative_to(BACKEND_ROOT)))
 
     assert offenders == []
+
+
+def test_rag_code_does_not_encode_entity_specific_routing_maps():
+    forbidden_patterns = [
+        "official_domain",
+        "entity_to_domain",
+        "entity_to_keyword",
+        "brand_name",
+        "school_name",
+        "company_name",
+    ]
+    offenders = []
+    rag_root = BACKEND_ROOT / "rag"
+    for path in rag_root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        for pattern in forbidden_patterns:
+            if pattern in text:
+                offenders.append(f"{path.relative_to(BACKEND_ROOT)}:{pattern}")
+
+    assert offenders == []
