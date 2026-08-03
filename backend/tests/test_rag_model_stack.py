@@ -49,6 +49,7 @@ class RagModelStackTests(unittest.TestCase):
         config = load_rag_config(self._selected_stack())
 
         self.assertEqual(config.vector_backend, "qdrant")
+        self.assertEqual(config.retrieval_profile, "production")
         self.assertEqual(config.embedding_provider, "huggingface_local")
         self.assertEqual(config.embedding_model, "BAAI/bge-m3")
         self.assertEqual(config.embedding_dimension, 1024)
@@ -159,9 +160,11 @@ class RagModelStackTests(unittest.TestCase):
         rag = runtime.get("rag", {})
 
         self.assertEqual(rag.get("vector_backend"), "qdrant")
+        self.assertEqual(rag.get("retrieval_profile"), "production")
         self.assertEqual(rag.get("embedding_provider"), "huggingface_local")
         self.assertEqual(rag.get("embedding_model"), "bge-m3")
         self.assertEqual(rag.get("reranker_model"), "bge-reranker-v2-m3")
+        self.assertTrue(rag.get("reranker_enabled_by_default"))
         self.assertEqual(rag.get("reranker_candidate_top_k"), 50)
         self.assertEqual(rag.get("final_top_k"), 8)
 

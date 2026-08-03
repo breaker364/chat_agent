@@ -155,7 +155,11 @@ class RagProjectSyncTests(unittest.TestCase):
             tool.name: tool
             for tool in build_knowledge_tools(
                 workspace_root=self.workspace,
-                config_overrides={"enabled": True, "knowledge_store_path": str(self.store_dir)},
+                config_overrides={
+                    "enabled": True,
+                    "retrieval_profile": "deterministic",
+                    "knowledge_store_path": str(self.store_dir),
+                },
             )
         }
 
@@ -174,7 +178,11 @@ class RagProjectSyncTests(unittest.TestCase):
             tool.name: tool
             for tool in build_knowledge_tools(
                 workspace_root=self.workspace,
-                config_overrides={"enabled": True, "knowledge_store_path": str(self.store_dir)},
+                config_overrides={
+                    "enabled": True,
+                    "retrieval_profile": "deterministic",
+                    "knowledge_store_path": str(self.store_dir),
+                },
             )
         }
 

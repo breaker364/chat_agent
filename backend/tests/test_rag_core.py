@@ -32,7 +32,13 @@ class RagCoreTests(unittest.TestCase):
     def test_config_exposes_personal_knowledge_defaults(self):
         _, _, load_rag_config, _ = _load_rag_symbols()
 
-        config = load_rag_config({"enabled": True, "knowledge_store_path": str(self.store_dir)})
+        config = load_rag_config(
+            {
+                "enabled": True,
+                "retrieval_profile": "deterministic",
+                "knowledge_store_path": str(self.store_dir),
+            }
+        )
 
         self.assertTrue(config.enabled)
         self.assertEqual(config.knowledge_store_path, self.store_dir)

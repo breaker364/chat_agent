@@ -8,14 +8,28 @@ import math
 import re
 import shutil
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
 
 from .chunking import StructureFirstSemanticChunker, content_hash, tokenize
-from .config import SemanticChunkingConfig, load_rag_config
+from .config import RagConfig, SemanticChunkingConfig, load_rag_config
 from .models import DocumentManifest, KnowledgeChunk
+from .retrieval import (
+    BackendUnavailableError,
+    EmbeddingProvider,
+    QdrantVectorStore,
+    RagBackendError,
+    RerankerProvider,
+    VectorRecord,
+    VectorSearchHit,
+    build_embedding_provider,
+    build_reranker_provider,
+    build_vector_store,
+)
 
 _SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".html", ".htm", ".pdf", ".docx"}
 _PARSER_VERSION = "local-parser-v1"
@@ -129,20 +143,52 @@ class PersonalKnowledgeBase:
         *,
         workspace_root: str | Path,
         store_path: str | Path,
+        config: RagConfig | None = None,
         chunker_config: SemanticChunkingConfig | None = None,
-        reranker_enabled: bool = False,
+        reranker_enabled: bool | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+        reranker_provider: RerankerProvider | None = None,
+        vector_store: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.store_path = Path(store_path).resolve()
+        if config is None:
+            config = load_rag_config(
+                {
+                    "enabled": True,
+                    "retrieval_profile": "deterministic",
+                    "knowledge_store_path": str(self.store_path),
+                    "embedding_provider": "deterministic",
+                    "vector_backend": "in_memory",
+                    "sparse_backend": "in_memory_bm25",
+                    "reranker": {
+                        "enabled": bool(reranker_enabled),
+                        "provider": "local_overlap",
+                    },
+                }
+            )
+        elif config.knowledge_store_path.resolve() != self.store_path:
+            config = replace(config, knowledge_store_path=self.store_path)
+        if chunker_config is not None:
+            config = replace(config, chunking=chunker_config)
+        if reranker_enabled is not None:
+            config = replace(config, reranker=replace(config.reranker, enabled=bool(reranker_enabled)))
+        self.config = config
+        self.retrieval_profile = str(getattr(config, "retrieval_profile", "production") or "production")
         self.documents_path = self.store_path / "documents"
         self.index_path = self.store_path / "index"
         self.manifests_path = self.store_path / "manifests"
         self.sync_reports_path = self.store_path / "reports"
         for path in (self.store_path, self.documents_path, self.index_path, self.manifests_path, self.sync_reports_path):
             path.mkdir(parents=True, exist_ok=True)
-        self.chunker_config = chunker_config or SemanticChunkingConfig()
+        self.chunker_config = config.chunking
         self.chunker = StructureFirstSemanticChunker(self.chunker_config)
-        self.reranker_enabled = bool(reranker_enabled)
+        self.reranker_enabled = bool(config.reranker.enabled)
+        self.embedding_provider = embedding_provider
+        self.reranker_provider = reranker_provider
+        self.vector_store = vector_store
+        self._backend_error: RagBackendError | None = None
+        self._initialize_retrieval_backends()
         self.manifests: dict[str, DocumentManifest] = {}
         self.chunks_by_doc: dict[str, list[KnowledgeChunk]] = {}
         self._load()
@@ -153,9 +199,69 @@ class PersonalKnowledgeBase:
         return cls(
             workspace_root=workspace_root,
             store_path=config.knowledge_store_path,
-            chunker_config=config.chunking,
-            reranker_enabled=config.reranker.enabled,
+            config=config,
         )
+
+    def _initialize_retrieval_backends(self) -> None:
+        """Prepare configured adapters without hiding initialization failures."""
+        try:
+            if self.embedding_provider is None:
+                self.embedding_provider = build_embedding_provider(self.config)
+            if self.config.vector_backend == "qdrant" and self.vector_store is None:
+                self.vector_store = build_vector_store(self.config)
+            if self.reranker_enabled and self.reranker_provider is None:
+                self.reranker_provider = build_reranker_provider(self.config)
+        except RagBackendError as exc:
+            self._backend_error = exc
+
+    def _error_payload(self, error: BaseException) -> dict[str, Any]:
+        if isinstance(error, RagBackendError):
+            return error.to_dict()
+        return {"code": "rag_backend_error", "message": str(error)}
+
+    def _stack_settings(
+        self,
+        *,
+        latency_ms: float = 0.0,
+        embedding_active: bool = False,
+        vector_active: bool = False,
+        reranker_active: bool = False,
+        candidate_counts: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        embedding_model = str(
+            getattr(self.embedding_provider, "model_id", "") or self.config.embedding_model or ""
+        )
+        reranker_model = str(
+            getattr(self.reranker_provider, "model_id", "") or self.config.reranker.model or ""
+        )
+        return {
+            "retrieval_profile": self.retrieval_profile,
+            "embedding_provider": self.config.embedding_provider,
+            "embedding_model": embedding_model,
+            "embedding_dimension": int(self.config.embedding_dimension),
+            "embedding_active": bool(embedding_active),
+            "vector_backend": self.config.vector_backend,
+            "vector_collection": self.config.qdrant_collection,
+            "vector_backend_active": bool(vector_active),
+            "sparse_backend": self.config.sparse_backend,
+            "fusion_strategy": self.config.hybrid.fusion_strategy,
+            "reranker_provider": self.config.reranker.provider,
+            "reranker_model": reranker_model,
+            "reranker_enabled": self.reranker_enabled,
+            "reranker_active": bool(reranker_active),
+            "candidate_counts": dict(candidate_counts or {}),
+            "latency_ms": round(min(max(float(latency_ms), 0.0), 60000.0), 3),
+        }
+
+    def _backend_error_result(self, *, operation: str, error: BaseException, **payload: Any) -> dict[str, Any]:
+        result = {
+            **payload,
+            "status": "error",
+            "operation": operation,
+            "error": self._error_payload(error),
+            "settings": self._stack_settings(),
+        }
+        return result
 
     def _manifest_path(self) -> Path:
         return self.manifests_path / "manifests.json"
@@ -271,6 +377,69 @@ class PersonalKnowledgeBase:
             return BeautifulSoup(raw, "html.parser").get_text("\n")
         return html.unescape(raw)
 
+    def _retrieval_signature(self) -> str:
+        return self.config.retrieval_signature()
+
+    def _indexed_at(self) -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _document_vectors_current(self, doc_id: str) -> bool:
+        if self.config.vector_backend != "qdrant":
+            return True
+        if self.vector_store is None:
+            raise self._backend_error or BackendUnavailableError("Qdrant vector store is unavailable")
+        expected_ids = {chunk.chunk_id for chunk in self.chunks_by_doc.get(doc_id, [])}
+        if hasattr(self.vector_store, "document_point_ids"):
+            observed_ids = set(self.vector_store.document_point_ids(doc_id))
+            return observed_ids == expected_ids
+        return bool(self.vector_store.document_exists(doc_id))
+
+    def _vector_records(self, chunks: list[KnowledgeChunk], manifest: DocumentManifest) -> list[VectorRecord]:
+        if self.config.vector_backend != "qdrant":
+            return []
+        if self.embedding_provider is None:
+            raise self._backend_error or BackendUnavailableError("BGE-M3 embedding provider is unavailable")
+        vectors = self.embedding_provider.embed([chunk.text for chunk in chunks])
+        if len(vectors) != len(chunks):
+            raise BackendUnavailableError(
+                f"Embedding provider returned {len(vectors)} vectors for {len(chunks)} chunks"
+            )
+        records: list[VectorRecord] = []
+        for chunk, vector in zip(chunks, vectors):
+            metadata = dict(manifest.metadata)
+            metadata.update(chunk.metadata)
+            records.append(
+                VectorRecord(
+                    chunk_id=chunk.chunk_id,
+                    doc_id=chunk.doc_id,
+                    collection=chunk.collection,
+                    vector=list(vector),
+                    payload={
+                        "source_ref": chunk.source_ref,
+                        "source_type": manifest.source_type,
+                        "title": manifest.title,
+                        "ordinal": chunk.ordinal,
+                        "heading_path": list(chunk.heading_path),
+                        "metadata": metadata,
+                    },
+                )
+            )
+        return records
+
+    def _commit_document(
+        self,
+        *,
+        manifest: DocumentManifest,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        if self.config.vector_backend == "qdrant":
+            if self.vector_store is None:
+                raise self._backend_error or BackendUnavailableError("Qdrant vector store is unavailable")
+            records = self._vector_records(chunks, manifest)
+            self.vector_store.refresh(manifest.doc_id, records)
+        self.manifests[manifest.doc_id] = manifest
+        self.chunks_by_doc[manifest.doc_id] = chunks
+
     def index_files(
         self,
         collection: str,
@@ -279,9 +448,12 @@ class PersonalKnowledgeBase:
         refresh: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         indexed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
         normalized_collection = _safe_component(collection)
+        retrieval_signature = self._retrieval_signature()
         for path in paths:
             resolved, reason = self._validate_source(path)
             if reason:
@@ -299,35 +471,87 @@ class PersonalKnowledgeBase:
                 or existing is None
                 or existing.content_hash != digest
                 or existing.chunking_signature != chunk_signature
+                or existing.retrieval_signature != retrieval_signature
             )
-            if not needs_refresh:
-                indexed.append({"doc_id": doc_id, "source_uri": source_uri, "refreshed": False, "chunk_count": existing.chunk_count})
-                continue
-            chunks = self.chunker.chunk_text(
-                text,
-                source_ref=resolved.name,
-                doc_id=doc_id,
-                collection=normalized_collection,
-            )
-            manifest = DocumentManifest(
-                doc_id=doc_id,
-                collection=normalized_collection,
-                source_uri=source_uri,
-                source_type=resolved.suffix.lower().lstrip("."),
-                content_hash=digest,
-                parser_version=_PARSER_VERSION,
-                chunker_version=self.chunker_config.chunker_version,
-                chunking_signature=chunk_signature,
-                title=resolved.name,
-                status="indexed",
-                chunk_count=len(chunks),
-                metadata=dict(metadata or {}),
-            )
-            self.manifests[doc_id] = manifest
-            self.chunks_by_doc[doc_id] = chunks
-            indexed.append({"doc_id": doc_id, "source_uri": source_uri, "refreshed": existing is not None, "chunk_count": len(chunks)})
+            try:
+                if existing is not None and not needs_refresh:
+                    if not self._document_vectors_current(doc_id):
+                        needs_refresh = True
+                if not needs_refresh:
+                    indexed.append(
+                        {
+                            "doc_id": doc_id,
+                            "source_uri": source_uri,
+                            "refreshed": False,
+                            "chunk_count": existing.chunk_count,
+                            "status": "unchanged",
+                        }
+                    )
+                    continue
+                chunks = self.chunker.chunk_text(
+                    text,
+                    source_ref=resolved.name,
+                    doc_id=doc_id,
+                    collection=normalized_collection,
+                )
+                manifest = DocumentManifest(
+                    doc_id=doc_id,
+                    collection=normalized_collection,
+                    source_uri=source_uri,
+                    source_type=resolved.suffix.lower().lstrip("."),
+                    content_hash=digest,
+                    parser_version=_PARSER_VERSION,
+                    chunker_version=self.chunker_config.chunker_version,
+                    chunking_signature=chunk_signature,
+                    title=resolved.name,
+                    status="indexed",
+                    chunk_count=len(chunks),
+                    metadata=dict(metadata or (existing.metadata if existing else {})),
+                    retrieval_signature=retrieval_signature,
+                    indexed_at=self._indexed_at(),
+                )
+                self._commit_document(manifest=manifest, chunks=chunks)
+                indexed.append(
+                    {
+                        "doc_id": doc_id,
+                        "source_uri": source_uri,
+                        "refreshed": existing is not None,
+                        "chunk_count": len(chunks),
+                        "status": "indexed",
+                    }
+                )
+            except RagBackendError as exc:
+                failure = {
+                    "path": source_uri,
+                    "doc_id": doc_id,
+                    "status": "failed",
+                    "error": exc.to_dict(),
+                }
+                failed.append(failure)
+            except Exception as exc:
+                failure = {
+                    "path": source_uri,
+                    "doc_id": doc_id,
+                    "status": "failed",
+                    "error": self._error_payload(exc),
+                }
+                failed.append(failure)
         self._save()
-        return {"collection": normalized_collection, "indexed": indexed, "skipped": skipped}
+        result = {
+            "collection": normalized_collection,
+            "indexed": indexed,
+            "skipped": skipped,
+            "failed": failed,
+            "settings": self._stack_settings(
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                embedding_active=bool(indexed and self.config.vector_backend == "qdrant"),
+                vector_active=bool(indexed and self.vector_store is not None),
+                candidate_counts={"indexed": len(indexed), "skipped": len(skipped), "failed": len(failed)},
+            ),
+        }
+        if failed:
+            result["error"] = failed[0]["error"]
+        return result
 
     def import_files(
         self,
@@ -406,6 +630,7 @@ class PersonalKnowledgeBase:
         }
 
     def sync(self, collection: str | None = None, *, dry_run: bool = False) -> dict[str, Any]:
+        started = time.perf_counter()
         normalized_collection = _safe_component(collection) if collection else None
         counts = {
             "indexed": 0,
@@ -420,6 +645,7 @@ class PersonalKnowledgeBase:
         scan_root = self.documents_path / normalized_collection if normalized_collection else self.documents_path
         candidates = sorted(scan_root.rglob("*")) if scan_root.exists() else []
         chunk_signature = self.chunker_config.signature()
+        retrieval_signature = self._retrieval_signature()
 
         for path in candidates:
             if not path.is_file():
@@ -442,7 +668,10 @@ class PersonalKnowledgeBase:
                     existing is None
                     or existing.content_hash != digest
                     or existing.chunking_signature != chunk_signature
+                    or existing.retrieval_signature != retrieval_signature
                 )
+                if existing is not None and not needs_index:
+                    needs_index = not self._document_vectors_current(doc_id)
                 if not needs_index:
                     counts["unchanged"] += 1
                     files.append({"path": source_uri, "collection": inferred_collection, "doc_id": doc_id, "status": "unchanged"})
@@ -461,12 +690,32 @@ class PersonalKnowledgeBase:
                         counts["indexed"] += 1
                         status = "indexed"
                     files.append({"path": source_uri, "collection": inferred_collection, "doc_id": item["doc_id"], "status": status})
+                elif result.get("failed"):
+                    failure = result["failed"][0]
+                    counts["failed"] += 1
+                    files.append(
+                        {
+                            "path": source_uri,
+                            "collection": inferred_collection,
+                            "doc_id": doc_id,
+                            "status": "failed",
+                            "error": failure.get("error", {}),
+                        }
+                    )
                 for skipped in result.get("skipped", []):
                     counts["skipped"] += 1
                     files.append({**skipped, "collection": inferred_collection, "status": "skipped"})
             except Exception as exc:
                 counts["failed"] += 1
-                files.append({"path": source_uri, "collection": inferred_collection, "doc_id": doc_id, "status": "failed", "reason": str(exc)})
+                files.append(
+                    {
+                        "path": source_uri,
+                        "collection": inferred_collection,
+                        "doc_id": doc_id,
+                        "status": "failed",
+                        "error": self._error_payload(exc),
+                    }
+                )
 
         deleted: list[str] = []
         for doc_id, manifest in list(self.manifests.items()):
@@ -481,7 +730,16 @@ class PersonalKnowledgeBase:
 
         if not dry_run:
             for doc_id in deleted:
-                self.delete_document(doc_id=doc_id)
+                delete_result = self.delete_document(doc_id=doc_id)
+                if delete_result.get("error"):
+                    counts["failed"] += 1
+                    files.append(
+                        {
+                            "doc_id": doc_id,
+                            "status": "failed",
+                            "error": delete_result.get("error"),
+                        }
+                    )
         counts["deleted"] = len(deleted)
         for doc_id in deleted:
             files.append({"doc_id": doc_id, "status": "deleted"})
@@ -492,11 +750,20 @@ class PersonalKnowledgeBase:
             "counts": counts,
             "files": files,
             "store_path": str(self.store_path),
+            "settings": self._stack_settings(
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                embedding_active=bool(counts["indexed"] or counts["refreshed"]),
+                vector_active=bool(self.vector_store is not None and (counts["indexed"] or counts["refreshed"])),
+                candidate_counts=dict(counts),
+            ),
         }
         if not dry_run:
             report_path = self.sync_reports_path / f"sync-{int(time.time() * 1000)}.json"
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             report["report_path"] = str(report_path)
+        failures = [item.get("error") for item in files if item.get("status") == "failed" and item.get("error")]
+        if failures:
+            report["error"] = failures[0]
         return report
 
     def list_collections(self) -> list[dict[str, Any]]:
@@ -545,7 +812,10 @@ class PersonalKnowledgeBase:
                 source_type = manifest.source_type
                 latest_error = manifest.latest_error
                 try:
-                    status = "indexed" if content_hash(self._read_supported_file(path)) == manifest.content_hash else "pending_sync"
+                    current_content = content_hash(self._read_supported_file(path)) == manifest.content_hash
+                    current_signature = manifest.retrieval_signature == self._retrieval_signature()
+                    current_vectors = self._document_vectors_current(manifest.doc_id)
+                    status = "indexed" if current_content and current_signature and current_vectors else "pending_sync"
                 except Exception as exc:
                     status = "failed"
                     reason = str(exc)
@@ -575,6 +845,13 @@ class PersonalKnowledgeBase:
     def list_chunks(self, doc_id: str) -> list[dict[str, Any]]:
         return [chunk.to_dict() for chunk in self.chunks_by_doc.get(doc_id, [])]
 
+    def _delete_document_vectors(self, doc_id: str) -> None:
+        if self.config.vector_backend != "qdrant":
+            return
+        if self.vector_store is None:
+            raise self._backend_error or BackendUnavailableError("Qdrant vector store is unavailable")
+        self.vector_store.delete_document(doc_id)
+
     def delete_source_file(self, source_uri: str) -> dict[str, Any]:
         source_path = Path(source_uri)
         if not source_path.is_absolute():
@@ -589,6 +866,15 @@ class PersonalKnowledgeBase:
         for manifest_id, manifest in list(self.manifests.items()):
             if Path(manifest.source_uri).resolve() != resolved:
                 continue
+            try:
+                self._delete_document_vectors(manifest_id)
+            except RagBackendError as exc:
+                return self._backend_error_result(
+                    operation="delete_source_file",
+                    error=exc,
+                    deleted=[],
+                    removed_sources=[],
+                )
             self.manifests.pop(manifest_id, None)
             self.chunks_by_doc.pop(manifest_id, None)
             deleted.append(manifest_id)
@@ -616,7 +902,17 @@ class PersonalKnowledgeBase:
             to_delete.append(manifest_id)
         removed_sources: list[str] = []
         for manifest_id in to_delete:
-            manifest = self.manifests.pop(manifest_id, None)
+            manifest = self.manifests.get(manifest_id)
+            try:
+                self._delete_document_vectors(manifest_id)
+            except RagBackendError as exc:
+                return self._backend_error_result(
+                    operation="delete_document",
+                    error=exc,
+                    deleted=[],
+                    removed_sources=[],
+                )
+            self.manifests.pop(manifest_id, None)
             self.chunks_by_doc.pop(manifest_id, None)
             if remove_source and manifest:
                 source_path = Path(manifest.source_uri)
@@ -626,7 +922,50 @@ class PersonalKnowledgeBase:
         self._save()
         return {"deleted": to_delete, "removed_sources": removed_sources}
 
-    def _candidate_chunks(self, collection: str | None) -> list[KnowledgeChunk]:
+    @staticmethod
+    def _filter_value_matches(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, (list, tuple, set)):
+            expected_values = set(expected)
+            if isinstance(actual, (list, tuple, set)):
+                return bool(expected_values.intersection(actual))
+            return actual in expected_values
+        if isinstance(actual, (list, tuple, set)):
+            return expected in actual
+        return actual == expected
+
+    def _chunk_matches_filters(
+        self,
+        chunk: KnowledgeChunk,
+        manifest: DocumentManifest,
+        filters: dict[str, Any] | None,
+    ) -> bool:
+        for raw_key, expected in (filters or {}).items():
+            if expected is None:
+                continue
+            key = str(raw_key)
+            if key.startswith("metadata."):
+                key = key[len("metadata.") :]
+            if key in {"doc_id", "collection", "source_uri", "source_type", "title"}:
+                actual = {
+                    "doc_id": manifest.doc_id,
+                    "collection": manifest.collection,
+                    "source_uri": manifest.source_uri,
+                    "source_type": manifest.source_type,
+                    "title": manifest.title,
+                }[key]
+            elif key in chunk.metadata:
+                actual = chunk.metadata.get(key)
+            else:
+                actual = manifest.metadata.get(key)
+            if not self._filter_value_matches(actual, expected):
+                return False
+        return True
+
+    def _candidate_chunks(
+        self,
+        collection: str | None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[KnowledgeChunk]:
         chunks: list[KnowledgeChunk] = []
         for doc_id, doc_chunks in self.chunks_by_doc.items():
             manifest = self.manifests.get(doc_id)
@@ -634,7 +973,11 @@ class PersonalKnowledgeBase:
                 continue
             if collection and manifest.collection != collection:
                 continue
-            chunks.extend(doc_chunks)
+            chunks.extend(
+                chunk
+                for chunk in doc_chunks
+                if self._chunk_matches_filters(chunk, manifest, filters)
+            )
         return chunks
 
     def _lexical_rank(self, query_tokens: list[str], chunks: list[KnowledgeChunk]) -> list[tuple[KnowledgeChunk, float]]:
@@ -649,12 +992,47 @@ class PersonalKnowledgeBase:
             overlap = sum(1 for token in query_tokens if token in token_set)
             if overlap:
                 scored.append((chunk, overlap / max(1, len(set(query_tokens)))))
-        return sorted(scored, key=lambda item: (-item[1], item[0].chunk_id))
+        depth = max(0, int(self.config.hybrid.lexical_candidate_depth))
+        return sorted(scored, key=lambda item: (-item[1], item[0].chunk_id))[:depth]
 
-    def _dense_rank(self, query: str, chunks: list[KnowledgeChunk]) -> list[tuple[KnowledgeChunk, float]]:
+    def _dense_rank(
+        self,
+        query: str,
+        chunks: list[KnowledgeChunk],
+        *,
+        collection: str | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[tuple[KnowledgeChunk, float]]:
+        if not query.strip() or not chunks:
+            return []
+        if self.config.vector_backend == "qdrant":
+            if self.embedding_provider is None:
+                raise self._backend_error or BackendUnavailableError("BGE-M3 embedding provider is unavailable")
+            if self.vector_store is None:
+                raise self._backend_error or BackendUnavailableError("Qdrant vector store is unavailable")
+            vectors = self.embedding_provider.embed([query])
+            if len(vectors) != 1:
+                raise BackendUnavailableError("Embedding provider did not return one query vector")
+            hits = self.vector_store.search(
+                vectors[0],
+                limit=max(0, int(self.config.hybrid.dense_candidate_depth)),
+                collection=collection,
+                filters=filters,
+            )
+            by_id = {chunk.chunk_id: chunk for chunk in chunks}
+            return [
+                (by_id[hit.chunk_id], float(hit.score))
+                for hit in hits
+                if hit.chunk_id in by_id
+            ]
         query_vector = _vectorize(query)
         scored = [(chunk, _cosine(query_vector, _vectorize(chunk.text))) for chunk in chunks]
-        return [(chunk, score) for chunk, score in sorted(scored, key=lambda item: (-item[1], item[0].chunk_id)) if score > 0]
+        depth = max(0, int(self.config.hybrid.dense_candidate_depth))
+        return [
+            (chunk, score)
+            for chunk, score in sorted(scored, key=lambda item: (-item[1], item[0].chunk_id))[:depth]
+            if score > 0
+        ]
 
     def _rrf(self, ranked_lists: list[list[tuple[KnowledgeChunk, float]]], k: int = 60) -> dict[str, float]:
         scores: dict[str, float] = {}
@@ -698,64 +1076,130 @@ class PersonalKnowledgeBase:
         top_k: int = 8,
         include_scores: bool = True,
     ) -> dict[str, Any]:
-        del filters
-        chunks = self._candidate_chunks(collection)
+        started = time.perf_counter()
+        normalized_collection = _safe_component(collection) if collection else None
+        chunks = self._candidate_chunks(normalized_collection, filters)
         query_tokens = tokenize(query)
-        lexical = self._lexical_rank(query_tokens, chunks)
-        dense = self._dense_rank(query, chunks)
-        rrf_scores = self._rrf([lexical, dense])
-        by_id = {chunk.chunk_id: chunk for chunk in chunks}
-        lexical_scores = {chunk.chunk_id: score for chunk, score in lexical}
-        dense_scores = {chunk.chunk_id: score for chunk, score in dense}
-        fused = [(by_id[chunk_id], score) for chunk_id, score in rrf_scores.items()]
-        if self.reranker_enabled:
+        try:
+            lexical = self._lexical_rank(query_tokens, chunks)
+            dense = self._dense_rank(
+                query,
+                chunks,
+                collection=normalized_collection,
+                filters=filters,
+            )
+            rrf_scores = self._rrf(
+                [lexical, dense],
+                k=max(1, int(self.config.hybrid.rrf_k)),
+            )
+            by_id = {chunk.chunk_id: chunk for chunk in chunks}
+            lexical_scores = {chunk.chunk_id: score for chunk, score in lexical}
+            dense_scores = {chunk.chunk_id: score for chunk, score in dense}
             fused = [
-                (chunk, score + lexical_scores.get(chunk.chunk_id, 0.0) * 0.1)
-                for chunk, score in fused
+                (by_id[chunk_id], score)
+                for chunk_id, score in rrf_scores.items()
+                if chunk_id in by_id
             ]
-        fused.sort(key=lambda item: (-item[1], item[0].chunk_id))
-        fused, adjacent_to = self._expand_with_adjacent_chunks(fused, chunks)
-        results = []
-        for chunk, fused_score in fused[: max(0, int(top_k))]:
-            score_payload = {
-                "fusion_score": round(fused_score, 6),
-                "lexical_score": round(lexical_scores.get(chunk.chunk_id, 0.0), 6),
-                "dense_score": round(dense_scores.get(chunk.chunk_id, 0.0), 6),
-            }
+            fused.sort(key=lambda item: (-item[1], item[0].chunk_id))
+
+            reranker_scores: dict[str, float] = {}
+            reranker_active = False
             if self.reranker_enabled:
-                score_payload["reranker_score"] = round(score_payload["lexical_score"], 6)
-            item = {
-                "chunk_id": chunk.chunk_id,
-                "doc_id": chunk.doc_id,
-                "collection": chunk.collection,
-                "citation_id": chunk.chunk_id,
-                "source_ref": chunk.source_ref,
-                "source_uri": self.manifests.get(chunk.doc_id).source_uri if self.manifests.get(chunk.doc_id) else "",
-                "source_type": self.manifests.get(chunk.doc_id).source_type if self.manifests.get(chunk.doc_id) else "",
-                "title": self.manifests.get(chunk.doc_id).title if self.manifests.get(chunk.doc_id) else chunk.source_ref,
-                "heading_path": chunk.heading_path,
-                "snippet": _safe_snippet(chunk.text, query=query),
-                "excerpt": _safe_chunk_excerpt(chunk.text, query=query),
-                "metadata": {
-                    "chunking_strategy": chunk.chunking_strategy,
-                    "boundary_method": chunk.boundary_method,
-                    "start_offset": chunk.start_offset,
-                    "end_offset": chunk.end_offset,
-                    "adjacent_context": chunk.chunk_id in adjacent_to,
-                    "adjacent_to": adjacent_to.get(chunk.chunk_id, ""),
+                if self.reranker_provider is None:
+                    raise self._backend_error or BackendUnavailableError("Configured reranker is unavailable")
+                rerank_limit = max(0, int(self.config.reranker.candidate_top_k))
+                rerank_candidates = fused[:rerank_limit] if rerank_limit else []
+                scores = self.reranker_provider.score(
+                    query,
+                    [chunk.text for chunk, _ in rerank_candidates],
+                )
+                if len(scores) != len(rerank_candidates):
+                    raise BackendUnavailableError(
+                        f"Reranker returned {len(scores)} scores for {len(rerank_candidates)} candidates"
+                    )
+                reranker_scores = {
+                    chunk.chunk_id: float(score)
+                    for (chunk, _), score in zip(rerank_candidates, scores)
+                }
+                reranker_active = bool(rerank_candidates)
+                fused.sort(
+                    key=lambda item: (
+                        -reranker_scores.get(item[0].chunk_id, float("-inf")),
+                        -item[1],
+                        item[0].chunk_id,
+                    )
+                )
+
+            fused, adjacent_to = self._expand_with_adjacent_chunks(fused, chunks)
+            results = []
+            for chunk, fused_score in fused[: max(0, int(top_k))]:
+                manifest = self.manifests.get(chunk.doc_id)
+                score_payload = {
+                    "fusion_score": round(fused_score, 6),
+                    "lexical_score": round(lexical_scores.get(chunk.chunk_id, 0.0), 6),
+                    "dense_score": round(dense_scores.get(chunk.chunk_id, 0.0), 6),
+                }
+                if chunk.chunk_id in reranker_scores:
+                    score_payload["reranker_score"] = round(reranker_scores[chunk.chunk_id], 6)
+                item = {
+                    "chunk_id": chunk.chunk_id,
+                    "doc_id": chunk.doc_id,
+                    "collection": chunk.collection,
+                    "citation_id": chunk.chunk_id,
+                    "source_ref": chunk.source_ref,
+                    "source_uri": manifest.source_uri if manifest else "",
+                    "source_type": manifest.source_type if manifest else "",
+                    "title": manifest.title if manifest else chunk.source_ref,
+                    "heading_path": chunk.heading_path,
+                    "snippet": _safe_snippet(chunk.text, query=query),
+                    "excerpt": _safe_chunk_excerpt(chunk.text, query=query),
+                    "metadata": {
+                        "chunking_strategy": chunk.chunking_strategy,
+                        "boundary_method": chunk.boundary_method,
+                        "start_offset": chunk.start_offset,
+                        "end_offset": chunk.end_offset,
+                        "adjacent_context": chunk.chunk_id in adjacent_to,
+                        "adjacent_to": adjacent_to.get(chunk.chunk_id, ""),
+                    },
+                }
+                if include_scores:
+                    item["scores"] = score_payload
+                results.append(item)
+            return {
+                "query": query,
+                "collection": normalized_collection,
+                "results": results,
+                "settings": self._stack_settings(
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    embedding_active=bool(self.config.vector_backend == "qdrant" and dense),
+                    vector_active=bool(self.config.vector_backend == "qdrant" and self.vector_store is not None),
+                    reranker_active=reranker_active,
+                    candidate_counts={
+                        "lexical": len(lexical),
+                        "dense": len(dense),
+                        "fused": len(rrf_scores),
+                        "reranked": len(reranker_scores),
+                        "returned": len(results),
+                    },
+                )
+                | {
+                    "top_k": top_k,
+                    "adjacent_chunk_expansion": True,
                 },
             }
-            if include_scores:
-                item["scores"] = score_payload
-            results.append(item)
-        return {
-            "query": query,
-            "collection": collection,
-            "results": results,
-            "settings": {
-                "fusion_strategy": "rrf",
-                "reranker_enabled": self.reranker_enabled,
-                "top_k": top_k,
-                "adjacent_chunk_expansion": True,
-            },
-        }
+        except RagBackendError as exc:
+            return self._backend_error_result(
+                operation="search",
+                error=exc,
+                query=query,
+                collection=normalized_collection,
+                results=[],
+            )
+        except Exception as exc:
+            return self._backend_error_result(
+                operation="search",
+                error=exc,
+                query=query,
+                collection=normalized_collection,
+                results=[],
+            )

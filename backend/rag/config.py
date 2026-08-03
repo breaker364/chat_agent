@@ -78,6 +78,7 @@ class RerankerConfig:
 @dataclass
 class RagConfig:
     enabled: bool = False
+    retrieval_profile: str = "deterministic"
     knowledge_store_path: Path = field(default_factory=lambda: resolve_runtime_path(None, "knowledge_base"))
     evaluation_cache_path: Path = field(default_factory=lambda: resolve_runtime_path(None, "tmp/rag_eval_cache"))
     report_dir: Path = field(default_factory=lambda: resolve_runtime_path(None, "tmp/rag_eval_reports"))
@@ -87,6 +88,11 @@ class RagConfig:
     embedding_model: str = ""
     embedding_dimension: int = 0
     model_cache_path: Path = field(default_factory=lambda: resolve_runtime_path(None, "knowledge_base/models"))
+    qdrant_collection: str = "knowledge_chunks"
+    embedding_batch_size: int = 8
+    reranker_batch_size: int = 8
+    max_sequence_length: int = 8192
+    device: str = "auto"
     chunking: SemanticChunkingConfig = field(default_factory=SemanticChunkingConfig)
     hybrid: HybridRetrievalConfig = field(default_factory=HybridRetrievalConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
@@ -107,6 +113,21 @@ class RagConfig:
     def sync_reports_path(self) -> Path:
         return self.knowledge_store_path / "reports"
 
+    @property
+    def qdrant_path(self) -> Path:
+        return self.knowledge_store_path / "qdrant"
+
+    def retrieval_signature(self) -> str:
+        return (
+            f"profile={self.retrieval_profile};"
+            f"embedding={self.embedding_provider}:{self.embedding_model}:dim={self.embedding_dimension};"
+            f"vector={self.vector_backend}:{self.qdrant_collection};"
+            f"sparse={self.sparse_backend};fusion={self.hybrid.fusion_strategy}:"
+            f"{self.hybrid.lexical_candidate_depth}:{self.hybrid.dense_candidate_depth}:{self.hybrid.rrf_k};"
+            f"reranker={self.reranker.enabled}:{self.reranker.provider}:{self.reranker.model}:"
+            f"{self.reranker.candidate_top_k}"
+        )
+
 
 def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
     data = dict(overrides or {})
@@ -115,6 +136,10 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
     reranker_data = data.get("reranker") if isinstance(data.get("reranker"), dict) else {}
 
     enabled = _as_bool(data.get("enabled", get_runtime_value("rag", "enabled", False)), False)
+    retrieval_profile = str(
+        data.get("retrieval_profile", get_runtime_value("rag", "retrieval_profile", "production"))
+        or "production"
+    ).strip().lower()
     store_raw = data.get("knowledge_store_path", get_runtime_value("rag", "knowledge_store_path", "knowledge_base"))
     eval_raw = data.get("evaluation_cache_path", get_runtime_value("rag", "evaluation_cache_path", "tmp/rag_eval_cache"))
     report_raw = data.get("report_dir", get_runtime_value("rag", "report_dir", "tmp/rag_eval_reports"))
@@ -136,6 +161,23 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
         data.get("embedding_dimension", get_runtime_value("rag", "embedding_dimension", 0)),
         0,
     )
+    qdrant_collection = str(
+        data.get("qdrant_collection", get_runtime_value("rag", "qdrant_collection", "knowledge_chunks"))
+        or "knowledge_chunks"
+    )
+    embedding_batch_size = _as_int(
+        data.get("embedding_batch_size", get_runtime_value("rag", "embedding_batch_size", 8)),
+        8,
+    )
+    reranker_batch_size = _as_int(
+        data.get("reranker_batch_size", get_runtime_value("rag", "reranker_batch_size", 8)),
+        8,
+    )
+    max_sequence_length = _as_int(
+        data.get("max_sequence_length", get_runtime_value("rag", "max_sequence_length", 8192)),
+        8192,
+    )
+    device = str(data.get("device", get_runtime_value("rag", "device", "auto")) or "auto")
 
     chunking = SemanticChunkingConfig(
         target_tokens=_as_int(chunking_data.get("target_tokens", data.get("chunk_target_tokens")), 500),
@@ -148,17 +190,56 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
     )
     hybrid = HybridRetrievalConfig(
         fusion_strategy=str(
-            hybrid_data.get("fusion_strategy", data.get("hybrid_fusion", data.get("fusion_strategy", "rrf")))
+            hybrid_data.get(
+                "fusion_strategy",
+                data.get(
+                    "hybrid_fusion",
+                    data.get("fusion_strategy", get_runtime_value("rag", "hybrid_fusion", "rrf")),
+                ),
+            )
             or "rrf"
         ),
-        lexical_candidate_depth=_as_int(hybrid_data.get("lexical_candidate_depth"), 30),
-        dense_candidate_depth=_as_int(hybrid_data.get("dense_candidate_depth"), 30),
-        rrf_k=_as_int(hybrid_data.get("rrf_k"), 60),
-        top_k=_as_int(hybrid_data.get("top_k", data.get("final_top_k", data.get("top_k"))), 8),
+        lexical_candidate_depth=_as_int(
+            hybrid_data.get(
+                "lexical_candidate_depth",
+                data.get("lexical_candidate_depth", get_runtime_value("rag", "lexical_candidate_depth", 30)),
+            ),
+            30,
+        ),
+        dense_candidate_depth=_as_int(
+            hybrid_data.get(
+                "dense_candidate_depth",
+                data.get("dense_candidate_depth", get_runtime_value("rag", "dense_candidate_depth", 30)),
+            ),
+            30,
+        ),
+        rrf_k=_as_int(
+            hybrid_data.get("rrf_k", data.get("rrf_k", get_runtime_value("rag", "rrf_k", 60))),
+            60,
+        ),
+        top_k=_as_int(
+            hybrid_data.get(
+                "top_k",
+                data.get(
+                    "final_top_k",
+                    data.get("top_k", get_runtime_value("rag", "final_top_k", 8)),
+                ),
+            ),
+            8,
+        ),
     )
     reranker = RerankerConfig(
         enabled=_as_bool(
-            reranker_data.get("enabled", data.get("reranker_enabled_by_default", data.get("reranker_enabled"))),
+            reranker_data.get(
+                "enabled",
+                data.get(
+                    "reranker_enabled_by_default",
+                    data.get(
+                        "reranker_enabled",
+                        get_runtime_value("rag", "reranker_enabled_by_default", False),
+                    ),
+                ),
+            ),
             False,
         ),
         provider=str(
@@ -173,13 +254,39 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
             "",
         ),
         candidate_top_k=_as_int(
-            reranker_data.get("candidate_top_k", data.get("reranker_candidate_top_k")),
+            reranker_data.get(
+                "candidate_top_k",
+                data.get(
+                    "reranker_candidate_top_k",
+                    get_runtime_value("rag", "reranker_candidate_top_k", 30),
+                ),
+            ),
             30,
         ),
     )
+    if retrieval_profile == "deterministic":
+        deterministic_reranker_enabled = (
+            reranker.enabled
+            if "reranker" in data
+            or "reranker_enabled_by_default" in data
+            or "reranker_enabled" in data
+            else False
+        )
+        embedding_provider = "deterministic"
+        embedding_model = ""
+        embedding_dimension = 0
+        vector_backend = "in_memory"
+        sparse_backend = "in_memory_bm25"
+        reranker = RerankerConfig(
+            enabled=deterministic_reranker_enabled,
+            provider="local_overlap",
+            model="",
+            candidate_top_k=reranker.candidate_top_k,
+        )
     knowledge_store_path = resolve_runtime_path(store_raw, "knowledge_base")
     return RagConfig(
         enabled=enabled,
+        retrieval_profile=retrieval_profile,
         knowledge_store_path=knowledge_store_path,
         evaluation_cache_path=resolve_runtime_path(eval_raw, "tmp/rag_eval_cache"),
         report_dir=resolve_runtime_path(report_raw, "tmp/rag_eval_reports"),
@@ -193,6 +300,11 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
             if model_cache_raw
             else knowledge_store_path / "models"
         ),
+        qdrant_collection=qdrant_collection,
+        embedding_batch_size=max(1, embedding_batch_size),
+        reranker_batch_size=max(1, reranker_batch_size),
+        max_sequence_length=max(1, max_sequence_length),
+        device=device,
         chunking=chunking,
         hybrid=hybrid,
         reranker=reranker,

@@ -51,6 +51,8 @@ class DocumentManifest:
     chunk_count: int
     metadata: dict[str, Any] = field(default_factory=dict)
     latest_error: str = ""
+    retrieval_signature: str = ""
+    indexed_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -28,7 +28,11 @@ class RagToolTests(unittest.TestCase):
 
         tools = build_knowledge_tools(
             workspace_root=self.temp_dir,
-            config_overrides={"enabled": False, "knowledge_store_path": str(self.temp_dir / "store")},
+            config_overrides={
+                "enabled": False,
+                "retrieval_profile": "deterministic",
+                "knowledge_store_path": str(self.temp_dir / "store"),
+            },
         )
 
         self.assertEqual(tools, [])
@@ -38,7 +42,11 @@ class RagToolTests(unittest.TestCase):
 
         tools = build_knowledge_tools(
             workspace_root=self.temp_dir,
-            config_overrides={"enabled": True, "knowledge_store_path": str(self.temp_dir / "store")},
+            config_overrides={
+                "enabled": True,
+                "retrieval_profile": "deterministic",
+                "knowledge_store_path": str(self.temp_dir / "store"),
+            },
         )
 
         names = {tool.name for tool in tools}
@@ -65,13 +73,21 @@ class RagToolTests(unittest.TestCase):
             disabled = runtime_tools._run_coro_in_thread(
                 runtime_tools.get_all_tools(
                     workspace_dir=self.temp_dir,
-                    rag_config_overrides={"enabled": False, "knowledge_store_path": str(self.temp_dir / "store")},
+                    rag_config_overrides={
+                        "enabled": False,
+                        "retrieval_profile": "deterministic",
+                        "knowledge_store_path": str(self.temp_dir / "store"),
+                    },
                 )
             )
             enabled = runtime_tools._run_coro_in_thread(
                 runtime_tools.get_all_tools(
                     workspace_dir=self.temp_dir,
-                    rag_config_overrides={"enabled": True, "knowledge_store_path": str(self.temp_dir / "store")},
+                    rag_config_overrides={
+                        "enabled": True,
+                        "retrieval_profile": "deterministic",
+                        "knowledge_store_path": str(self.temp_dir / "store"),
+                    },
                 )
             )
 

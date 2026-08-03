@@ -4,11 +4,12 @@
 
 - Text extraction supports Markdown, plain text, CSV, and HTML with structured skipped-file results for unsupported files.
 - Chunking uses a structure-first semantic strategy: headings, paragraphs, tables, lists, code blocks, and pages are preserved before sentence/semantic fallback and token-window fallback.
-- Sparse retrieval uses an in-process lexical scorer suitable for deterministic tests.
-- Dense retrieval uses a local hashing/vector scorer suitable for deterministic tests and offline smoke runs.
+- Sparse retrieval uses an in-process lexical scorer for exact identifiers, filenames, dates, and numeric values.
+- Production dense retrieval uses the local BGE-M3 Transformers adapter and persistent Qdrant.
+- The old in-memory hashing scorer is restricted to the explicit deterministic profile used by unit tests.
 - Hybrid retrieval uses Reciprocal Rank Fusion as the default fusion strategy.
 - Search expands adjacent chunks after rank fusion so split paragraphs, pages, and stage tables can return nearby evidence without increasing document-wide snippets.
-- Reranking is configurable and currently implemented with a local overlap reranker for deterministic smoke verification.
+- Production reranking uses the local BGE reranker through Transformers; the local overlap reranker is restricted to the deterministic profile.
 
 ## Selected Local Model Stack
 
@@ -16,7 +17,10 @@
 - Embeddings use the Hugging Face local model alias `bge-m3`, normalized at runtime to `BAAI/bge-m3`, with 1024 output dimensions.
 - Hybrid retrieval uses Reciprocal Rank Fusion (`rrf`) and returns 8 final chunks by default.
 - Reranking uses the Hugging Face local model alias `bge-reranker-v2-m3`, normalized at runtime to `BAAI/bge-reranker-v2-m3`.
-- Reranking is configured but disabled by default; when enabled it reranks the top 50 fused candidates before final packing.
+- Reranking is enabled by default and reranks the top 50 fused candidates before final packing.
+- Runtime settings report whether each configured provider was actually active. Missing production models return a structured backend-unavailable result instead of silently falling back.
+- Qdrant stores one local collection per knowledge store under `knowledge_base/qdrant`; deterministic UUID point ids allow refresh and deletion reconciliation.
+- Manifest `retrieval_signature` and `indexed_at` fields force re-embedding when the retrieval stack changes.
 - Model assets are stored under `knowledge_base/models/`, with separate embedding and reranker cache directories plus a download manifest.
 - The model download command pulls only runtime-relevant Hugging Face assets and validates that snapshots contain complete model weight files before marking them as successful; stale non-model image or asset leftovers do not block model readiness.
 

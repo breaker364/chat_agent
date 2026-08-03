@@ -66,8 +66,7 @@ def build_knowledge_tools(
         return PersonalKnowledgeBase(
             workspace_root=workspace_root,
             store_path=config.knowledge_store_path,
-            chunker_config=config.chunking,
-            reranker_enabled=config.reranker.enabled,
+            config=config,
         )
 
     def knowledge_import_files(collection: str, paths: list[str], metadata: dict[str, Any] | None = None) -> str:

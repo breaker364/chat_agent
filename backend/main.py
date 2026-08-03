@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .agent import build_agent, stream_agent_events
-from .config import get_runtime_value
+from .config import PROJECT_ROOT, get_runtime_value
 from .session_store import SessionStore, TOOL_EVENT_SCHEMA_VERSION
 from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
@@ -194,10 +194,27 @@ def _safe_upload_component(value: str, fallback: str) -> str:
 
 
 def _project_knowledge_base():
+    from .rag.config import load_rag_config
     from .rag.service import PersonalKnowledgeBase
 
     workspace = _workspace()
-    return PersonalKnowledgeBase(workspace_root=workspace, store_path=workspace / "knowledge_base")
+    if workspace == PROJECT_ROOT.resolve():
+        return PersonalKnowledgeBase.from_config(workspace_root=workspace)
+    isolated_config = load_rag_config(
+        {
+            "enabled": True,
+            "retrieval_profile": "deterministic",
+            "knowledge_store_path": str(workspace / "knowledge_base"),
+            "embedding_provider": "deterministic",
+            "vector_backend": "in_memory",
+            "sparse_backend": "in_memory_bm25",
+        }
+    )
+    return PersonalKnowledgeBase(
+        workspace_root=workspace,
+        store_path=workspace / "knowledge_base",
+        config=isolated_config,
+    )
 
 
 def _knowledge_mode_message(message: str, enabled: bool) -> str:
