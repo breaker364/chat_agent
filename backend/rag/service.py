@@ -17,7 +17,7 @@ from .chunking import StructureFirstSemanticChunker, content_hash, tokenize
 from .config import SemanticChunkingConfig, load_rag_config
 from .models import DocumentManifest, KnowledgeChunk
 
-_SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".html", ".htm", ".pdf"}
+_SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".html", ".htm", ".pdf", ".docx"}
 _PARSER_VERSION = "local-parser-v1"
 
 
@@ -244,6 +244,23 @@ class PersonalKnowledgeBase:
             text = "\n\n".join(page.strip() for page in pages if page.strip()).strip()
             if not text:
                 raise RuntimeError("PDF text extraction produced no text")
+            return text
+        if suffix == ".docx":
+            try:
+                from docx import Document
+            except Exception as exc:
+                raise RuntimeError("Word document text extraction requires python-docx") from exc
+            doc = Document(str(path))
+            paragraphs = [paragraph.text.strip() for paragraph in doc.paragraphs if paragraph.text.strip()]
+            # Also extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if row_text:
+                        paragraphs.append(row_text)
+            text = "\n\n".join(paragraphs)
+            if not text:
+                raise RuntimeError("Word document text extraction produced no text")
             return text
         if suffix == ".csv":
             with path.open("r", encoding="utf-8", newline="", errors="ignore") as handle:
