@@ -155,6 +155,7 @@ npm run dev
   "base_url": "LLM API 地址",
   "api_key": "API 密钥",
   "model": "模型名称",
+  "model_context_window": 128000,
   "tavily_api_key": "Tavily 搜索 API 密钥",
   "tavily_base_url": "Tavily API 地址",
   "vision": {
@@ -165,6 +166,17 @@ npm run dev
   }
 }
 ```
+
+**配置项说明：**
+
+| 配置项 | 类型 | 必填 | 说明 |
+|--------|------|------|------|
+| `base_url` | string | 是 | LLM API 地址 |
+| `api_key` | string | 是 | API 密钥 |
+| `model` | string | 是 | 模型名称 |
+| `model_context_window` | int | 否 | 模型上下文窗口大小（token 数），用于监控剩余容量 |
+| `tavily_api_key` | string | 否 | Tavily 搜索 API 密钥 |
+| `tavily_base_url` | string | 否 | Tavily API 地址 |
 
 ## API 接口
 
@@ -328,7 +340,41 @@ files=@file2.pdf
 - **视觉问答**：基于图片的问答交互
 - **文档 OCR**：图片文字识别
 
-### 5. 搜索适配器
+### 5. 上下文容量监控
+
+系统支持实时监控模型上下文窗口使用情况：
+
+- **配置方式**：在 `config.json` 中设置 `model_context_window` 参数
+- **容量检查**：在每次 Agent 运行开始时检查剩余容量
+- **实时反馈**：通过 debug 事件返回以下信息：
+  - `context_token_estimate`：当前上下文 token 估算值
+  - `model_context_window`：模型上下文窗口大小
+  - `remaining_tokens`：剩余可用 token 数
+  - `is_context_exceeded`：是否已超出限制
+
+**配置示例：**
+```json
+{
+  "model": "deepseek-chat",
+  "model_context_window": 128000
+}
+```
+
+**Debug 事件示例：**
+```json
+{
+  "event": "debug",
+  "data": {
+    "stage": "agent_start",
+    "context_token_estimate": 50000,
+    "model_context_window": 128000,
+    "remaining_tokens": 78000,
+    "is_context_exceeded": false
+  }
+}
+```
+
+### 6. 搜索适配器
 
 支持多种搜索后端：
 

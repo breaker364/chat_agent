@@ -163,6 +163,62 @@ def estimate_tokens_from_text(text: str) -> int:
     return count_text_tokens(text or "")
 
 
+def get_model_context_window(model_name: str) -> int | None:
+    """Get the configured context window size for the specified model.
+
+    Returns:
+        The context window size in tokens, or None if not configured or invalid.
+    """
+    try:
+        from .config import load_app_config
+        config = load_app_config()
+        configured_model = config.get("model", "")
+        if configured_model != model_name:
+            return None
+        context_window = config.get("model_context_window")
+        if isinstance(context_window, int) and context_window > 0:
+            return context_window
+        return None
+    except Exception:
+        return None
+
+
+def check_context_capacity(
+    context_token_estimate: int,
+    model_name: str,
+) -> dict[str, Any]:
+    """Check the remaining context capacity for the current model.
+
+    Args:
+        context_token_estimate: Estimated token count of current context.
+        model_name: The model name to check capacity for.
+
+    Returns:
+        A dictionary containing:
+        - model_context_window: The configured context window size (or None).
+        - context_token_estimate: The input token estimate.
+        - remaining_tokens: Remaining tokens before limit (or None if unknown).
+        - is_exceeded: Whether the context exceeds the model limit.
+    """
+    model_limit = get_model_context_window(model_name)
+
+    if model_limit is None:
+        return {
+            "model_context_window": None,
+            "context_token_estimate": context_token_estimate,
+            "remaining_tokens": None,
+            "is_exceeded": False,
+        }
+
+    remaining = max(0, model_limit - context_token_estimate)
+    return {
+        "model_context_window": model_limit,
+        "context_token_estimate": context_token_estimate,
+        "remaining_tokens": remaining,
+        "is_exceeded": context_token_estimate > model_limit,
+    }
+
+
 def _history_entry_text(entry: dict[str, Any]) -> str:
     """Serialize structured history without dropping native tool payload fields."""
     if entry.get("role") in {"assistant_tool_calls", "tool", "legacy_tool_result", "malformed_tool_result"}:
@@ -1504,6 +1560,11 @@ async def stream_agent_events(
         progress={"current": 1, "total": 3, "label": "理解任务"},
     )
 
+    # Get model context window capacity info
+    model_config = load_llm_config()
+    model_name = model_config.get("model", "")
+    capacity_info = check_context_capacity(context_token_estimate, model_name)
+
     yield {
         "event": "debug",
         "data": json.dumps(
@@ -1516,6 +1577,9 @@ async def stream_agent_events(
                 "context_messages": context_message_count,
                 "context_chars": context_char_count,
                 "context_token_estimate": context_token_estimate,
+                "model_context_window": capacity_info["model_context_window"],
+                "remaining_tokens": capacity_info["remaining_tokens"],
+                "is_context_exceeded": capacity_info["is_exceeded"],
             },
             ensure_ascii=False,
         ),
