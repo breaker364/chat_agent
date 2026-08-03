@@ -90,6 +90,44 @@ def load_llm_config(config_path: str | Path | None = None) -> dict[str, str]:
     }
 
 
+DEFAULT_CONTEXT_COMPACTION_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "trigger_remaining_tokens": 20_000,
+    "retain_recent_turns": 3,
+    "summary_max_output_tokens": 4_096,
+    "chunk_target_tokens": 12_000,
+    "merge_target_tokens": 12_000,
+    "max_retries": 1,
+}
+
+
+def load_context_compaction_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Load optional context-compaction settings with safe defaults."""
+    data = load_app_config(config_path)
+    raw = data.get("context_compaction")
+    raw = raw if isinstance(raw, dict) else {}
+
+    def positive_int(key: str, *, allow_zero: bool = False) -> int:
+        value = raw.get(key, DEFAULT_CONTEXT_COMPACTION_CONFIG[key])
+        if isinstance(value, bool) or not isinstance(value, int):
+            return int(DEFAULT_CONTEXT_COMPACTION_CONFIG[key])
+        minimum = 0 if allow_zero else 1
+        return value if value >= minimum else int(DEFAULT_CONTEXT_COMPACTION_CONFIG[key])
+
+    enabled = raw.get("enabled", DEFAULT_CONTEXT_COMPACTION_CONFIG["enabled"])
+    if not isinstance(enabled, bool):
+        enabled = bool(DEFAULT_CONTEXT_COMPACTION_CONFIG["enabled"])
+    return {
+        "enabled": enabled,
+        "trigger_remaining_tokens": positive_int("trigger_remaining_tokens"),
+        "retain_recent_turns": positive_int("retain_recent_turns"),
+        "summary_max_output_tokens": positive_int("summary_max_output_tokens"),
+        "chunk_target_tokens": positive_int("chunk_target_tokens"),
+        "merge_target_tokens": positive_int("merge_target_tokens"),
+        "max_retries": positive_int("max_retries", allow_zero=True),
+    }
+
+
 def load_tavily_config(config_path: str | Path | None = None) -> dict[str, str | None]:
     """Load Tavily configuration from env or config JSON."""
     data = load_app_config(config_path)

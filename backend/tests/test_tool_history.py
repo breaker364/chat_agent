@@ -136,6 +136,33 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual(tool_entries[0]["tool_calls"][0]["args"], arguments)
         self.assertEqual(tool_entries[1]["content"], content)
 
+    def test_older_tool_history_is_available_as_textual_compaction_source(self):
+        old_tools = [
+            _tool_call(0, "old-call", "lookup", {"query": "old exact query"}),
+            _tool_result(1, "old-call", "lookup", "old exact result"),
+        ]
+        self._complete_turn("older-tools", "old request", "old answer", old_tools)
+        for index in range(3):
+            self._complete_turn(
+                "older-tools",
+                f"recent request {index}",
+                f"recent answer {index}",
+                [],
+            )
+
+        history = self.store.get_history("older-tools")
+
+        old_context = [
+            entry for entry in history if entry.get("role") == "historical_tool_context"
+        ]
+        self.assertEqual(len(old_context), 1)
+        self.assertIn("old exact query", old_context[0]["content"])
+        self.assertIn("old exact result", old_context[0]["content"])
+        self.assertEqual(
+            len([entry for entry in history if entry.get("role") == "assistant_tool_calls"]),
+            0,
+        )
+
     def test_stream_events_include_same_run_tool_call_id_for_call_and_result(self):
         agent = CapturingAgent(
             [
@@ -479,6 +506,35 @@ class ToolHistoryTests(unittest.TestCase):
         session = self.store.load_session("overflow-stream")
         self.assertTrue(any(event["event"] == "error" for event in events))
         self.assertEqual(agent.calls, [])
+        self.assertEqual(session["task_progress"]["execution_summary"]["status"], "failed")
+        self.assertEqual(session["task_progress"]["status"], "failed")
+
+    def test_context_compaction_failure_marks_sync_turn_failed(self):
+        async def fake_get_agent():
+            return CapturingAgent()
+
+        async def fake_stream(*_args, **_kwargs):
+            yield {
+                "event": "error",
+                "data": json.dumps(
+                    {
+                        "code": "context_compaction_failed",
+                        "message": "Context summary unavailable.",
+                    }
+                ),
+            }
+            yield {"event": "done", "data": json.dumps("Context summary unavailable.")}
+
+        with patch("backend.main.get_session_store", return_value=self.store), patch(
+            "backend.main.get_agent", fake_get_agent
+        ), patch("backend.main.stream_agent_events", fake_stream):
+            response = asyncio.run(
+                chat_sync(JsonRequest({"message": "next request", "session_id": "compaction-failed"}))
+            )
+
+        payload = json.loads(response.body)
+        session = self.store.load_session("compaction-failed")
+        self.assertIn("Context summary unavailable", payload["reply"])
         self.assertEqual(session["task_progress"]["execution_summary"]["status"], "failed")
         self.assertEqual(session["task_progress"]["status"], "failed")
 

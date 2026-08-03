@@ -13,7 +13,18 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import Runnable
 from langgraph.prebuilt import create_react_agent
 
-from .config import create_chat_deepseek, load_llm_config
+from .config import create_chat_deepseek, load_context_compaction_config, load_llm_config
+from .context_compaction import (
+    ContextCompactionError,
+    build_compaction_cache,
+    canonical_history_fingerprint,
+    compact_history_with_llm,
+    get_context_compaction_lock,
+    is_compaction_cache_usable,
+    partition_history,
+    should_compact_context,
+    validate_summary_text,
+)
 from .prompts import load_agent_policy, load_system_prompt
 from .session_events import get_session_event_hub
 from .session_store import SessionStore
@@ -221,9 +232,206 @@ def check_context_capacity(
 
 def _history_entry_text(entry: dict[str, Any]) -> str:
     """Serialize structured history without dropping native tool payload fields."""
-    if entry.get("role") in {"assistant_tool_calls", "tool", "legacy_tool_result", "malformed_tool_result"}:
+    if entry.get("role") in {
+        "assistant_tool_calls",
+        "tool",
+        "legacy_tool_result",
+        "malformed_tool_result",
+        "historical_tool_context",
+        "context_summary",
+    }:
         return json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
     return str(entry.get("content") or "")
+
+
+def _estimate_context_metrics(
+    history_items: list[dict[str, Any]] | None,
+    *,
+    effective_message: str,
+    skill_catalog_text: str,
+    resume_text: str,
+) -> dict[str, Any]:
+    history_payloads = [_history_entry_text(entry) for entry in (history_items or [])]
+    protected_tool_chars = sum(
+        len(payload)
+        for entry, payload in zip(history_items or [], history_payloads)
+        if entry.get("protected_tool_history")
+    )
+    context_char_count = sum(len(payload) for payload in history_payloads)
+    context_char_count += len(SYSTEM_PROMPT) + len(AGENT_POLICY or "") + len(effective_message)
+    context_message_count = len(history_payloads) + 2
+    if skill_catalog_text:
+        context_char_count += len(skill_catalog_text)
+        context_message_count += 1
+    if resume_text:
+        context_char_count += len(resume_text)
+        context_message_count += 1
+    context_token_estimate = estimate_tokens_from_text("".join(
+        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", resume_text or "", effective_message]
+        + history_payloads
+    ))
+    return {
+        "history_payloads": history_payloads,
+        "protected_tool_chars": protected_tool_chars,
+        "context_char_count": context_char_count,
+        "context_message_count": context_message_count,
+        "context_token_estimate": context_token_estimate,
+    }
+
+
+async def _compact_history_if_needed(
+    history: list[dict[str, Any]] | None,
+    *,
+    session_id: str,
+    model_config: dict[str, Any],
+    model_context_window: int | None,
+    context_token_estimate: int,
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source_history = [dict(item) for item in (history or []) if isinstance(item, dict)]
+    retain_recent_turns = int(settings.get("retain_recent_turns", 3))
+    partition = partition_history(source_history, retain_recent_turns=retain_recent_turns)
+    old_turn_count = max(0, len(partition.completed_turns) - retain_recent_turns)
+    details: dict[str, Any] = {
+        "triggered": False,
+        "cache_hit": False,
+        "protected_turn_count": min(len(partition.completed_turns), retain_recent_turns),
+        "eligible_turn_count": old_turn_count,
+        "eligible_item_count": len(partition.eligible_items),
+        "model_context_window": model_context_window,
+        "context_token_estimate_before": context_token_estimate,
+        "remaining_tokens_before": (
+            model_context_window - context_token_estimate
+            if model_context_window is not None
+            else None
+        ),
+        "model_calls": 0,
+    }
+    if not settings.get("enabled", True):
+        details["skip_reason"] = "disabled"
+        return source_history, details
+    if model_context_window is None:
+        details["skip_reason"] = "unknown_context_window"
+        return source_history, details
+    if not should_compact_context(
+        context_token_estimate,
+        model_context_window,
+        int(settings.get("trigger_remaining_tokens", 20_000)),
+    ):
+        details["skip_reason"] = "above_threshold"
+        return source_history, details
+    if not partition.eligible_items:
+        details["skip_reason"] = "no_eligible_history"
+        return source_history, details
+
+    model_name = str(model_config.get("model") or "")
+    store = SessionStore(Path.cwd())
+    current_fingerprint = canonical_history_fingerprint(partition.eligible_items)
+    async with get_context_compaction_lock(session_id):
+        cache = store.get_context_compaction(session_id)
+        cached_summary = ""
+        merge_items: list[dict[str, Any]] | None = None
+        cache_usable = is_compaction_cache_usable(
+            cache,
+            partition.eligible_items,
+            model_name=model_name,
+            allow_extended_source=True,
+            expected_boundary_index=partition.boundary_index,
+            expected_covered_turn_count=old_turn_count,
+        )
+        if cache_usable and cache is not None:
+            try:
+                validate_summary_text(
+                    str(cache.get("summary") or ""),
+                    cache.get("literal_ledger") or [],
+                    max_output_tokens=int(settings.get("summary_max_output_tokens", 4_096)),
+                )
+            except ContextCompactionError:
+                cache_usable = False
+        if cache_usable and cache is not None:
+            covered_count = int(cache.get("covered_item_count", 0))
+            cached_summary = str(cache.get("summary") or "")
+            if covered_count == len(partition.eligible_items):
+                details["triggered"] = True
+                details["cache_hit"] = True
+                details["summary"] = cached_summary
+                details["source_fingerprint"] = current_fingerprint
+                return [
+                    {
+                        "role": "context_summary",
+                        "content": cached_summary,
+                        "context_compaction": True,
+                        "source_fingerprint": current_fingerprint,
+                        "covered_turn_count": old_turn_count,
+                    },
+                    *partition.protected_items,
+                ], details
+            if covered_count < len(partition.eligible_items):
+                merge_items = [
+                    {"role": "context_summary", "content": cached_summary},
+                    *partition.eligible_items[covered_count:],
+                ]
+
+        source_items = merge_items or partition.eligible_items
+
+        def generate_summary() -> Any:
+            llm = create_chat_deepseek(
+                model_config,
+                temperature=0.0,
+                streaming=False,
+                max_tokens=int(settings.get("summary_max_output_tokens", 4_096)),
+            )
+            return compact_history_with_llm(
+                llm,
+                source_items,
+                settings=settings,
+            )
+
+        try:
+            result = await asyncio.to_thread(generate_summary)
+        except ContextCompactionError:
+            raise
+        except Exception as exc:
+            raise ContextCompactionError(
+                f"Context compaction failed: {exc}",
+                code="context_compaction_failed",
+            ) from exc
+
+        details["triggered"] = True
+        details["model_calls"] = result.model_calls
+        details["source_fingerprint"] = current_fingerprint
+        cache_payload = build_compaction_cache(
+            result,
+            model_name=model_name,
+            boundary_index=partition.boundary_index,
+            context_token_estimate_before=context_token_estimate,
+            context_token_estimate_after=estimate_tokens_from_text(result.summary),
+        )
+        cache_payload.update(
+            {
+                "source_fingerprint": current_fingerprint,
+                "covered_item_count": len(partition.eligible_items),
+                "covered_turn_count": old_turn_count,
+            }
+        )
+        try:
+            store.save_context_compaction(session_id, cache_payload)
+        except Exception as exc:
+            raise ContextCompactionError(
+                f"Context compaction cache persistence failed: {exc}",
+                code="context_compaction_failed",
+            ) from exc
+        details["summary"] = result.summary
+        return [
+            {
+                "role": "context_summary",
+                "content": result.summary,
+                "context_compaction": True,
+                "source_fingerprint": current_fingerprint,
+                "covered_turn_count": old_turn_count,
+            },
+            *partition.protected_items,
+        ], details
 
 
 def _tool_message_content(content: Any) -> str | list[Any]:
@@ -301,6 +509,8 @@ def _append_native_history_messages(messages: list[BaseMessage], history_items: 
                     name=str(entry.get("name") or "tool"),
                 )
             )
+        elif role in {"historical_tool_context", "context_summary"}:
+            messages.append(AIMessage(content=str(entry.get("content") or "")))
         elif role in {"legacy_tool_result", "malformed_tool_result"}:
             # An orphaned legacy result has no valid native call to reference.
             # Preserve it explicitly instead of silently dropping the data.
@@ -850,9 +1060,24 @@ async def stream_agent_events(
         # Keep the most recent turns first, then restore chronological order.
         for item in reversed(history_items):
             role = item.get("role", "")
+            if role == "context_summary":
+                trimmed.append(dict(item))
+                continue
             if role in {"assistant_tool_calls", "tool", "legacy_tool_result", "malformed_tool_result"}:
                 # Protected tool records are replayed exactly as persisted.
                 trimmed.append(item)
+                continue
+            if role == "historical_tool_context":
+                content = compress_history_text(str(item.get("content") or ""))
+                projected = total_chars + len(content)
+                if trimmed and (len(trimmed) >= MAX_HISTORY_MESSAGES or projected > MAX_HISTORY_TOTAL_CHARS):
+                    continue
+                trimmed.append({
+                    "role": role,
+                    "content": content,
+                    "historical_tool_history": True,
+                })
+                total_chars = projected
                 continue
             if role not in {"user", "assistant"}:
                 continue
@@ -1325,7 +1550,8 @@ async def stream_agent_events(
     resume_text = _format_resume_context(resume_context)
     if resume_text:
         messages.append(SystemMessage(content=resume_text))
-    effective_history = trim_history(history)
+    raw_history = [dict(item) for item in (history or []) if isinstance(item, dict)]
+    effective_history: list[dict[str, Any]] = raw_history
     effective_message = message
     detected_image_paths = extract_image_paths(message, Path.cwd())
     if detected_image_paths:
@@ -1482,36 +1708,190 @@ async def stream_agent_events(
                 ),
             }
 
-    context_message_count = len(effective_history) + 2
-    history_payloads = [_history_entry_text(entry) for entry in effective_history]
-    protected_tool_chars = sum(
-        len(payload)
-        for entry, payload in zip(effective_history, history_payloads)
-        if entry.get("protected_tool_history")
+    model_config = load_llm_config()
+    model_name = model_config.get("model", "")
+    compaction_settings = load_context_compaction_config()
+    pre_compaction_metrics = _estimate_context_metrics(
+        raw_history,
+        effective_message=effective_message,
+        skill_catalog_text=skill_catalog_text,
+        resume_text=resume_text,
     )
-    context_char_count = sum(len(payload) for payload in history_payloads)
-    context_char_count += len(SYSTEM_PROMPT) + len(AGENT_POLICY or "") + len(effective_message)
-    if skill_catalog_text:
-        context_char_count += len(skill_catalog_text)
-        context_message_count += 1
-    if resume_text:
-        context_char_count += len(resume_text)
-        context_message_count += 1
-    context_token_estimate = estimate_tokens_from_text("".join(
-        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", resume_text or "", effective_message]
-        + history_payloads
-    ))
+    pre_capacity_info = check_context_capacity(
+        pre_compaction_metrics["context_token_estimate"],
+        model_name,
+    )
+    pre_partition = partition_history(
+        raw_history,
+        retain_recent_turns=int(compaction_settings.get("retain_recent_turns", 3)),
+    )
+    pre_triggered = should_compact_context(
+        pre_compaction_metrics["context_token_estimate"],
+        pre_capacity_info["model_context_window"],
+        int(compaction_settings.get("trigger_remaining_tokens", 20_000)),
+    )
+    if compaction_settings.get("enabled", True) and pre_triggered and pre_partition.eligible_items:
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_compaction_started",
+                    "message": "Context compaction started.",
+                    "session_id": session_id,
+                    "context_token_estimate_before": pre_compaction_metrics["context_token_estimate"],
+                    "remaining_tokens_before": pre_capacity_info["remaining_tokens"],
+                    "protected_turn_count": min(
+                        len(pre_partition.completed_turns),
+                        int(compaction_settings.get("retain_recent_turns", 3)),
+                    ),
+                    "eligible_turn_count": max(
+                        0,
+                        len(pre_partition.completed_turns)
+                        - int(compaction_settings.get("retain_recent_turns", 3)),
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        }
 
+    try:
+        effective_history, compaction_details = await _compact_history_if_needed(
+            raw_history,
+            session_id=session_id,
+            model_config=model_config,
+            model_context_window=pre_capacity_info["model_context_window"],
+            context_token_estimate=pre_compaction_metrics["context_token_estimate"],
+            settings=compaction_settings,
+        )
+    except ContextCompactionError as exc:
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_compaction_failed",
+                    "message": str(exc),
+                    "code": exc.code,
+                    "session_id": session_id,
+                    "context_token_estimate_before": pre_compaction_metrics["context_token_estimate"],
+                    "remaining_tokens_before": pre_capacity_info["remaining_tokens"],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {
+            "event": "error",
+            "data": json.dumps(
+                {
+                    "code": exc.code,
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {"event": "done", "data": json.dumps(str(exc), ensure_ascii=False)}
+        return
+
+    # A validated compaction projection already contains the complete protected
+    # turns. Ordinary lossy trimming must not rewrite that protected source.
+    if not compaction_details.get("triggered"):
+        effective_history = trim_history(effective_history)
+    context_metrics = _estimate_context_metrics(
+        effective_history,
+        effective_message=effective_message,
+        skill_catalog_text=skill_catalog_text,
+        resume_text=resume_text,
+    )
+    history_payloads = context_metrics["history_payloads"]
+    protected_tool_chars = context_metrics["protected_tool_chars"]
+    context_char_count = context_metrics["context_char_count"]
+    context_message_count = context_metrics["context_message_count"]
+    context_token_estimate = context_metrics["context_token_estimate"]
+
+    if compaction_details.get("skip_reason") == "unknown_context_window":
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "skipped_unknown_context_window",
+                    "message": "Context compaction skipped because the model context window is unknown.",
+                    "session_id": session_id,
+                },
+                ensure_ascii=False,
+            ),
+        }
+    elif compaction_details.get("cache_hit"):
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_compaction_reused",
+                    "message": "Validated context summary cache reused.",
+                    "session_id": session_id,
+                    "context_token_estimate_after": context_token_estimate,
+                    "remaining_tokens_after": (
+                        pre_capacity_info["model_context_window"] - context_token_estimate
+                        if pre_capacity_info["model_context_window"] is not None
+                        else None
+                    ),
+                    "protected_turn_count": compaction_details.get("protected_turn_count", 0),
+                    "eligible_turn_count": compaction_details.get("eligible_turn_count", 0),
+                    "cache_hit": True,
+                },
+                ensure_ascii=False,
+            ),
+        }
+    elif compaction_details.get("triggered"):
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_compaction_completed",
+                    "message": "Context compaction completed.",
+                    "session_id": session_id,
+                    "context_token_estimate_after": context_token_estimate,
+                    "remaining_tokens_after": (
+                        pre_capacity_info["model_context_window"] - context_token_estimate
+                        if pre_capacity_info["model_context_window"] is not None
+                        else None
+                    ),
+                    "protected_turn_count": compaction_details.get("protected_turn_count", 0),
+                    "eligible_turn_count": compaction_details.get("eligible_turn_count", 0),
+                    "cache_hit": False,
+                    "model_calls": compaction_details.get("model_calls", 0),
+                },
+                ensure_ascii=False,
+            ),
+        }
     if protected_tool_chars and context_char_count > MAX_HISTORY_TOTAL_CHARS:
         capacity_message = (
             "Protected tool history exceeds the configured context budget; "
             "no tool arguments or results were truncated."
         )
+        capacity_code = (
+            "context_compaction_capacity_exceeded"
+            if compaction_details.get("triggered")
+            else "protected_context_capacity_exceeded"
+        )
+        if compaction_details.get("triggered"):
+            yield {
+                "event": "debug",
+                "data": json.dumps(
+                    {
+                        "stage": "context_compaction_failed",
+                        "message": capacity_message,
+                        "code": capacity_code,
+                        "session_id": session_id,
+                        "context_token_estimate_after": context_metrics["context_token_estimate"],
+                        "protected_tool_chars": protected_tool_chars,
+                    },
+                    ensure_ascii=False,
+                ),
+            }
         yield {
             "event": "error",
             "data": json.dumps(
                 {
-                    "code": "protected_context_capacity_exceeded",
+                    "code": capacity_code,
                     "message": capacity_message,
                     "context_chars": context_char_count,
                     "protected_tool_chars": protected_tool_chars,
@@ -1546,6 +1926,41 @@ async def stream_agent_events(
     messages.append(HumanMessage(content=effective_message))
 
     _repair_dangling_tool_call_messages(messages)
+    capacity_info = check_context_capacity(context_token_estimate, model_name)
+    if compaction_details.get("triggered") and capacity_info["is_exceeded"]:
+        capacity_message = (
+            "Context compaction completed, but the protected recent history and required prompt "
+            "still exceed the configured model context window."
+        )
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_compaction_failed",
+                    "message": capacity_message,
+                    "code": "context_compaction_capacity_exceeded",
+                    "session_id": session_id,
+                    "context_token_estimate_after": context_token_estimate,
+                    "model_context_window": capacity_info["model_context_window"],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {
+            "event": "error",
+            "data": json.dumps(
+                {
+                    "code": "context_compaction_capacity_exceeded",
+                    "message": capacity_message,
+                    "context_token_estimate": context_token_estimate,
+                    "model_context_window": capacity_info["model_context_window"],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        yield {"event": "done", "data": json.dumps(capacity_message, ensure_ascii=False)}
+        return
+
     injected_append_commands = inject_pending_append_commands()
     event_stream = agent.astream_events(
         {"messages": messages},
@@ -1559,11 +1974,6 @@ async def stream_agent_events(
         next_step="开始检查可用信息和所需操作。",
         progress={"current": 1, "total": 3, "label": "理解任务"},
     )
-
-    # Get model context window capacity info
-    model_config = load_llm_config()
-    model_name = model_config.get("model", "")
-    capacity_info = check_context_capacity(context_token_estimate, model_name)
 
     yield {
         "event": "debug",

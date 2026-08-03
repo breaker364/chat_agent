@@ -2,6 +2,7 @@
   "base_url": "https://api.xiaomimimo.com/v1",
   "api_key": "sk-c4lfrlu5bu82dzhbb0r5npq1lguvaj0hbeqwo194e0ej46n0",
   "model": "mimo-v2.5-pro",
+  "model_context_window": 800000,
   "vision": {
     "enabled": true,
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",

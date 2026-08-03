@@ -349,6 +349,26 @@ def _append_tool_history_entries(history: list[dict[str, Any]], events: list[dic
         index += 1
 
 
+def _append_historical_tool_history_entry(
+    history: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> None:
+    if not events:
+        return
+    history.append(
+        {
+            "role": "historical_tool_context",
+            "content": json.dumps(
+                {"historical_tool_events": events},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            "historical_tool_history": True,
+        }
+    )
+
+
 class SessionStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -538,6 +558,7 @@ class SessionStore:
                     stale_tmp.unlink()
                 except Exception:
                     pass
+
             payload = dict(session)
             progress = payload.get("task_progress")
             if isinstance(progress, dict):
@@ -551,11 +572,57 @@ class SessionStore:
                     _compact_message(message) if isinstance(message, dict) else message
                     for message in messages
                 ]
-            # Direct write avoids accumulating locked session.tmp-* files on Windows.
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             for stale_tmp in path.parent.glob("session.tmp-*.json"):
                 try:
                     stale_tmp.unlink()
+                except Exception:
+                    pass
+
+    def get_context_compaction(self, session_id: str) -> dict[str, Any] | None:
+        session = self.load_session(session_id)
+        if session is None:
+            return None
+        value = session.get("context_compaction")
+        return dict(value) if isinstance(value, dict) else None
+
+    def save_context_compaction(self, session_id: str, cache: dict[str, Any]) -> dict[str, Any]:
+        session = self.create_or_get_session(session_id)
+        session["context_compaction"] = dict(cache)
+        self._save_context_compaction_atomically(session)
+        return session
+
+    def _save_context_compaction_atomically(self, session: dict[str, Any]) -> None:
+        """Commit only validated compaction metadata without exposing a partial JSON file."""
+        with _SESSION_FILE_LOCK:
+            session["updated_at"] = _now_iso()
+            path = self.session_path(session["session_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = dict(session)
+            progress = payload.get("task_progress")
+            if isinstance(progress, dict):
+                progress = dict(progress)
+                progress.pop("task_plan", None)
+                progress.setdefault("task_plan_ref", {"path": "task_plan.json", "updated_at": ""})
+                payload["task_progress"] = progress
+            messages = payload.get("messages", [])
+            if isinstance(messages, list):
+                payload["messages"] = [
+                    _compact_message(message) if isinstance(message, dict) else message
+                    for message in messages
+                ]
+            temporary_path = path.with_name(f"session.tmp-{uuid4().hex}.json")
+            try:
+                temporary_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary_path.replace(path)
+            finally:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
                 except Exception:
                     pass
 
@@ -1519,9 +1586,13 @@ class SessionStore:
             role = item.get("role", "")
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
-                if role == "assistant" and index in protected_assistant_indexes:
+                if role == "assistant":
                     tool_events = normalize_tool_events(item.get("tools"), index)
-                    _append_tool_history_entries(history, deduplicate_tool_history_events(tool_events))
+                    tool_events = deduplicate_tool_history_events(tool_events)
+                    if index in protected_assistant_indexes:
+                        _append_tool_history_entries(history, tool_events)
+                    else:
+                        _append_historical_tool_history_entry(history, tool_events)
                 history.append({"role": role, "content": content})
         progress = session.get("task_progress", {})
         plan = progress.get("task_plan") if isinstance(progress, dict) else None
@@ -1912,9 +1983,13 @@ class SessionStore:
             role = item.get("role", "")
             content = item.get("content", "")
             if role in {"user", "assistant"} and isinstance(content, str):
-                if role == "assistant" and index in protected_assistant_indexes:
+                if role == "assistant":
                     tool_events = normalize_tool_events(item.get("tools"), index)
-                    _append_tool_history_entries(history, deduplicate_tool_history_events(tool_events))
+                    tool_events = deduplicate_tool_history_events(tool_events)
+                    if index in protected_assistant_indexes:
+                        _append_tool_history_entries(history, tool_events)
+                    else:
+                        _append_historical_tool_history_entry(history, tool_events)
                 history.append({"role": role, "content": content})
 
         plan = self.load_task_plan(session_id)

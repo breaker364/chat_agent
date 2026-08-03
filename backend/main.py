@@ -73,6 +73,11 @@ _agent_lock: Any = None
 _session_store: SessionStore | None = None
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
 _ACTIVE_RUNS_LOCK = RLock()
+_CONTEXT_FAILURE_CODES = {
+    "protected_context_capacity_exceeded",
+    "context_compaction_failed",
+    "context_compaction_capacity_exceeded",
+}
 
 
 def _get_lock():
@@ -1306,7 +1311,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                         )
                     elif event_type == "error" and isinstance(parsed, dict):
                         assistant_text = str(parsed.get("message") or assistant_text)
-                        if parsed.get("code") == "protected_context_capacity_exceeded":
+                        if parsed.get("code") in _CONTEXT_FAILURE_CODES:
                             terminal_status = "failed"
                             terminal_failure_reason = assistant_text
                     elif event_type == "done":
@@ -1477,7 +1482,7 @@ async def chat_sync(request: Request) -> JSONResponse:
                     pass
                 elif event_type == "error" and isinstance(parsed, dict):
                     final_text = str(parsed.get("message") or final_text)
-                    if parsed.get("code") == "protected_context_capacity_exceeded":
+                    if parsed.get("code") in _CONTEXT_FAILURE_CODES:
                         terminal_status = "failed"
                         terminal_failure_reason = final_text
                 elif event_type == "debug" and parsed.get("stage") == "agent_start" and isinstance(parsed.get("context_token_estimate"), int):
