@@ -39,6 +39,7 @@ knowledge_base/documents/
 knowledge_base/index/
 knowledge_base/manifests/
 knowledge_base/models/
+knowledge_base/faiss/
 knowledge_base/qdrant/
 knowledge_base/reports/
 snake-game/

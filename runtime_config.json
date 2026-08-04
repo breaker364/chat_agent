@@ -29,6 +29,8 @@
     "model_cache_path": "knowledge_base/models",
     "vector_backend": "qdrant",
     "qdrant_collection": "knowledge_chunks",
+    "faiss_enabled": true,
+    "faiss_candidate_multiplier": 4,
     "embedding_provider": "huggingface_local",
     "embedding_model": "bge-m3",
     "embedding_dimension": 1024,

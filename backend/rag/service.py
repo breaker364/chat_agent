@@ -244,6 +244,9 @@ class PersonalKnowledgeBase:
         reranker_model = str(
             getattr(self.reranker_provider, "model_id", "") or self.config.reranker.model or ""
         )
+        vector_accelerator = str(
+            getattr(self.vector_store, "vector_accelerator", "none") or "none"
+        )
         return {
             "retrieval_profile": self.retrieval_profile,
             "embedding_provider": self.config.embedding_provider,
@@ -253,6 +256,11 @@ class PersonalKnowledgeBase:
             "vector_backend": self.config.vector_backend,
             "vector_collection": self.config.qdrant_collection,
             "vector_backend_active": bool(vector_active),
+            "vector_accelerator": vector_accelerator,
+            "vector_accelerator_enabled": bool(getattr(self.config, "faiss_enabled", False)),
+            "vector_accelerator_active": bool(
+                vector_accelerator != "none" and getattr(self.vector_store, "faiss_active", False)
+            ),
             "sparse_backend": self.config.sparse_backend,
             "bm25_k1": round(float(self.config.bm25.k1), 6),
             "bm25_b": round(float(self.config.bm25.b), 6),

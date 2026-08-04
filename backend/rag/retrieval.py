@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from .chunking import tokenize
+from .faiss_index import FaissIndexError, FaissRecord, FaissVectorIndex
 
 try:
     import torch
@@ -291,6 +292,9 @@ class QdrantVectorStore:
         collection_name: str,
         vector_size: int,
         client: Any | None = None,
+        faiss_path: str | Path | None = None,
+        faiss_enabled: bool = False,
+        faiss_candidate_multiplier: int = 4,
     ) -> None:
         if QdrantClient is None or qdrant_models is None:
             raise BackendUnavailableError("qdrant-client is required for the configured Qdrant vector backend.")
@@ -308,6 +312,113 @@ class QdrantVectorStore:
         except Exception as exc:
             raise BackendUnavailableError(f"Unable to open Qdrant storage at {self.path}: {exc}") from exc
         self._ensure_collection()
+        self.faiss_index: FaissVectorIndex | None = None
+        self._faiss_error: BaseException | None = None
+        if faiss_enabled:
+            self._initialize_faiss(
+                path=faiss_path or (self.path.parent / "faiss"),
+                candidate_multiplier=faiss_candidate_multiplier,
+            )
+
+    @property
+    def faiss_active(self) -> bool:
+        return bool(self.faiss_index is not None and not self.faiss_index.needs_rebuild)
+
+    @property
+    def vector_accelerator(self) -> str:
+        return "faiss" if self.faiss_active else "none"
+
+    def _initialize_faiss(self, *, path: str | Path, candidate_multiplier: int) -> None:
+        try:
+            index = FaissVectorIndex(
+                path=path,
+                vector_size=self.vector_size,
+                candidate_multiplier=candidate_multiplier,
+            )
+            count = self._qdrant_point_count()
+            if index.needs_rebuild or index.ntotal != count:
+                records = self._qdrant_records()
+                if len(records) != count:
+                    raise FaissIndexError(
+                        "Qdrant point count does not match rebuildable FAISS records: "
+                        f"points={count}, records={len(records)}"
+                    )
+                index.rebuild(records)
+            if index.ntotal != count:
+                raise FaissIndexError(
+                    "FAISS rebuild did not reproduce the Qdrant point count: "
+                    f"points={count}, indexed={index.ntotal}"
+                )
+            self.faiss_index = index
+        except FaissIndexError as exc:
+            self._faiss_error = exc
+        except Exception as exc:
+            self._faiss_error = BackendUnavailableError(f"Unable to initialize FAISS acceleration: {exc}")
+
+    def _qdrant_point_count(self) -> int:
+        response = self.client.count(
+            collection_name=self.collection_name,
+            count_filter=None,
+            exact=True,
+        )
+        return int(getattr(response, "count", 0) or 0)
+
+    def _qdrant_records(self) -> list[FaissRecord]:
+        records: list[FaissRecord] = []
+        offset: Any | None = None
+        while True:
+            scroll_kwargs = {
+                "collection_name": self.collection_name,
+                "scroll_filter": None,
+                "limit": 10000,
+                "with_payload": True,
+                "with_vectors": True,
+            }
+            if offset is not None:
+                scroll_kwargs["offset"] = offset
+            points, next_offset = self.client.scroll(**scroll_kwargs)
+            for point in points:
+                payload = dict(getattr(point, "payload", None) or {})
+                chunk_id = str(payload.get("chunk_id") or "")
+                if not chunk_id:
+                    continue
+                vector = getattr(point, "vector", None)
+                if isinstance(vector, dict):
+                    vector = next(iter(vector.values()), None)
+                if not isinstance(vector, (list, tuple)):
+                    continue
+                records.append(
+                    FaissRecord(
+                        chunk_id=chunk_id,
+                        doc_id=str(payload.get("doc_id") or ""),
+                        collection=str(payload.get("collection") or ""),
+                        vector=list(vector),
+                        payload=payload,
+                    )
+                )
+            if next_offset is None:
+                break
+            if next_offset == offset:
+                raise BackendUnavailableError("Qdrant scroll did not advance while rebuilding FAISS")
+            offset = next_offset
+        return records
+
+    @staticmethod
+    def _faiss_records(records: Sequence[VectorRecord]) -> list[FaissRecord]:
+        return [
+            FaissRecord(
+                chunk_id=record.chunk_id,
+                doc_id=record.doc_id,
+                collection=record.collection,
+                vector=list(record.vector),
+                payload=dict(record.payload),
+            )
+            for record in records
+        ]
+
+    def _disable_faiss(self, error: BaseException) -> None:
+        self._faiss_error = error
+        self.faiss_index = None
 
     def _ensure_collection(self) -> None:
         try:
@@ -411,6 +522,11 @@ class QdrantVectorStore:
             self.client.upsert(collection_name=self.collection_name, points=points, wait=True)
         except Exception as exc:
             raise BackendUnavailableError(f"Unable to upsert Qdrant vectors: {exc}") from exc
+        if self.faiss_index is not None:
+            try:
+                self.faiss_index.upsert(self._faiss_records(records))
+            except Exception as exc:
+                self._disable_faiss(exc)
 
     def refresh(self, doc_id: str, records: Sequence[VectorRecord]) -> None:
         """Replace one document's points after all replacement vectors are ready."""
@@ -469,6 +585,26 @@ class QdrantVectorStore:
             raise VectorDimensionMismatchError(
                 f"Query vector dimension mismatch: configured={self.vector_size}, observed={len(query_vector)}"
             )
+        if self.faiss_active:
+            try:
+                hits = self.faiss_index.search(
+                    query_vector,
+                    limit=max(0, int(limit)),
+                    collection=collection,
+                    filters=filters,
+                )
+                return [
+                    VectorSearchHit(
+                        chunk_id=hit.chunk_id,
+                        doc_id=hit.doc_id,
+                        collection=hit.collection,
+                        score=hit.score,
+                        payload=hit.payload,
+                    )
+                    for hit in hits
+                ]
+            except Exception as exc:
+                self._disable_faiss(exc)
         try:
             response = self.client.query_points(
                 collection_name=self.collection_name,
@@ -508,6 +644,11 @@ class QdrantVectorStore:
                 )
             except Exception as exc:
                 raise BackendUnavailableError(f"Unable to delete Qdrant chunk vectors: {exc}") from exc
+        if self.faiss_index is not None:
+            try:
+                self.faiss_index.delete_chunks(chunk_ids)
+            except Exception as exc:
+                self._disable_faiss(exc)
 
     def delete_document(self, doc_id: str) -> None:
         if not doc_id:
@@ -521,6 +662,11 @@ class QdrantVectorStore:
             )
         except Exception as exc:
             raise BackendUnavailableError(f"Unable to delete Qdrant document vectors: {exc}") from exc
+        if self.faiss_index is not None:
+            try:
+                self.faiss_index.delete_document(doc_id)
+            except Exception as exc:
+                self._disable_faiss(exc)
 
     def document_exists(self, doc_id: str) -> bool:
         query_filter = self._filter(None, {"doc_id": doc_id})
@@ -533,6 +679,11 @@ class QdrantVectorStore:
         except Exception as exc:
             raise BackendUnavailableError(f"Unable to count Qdrant document vectors: {exc}") from exc
         return int(getattr(count, "count", 0)) > 0
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 def build_embedding_provider(config: Any) -> EmbeddingProvider | None:
@@ -573,7 +724,13 @@ def build_vector_store(config: Any) -> QdrantVectorStore | None:
         return None
     if int(config.embedding_dimension) <= 0:
         raise VectorDimensionMismatchError("embedding_dimension must be positive for Qdrant")
-    key = (str(Path(config.qdrant_path).resolve()), str(config.qdrant_collection))
+    key = (
+        str(Path(config.qdrant_path).resolve()),
+        str(config.qdrant_collection),
+        str(Path(config.faiss_path).resolve()),
+        bool(config.faiss_enabled),
+        int(config.faiss_candidate_multiplier),
+    )
     with _CACHE_LOCK:
         store = _VECTOR_STORE_CACHE.get(key)
         if store is not None and store.vector_size != int(config.embedding_dimension):
@@ -586,6 +743,9 @@ def build_vector_store(config: Any) -> QdrantVectorStore | None:
                 path=config.qdrant_path,
                 collection_name=config.qdrant_collection,
                 vector_size=int(config.embedding_dimension),
+                faiss_path=config.faiss_path,
+                faiss_enabled=bool(config.faiss_enabled),
+                faiss_candidate_multiplier=int(config.faiss_candidate_multiplier),
             )
             _VECTOR_STORE_CACHE[key] = store
         return store

@@ -4,6 +4,8 @@ This project uses a local production retrieval profile with:
 
 - BGE-M3 embeddings through the local Transformers runtime.
 - A persistent Qdrant collection at `knowledge_base/qdrant`.
+- A persistent FAISS `IndexFlatIP` accelerator at `knowledge_base/faiss` for
+  normalized dense-vector queries.
 - BM25 sparse retrieval for exact identifiers, filenames, dates, and numeric values.
 - Dense retrieval from Qdrant, fused with BM25 by Reciprocal Rank Fusion (RRF).
 - BGE reranking through the local Transformers sequence-classification runtime.
@@ -21,6 +23,8 @@ The effective production configuration is in `runtime_config.json`:
     "embedding_dimension": 1024,
     "vector_backend": "qdrant",
     "qdrant_collection": "knowledge_chunks",
+    "faiss_enabled": true,
+    "faiss_candidate_multiplier": 4,
     "sparse_backend": "bm25",
     "bm25": {
       "k1": 1.2,
@@ -50,8 +54,8 @@ Use the registered `knowledge_download_models` tool, or the model asset helper,
 to populate the configured cache. The download result validates that weight
 files exist and writes `knowledge_base/models/manifest.json`.
 
-The runtime requires `torch`, `transformers`, `huggingface_hub`, and
-`qdrant-client`. `sentence-transformers` is not required: the embedding
+The runtime requires `torch`, `transformers`, `huggingface_hub`,
+`qdrant-client`, `faiss-cpu`, and `numpy`. `sentence-transformers` is not required: the embedding
 adapter performs masked mean pooling and L2 normalization directly with
 Transformers.
 
@@ -85,11 +89,12 @@ counts, the active providers, candidate settings, and bounded latency.
 ```text
 document chunks
   -> BGE-M3 embedding
-  -> Qdrant upsert
+  -> Qdrant upsert (source of truth)
+  -> FAISS index update (dense query accelerator)
 
 query
   -> BM25 sparse candidates
-  -> BGE-M3 query embedding -> Qdrant dense candidates
+  -> BGE-M3 query embedding -> FAISS dense candidates
   -> RRF fusion of sparse and dense ranks
   -> BGE reranker
   -> adjacent context expansion
@@ -104,7 +109,14 @@ document-length normalization. `k1` controls term-frequency saturation and
 snippets and citations, never raw vectors or full source documents.
 
 Collection and metadata filters are applied to both candidate paths. The
-Qdrant payload contains identifiers and source metadata only; chunk text stays
+FAISS metadata sidecar mirrors identifiers and source metadata only; chunk text
+stays in the local chunk index used to build bounded citations. Qdrant remains
+the durable vector source of truth. If FAISS is unavailable or its index is
+stale/corrupt, it is rebuilt from Qdrant; if initialization or an update fails,
+dense search falls back to Qdrant and response settings mark the accelerator
+inactive.
+
+The Qdrant payload contains identifiers and source metadata only; chunk text stays
 in the local chunk index used to build bounded citations.
 
 ## Failure Behavior

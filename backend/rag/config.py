@@ -106,6 +106,8 @@ class RagConfig:
     embedding_dimension: int = 0
     model_cache_path: Path = field(default_factory=lambda: resolve_runtime_path(None, "knowledge_base/models"))
     qdrant_collection: str = "knowledge_chunks"
+    faiss_enabled: bool = False
+    faiss_candidate_multiplier: int = 4
     embedding_batch_size: int = 8
     reranker_batch_size: int = 8
     max_sequence_length: int = 8192
@@ -135,6 +137,10 @@ class RagConfig:
     @property
     def qdrant_path(self) -> Path:
         return self.knowledge_store_path / "qdrant"
+
+    @property
+    def faiss_path(self) -> Path:
+        return self.knowledge_store_path / "faiss"
 
     def retrieval_signature(self) -> str:
         return (
@@ -192,6 +198,20 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
     qdrant_collection = str(
         data.get("qdrant_collection", get_runtime_value("rag", "qdrant_collection", "knowledge_chunks"))
         or "knowledge_chunks"
+    )
+    faiss_enabled = _as_bool(
+        data.get("faiss_enabled", get_runtime_value("rag", "faiss_enabled", False)),
+        False,
+    )
+    faiss_candidate_multiplier = max(
+        1,
+        _as_int(
+            data.get(
+                "faiss_candidate_multiplier",
+                get_runtime_value("rag", "faiss_candidate_multiplier", 4),
+            ),
+            4,
+        ),
     )
     embedding_batch_size = _as_int(
         data.get("embedding_batch_size", get_runtime_value("rag", "embedding_batch_size", 8)),
@@ -338,6 +358,7 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
         embedding_model = ""
         embedding_dimension = 0
         vector_backend = "in_memory"
+        faiss_enabled = False
         sparse_backend = "in_memory_bm25"
         reranker = RerankerConfig(
             enabled=deterministic_reranker_enabled,
@@ -363,6 +384,8 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
             else knowledge_store_path / "models"
         ),
         qdrant_collection=qdrant_collection,
+        faiss_enabled=faiss_enabled,
+        faiss_candidate_multiplier=faiss_candidate_multiplier,
         embedding_batch_size=max(1, embedding_batch_size),
         reranker_batch_size=max(1, reranker_batch_size),
         max_sequence_length=max(1, max_sequence_length),
