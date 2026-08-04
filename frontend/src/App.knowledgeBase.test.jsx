@@ -162,7 +162,7 @@ describe("App knowledge base controls", () => {
     expect(screen.getByRole("button", { name: /init qr/i })).toBeTruthy();
   });
 
-  it("sends knowledge_mode when the user enables knowledge-base answering", async () => {
+  it("sends the default auto knowledge policy on chat requests", async () => {
     const calls = [];
     renderWithFetch(async (url, options = {}) => {
       calls.push({ url: String(url), method: options.method || "GET", body: options.body });
@@ -176,13 +176,71 @@ describe("App knowledge base controls", () => {
     });
 
     const textarea = await screen.findByPlaceholderText(/send a message/i);
-    fireEvent.click(screen.getByLabelText(/use knowledge base/i));
     fireEvent.change(textarea, { target: { value: "What does my knowledge base say?" } });
     fireEvent.click(screen.getByTitle("Send message"));
 
     await waitFor(() => expect(calls.some((call) => call.url === "/chat/stream")).toBe(true));
     const chatCall = calls.find((call) => call.url === "/chat/stream");
-    expect(JSON.parse(chatCall.body).knowledge_mode).toBe(true);
+    expect(JSON.parse(chatCall.body).knowledge_policy).toBe("auto");
+    expect(JSON.parse(chatCall.body).knowledge_mode).toBeUndefined();
+  });
+
+  it("switches among auto, required, and disabled knowledge policies", async () => {
+    renderWithFetch(async (url) => {
+      if (url === "/feishu/session") return jsonResponse({ logged_in: false, has_session: false, metadata: {} });
+      if (url === "/sessions") return jsonResponse({ sessions: [] });
+      if (url === "/knowledge/documents") return jsonResponse({ documents: [] });
+      return jsonResponse({ error: "unexpected request" }, { status: 404 });
+    });
+
+    expect((await screen.findByRole("radio", { name: /auto/i })).checked).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: /required/i }));
+    expect(screen.getByRole("radio", { name: /required/i }).checked).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: /disabled/i }));
+    expect(screen.getByRole("radio", { name: /disabled/i }).checked).toBe(true);
+  });
+
+  it("renders bounded research provenance and validation errors from SSE", async () => {
+    const calls = [];
+    renderWithFetch(async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      if (url === "/feishu/session") return jsonResponse({ logged_in: false, has_session: false, metadata: {} });
+      if (url === "/sessions") return jsonResponse({ sessions: [] });
+      if (url === "/knowledge/documents") return jsonResponse({ documents: [] });
+      if (url === "/chat/stream") {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(
+              `event: research\ndata: ${JSON.stringify({
+                policy: "auto",
+                outcome: "evidence_gap",
+                sources_attempted: ["personal_knowledge", "workspace", "web"],
+                attempts: { personal_knowledge: 1, workspace: 1, web: 1 },
+                budget: { route_transitions_used: 2, route_transitions_limit: 3 },
+                citation_counts: { personal_knowledge: 0, workspace: 0, web: 0 },
+                planner_reasoning: "must not be rendered",
+              })}\n\n`
+            ));
+            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ code: "invalid_request", message: "Choose a valid policy." })}\n\n`));
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      return jsonResponse({ error: "unexpected request" }, { status: 404 });
+    });
+
+    const textarea = await screen.findByPlaceholderText(/send a message/i);
+    fireEvent.change(textarea, { target: { value: "Question" } });
+    fireEvent.click(screen.getByTitle("Send message"));
+
+    await waitFor(() => expect(screen.getByText(/evidence gap/i)).toBeTruthy());
+    expect(screen.getByText(/personal knowledge/i)).toBeTruthy();
+    expect(screen.getByText(/workspace/i)).toBeTruthy();
+    expect(screen.queryByText(/must not be rendered/i)).toBeNull();
+    expect(screen.getAllByText(/choose a valid policy/i).length).toBeGreaterThan(0);
+    expect(calls.some((call) => call.url === "/chat/stream")).toBe(true);
   });
 
   it("renders citations returned by knowledge_search tool results", async () => {

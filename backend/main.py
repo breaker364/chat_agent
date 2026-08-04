@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 import re
 import time
 from pathlib import Path
@@ -15,7 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from .agent import build_agent, stream_agent_events
+from .agent import build_agent, run_agentic_research, stream_agent_events
+from .agentic_research.models import ResearchPolicyError, resolve_knowledge_policy
+from .agentic_research.runtime import build_synthesis_context
 from .config import PROJECT_ROOT, get_runtime_value
 from .session_store import SessionStore, TOOL_EVENT_SCHEMA_VERSION
 from .session_events import get_session_event_hub
@@ -46,6 +49,7 @@ from .skills import (
 )
 
 app = FastAPI(title="Chat Agent", docs_url="/docs")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -217,14 +221,63 @@ def _project_knowledge_base():
     )
 
 
-def _knowledge_mode_message(message: str, enabled: bool) -> str:
-    if not enabled:
-        return message
-    return (
-        f"{message}\n\n"
-        "Use the personal knowledge base for this answer. Call knowledge_search before answering, "
-        "ground factual claims in retrieved chunks, and include personal knowledge citations. "
-        "If the knowledge base does not contain enough evidence, say so."
+def _resolve_chat_knowledge_policy(body: Any) -> tuple[str | None, dict[str, Any] | None]:
+    if not isinstance(body, dict):
+        return None, {
+            "error": {
+                "code": "invalid_request",
+                "message": "JSON object body is required.",
+            }
+        }
+    knowledge_mode = body.get("knowledge_mode") if "knowledge_mode" in body else None
+    try:
+        policy = resolve_knowledge_policy(
+            knowledge_policy=body.get("knowledge_policy"),
+            knowledge_mode=knowledge_mode,
+        )
+    except ResearchPolicyError as exc:
+        return None, {
+            "error": {
+                "code": "invalid_request",
+                "message": str(exc),
+            }
+        }
+    return policy, None
+
+
+def _research_trace_payload(result: Any) -> dict[str, Any] | None:
+    trace = getattr(result, "trace", None)
+    to_dict = getattr(trace, "to_dict", None)
+    return to_dict() if callable(to_dict) else None
+
+
+def _log_research_completion(trace: dict[str, Any], duration_seconds: float) -> None:
+    logger.info(
+        "agentic_research policy=%s outcome=%s sources=%s attempts=%s budget=%s duration_seconds=%.3f",
+        trace.get("policy"),
+        trace.get("outcome"),
+        trace.get("sources_attempted", []),
+        trace.get("attempts", {}),
+        trace.get("budget", {}),
+        duration_seconds,
+    )
+
+
+def _stream_with_research_context(
+    agent: Any,
+    message: str,
+    session_id: str,
+    history: list[dict[str, Any]],
+    synthesis_context: str,
+) -> Any:
+    if not synthesis_context:
+        return stream_agent_events(agent, message, session_id, history)
+    return stream_agent_events(
+        agent,
+        message,
+        session_id,
+        history,
+        synthesis_context=synthesis_context,
     )
 
 
@@ -1284,10 +1337,18 @@ async def append_to_current_run(session_id: str, request: Request) -> JSONRespon
 @app.post("/chat/stream")
 async def chat_stream(request: Request) -> EventSourceResponse:
     body = await request.json()
+    policy, validation_error = _resolve_chat_knowledge_policy(body)
+    if validation_error is not None:
+        return EventSourceResponse([
+            {"event": "error", "data": json.dumps(validation_error["error"], ensure_ascii=False)}
+        ])
+    assert isinstance(body, dict)
+    assert policy is not None
     message = body.get("message", "")
+    if not isinstance(message, str):
+        message = ""
     session_id = str(body.get("session_id", "default")).strip() or "default"
     history = body.get("history", None)
-    agent_message = _knowledge_mode_message(message, bool(body.get("knowledge_mode", False)))
 
     if not message.strip():
         return EventSourceResponse([{"event": "error", "data": "Message cannot be empty"}])
@@ -1344,7 +1405,61 @@ async def chat_stream(request: Request) -> EventSourceResponse:
         event_hub = get_session_event_hub()
         event_queue = event_hub.subscribe(session["session_id"])
         try:
-            agent_iter = stream_agent_events(agent, agent_message, session["session_id"], merged_history).__aiter__()
+            research_result = None
+            research_context = ""
+            research_started_at = time.monotonic()
+            try:
+                research_result = await asyncio.to_thread(
+                    run_agentic_research,
+                    agent,
+                    message,
+                    knowledge_policy=policy,
+                )
+            except Exception:
+                research_result = None
+            research_trace = _research_trace_payload(research_result)
+            if research_trace is not None:
+                research_duration_seconds = round(time.monotonic() - research_started_at, 3)
+                _log_research_completion(research_trace, research_duration_seconds)
+                research_context = build_synthesis_context(research_result)
+                research_event = {
+                    "event": "research",
+                    "data": json.dumps(research_trace, ensure_ascii=False),
+                }
+                yield _with_run_attribution(
+                    research_event,
+                    research_trace,
+                    session["session_id"],
+                    run_id,
+                )
+                research_debug = {
+                    "event": "debug",
+                    "data": json.dumps(
+                        {
+                            "stage": "agentic_research_completed",
+                            "message": "Bounded evidence route completed.",
+                            "outcome": research_trace.get("outcome"),
+                            "sources_attempted": research_trace.get("sources_attempted", []),
+                            "attempts": research_trace.get("attempts", {}),
+                            "budget": research_trace.get("budget", {}),
+                            "duration_seconds": research_duration_seconds,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                yield _with_run_attribution(
+                    research_debug,
+                    json.loads(research_debug["data"]),
+                    session["session_id"],
+                    run_id,
+                )
+            agent_iter = _stream_with_research_context(
+                agent,
+                message,
+                session["session_id"],
+                merged_history,
+                research_context,
+            ).__aiter__()
             pending_agent = asyncio.create_task(agent_iter.__anext__())
             pending_subagent = asyncio.create_task(event_queue.get())
 
@@ -1554,10 +1669,16 @@ async def chat_stream(request: Request) -> EventSourceResponse:
 @app.post("/chat")
 async def chat_sync(request: Request) -> JSONResponse:
     body = await request.json()
+    policy, validation_error = _resolve_chat_knowledge_policy(body)
+    if validation_error is not None:
+        return JSONResponse(validation_error, status_code=400)
+    assert isinstance(body, dict)
+    assert policy is not None
     message = body.get("message", "")
+    if not isinstance(message, str):
+        message = ""
     session_id = str(body.get("session_id", "default")).strip() or "default"
     history = body.get("history", None)
-    agent_message = _knowledge_mode_message(message, bool(body.get("knowledge_mode", False)))
 
     if not message.strip():
         return JSONResponse({"error": "Message cannot be empty"}, status_code=400)
@@ -1591,6 +1712,20 @@ async def chat_sync(request: Request) -> JSONResponse:
         )
 
         agent = await get_agent()
+        research_started_at = time.monotonic()
+        try:
+            research_result = await asyncio.to_thread(
+                run_agentic_research,
+                agent,
+                message,
+                knowledge_policy=policy,
+            )
+        except Exception:
+            research_result = None
+        research_context = build_synthesis_context(research_result) if research_result is not None else ""
+        research_trace = _research_trace_payload(research_result)
+        if research_trace is not None:
+            _log_research_completion(research_trace, round(time.monotonic() - research_started_at, 3))
         final_text = ""
         tools: list[dict[str, Any]] = []
         pending_tool_ids: dict[str, list[str]] = {}
@@ -1599,7 +1734,13 @@ async def chat_sync(request: Request) -> JSONResponse:
         terminal_failure_reason = ""
         context_tokens = bind_runtime_context(session["session_id"], run_id)
         try:
-            async for event in stream_agent_events(agent, agent_message, session["session_id"], merged_history):
+            async for event in _stream_with_research_context(
+                agent,
+                message,
+                session["session_id"],
+                merged_history,
+                research_context,
+            ):
                 event_type = event["event"]
                 try:
                     parsed = json.loads(event["data"])
@@ -1673,7 +1814,14 @@ async def chat_sync(request: Request) -> JSONResponse:
             last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
             usage=final_usage,
         )
-        return JSONResponse({"reply": final_text, "session_id": session["session_id"], "usage": final_usage})
+        payload: dict[str, Any] = {
+            "reply": final_text,
+            "session_id": session["session_id"],
+            "usage": final_usage,
+        }
+        if research_trace is not None:
+            payload["research"] = research_trace
+        return JSONResponse(payload)
     finally:
         try:
             _finalize_unapplied_append_commands(store, session["session_id"], run_id)

@@ -60,6 +60,18 @@
       "max_retries": 1,
       "retry_backoff_seconds": 0.2
     },
+    "agentic_research": {
+      "enabled": true,
+      "max_route_transitions": 3,
+      "source_call_limits": {
+        "personal_knowledge": 1,
+        "workspace": 2,
+        "web": 2
+      },
+      "deadline_seconds": 30,
+      "result_limit": 8,
+      "excerpt_char_limit": 1200
+    },
     "final_top_k": 8
   },
   "checkers_game": {

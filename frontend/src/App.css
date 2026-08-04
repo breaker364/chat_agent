@@ -1,6 +1,6 @@
 /* ============================================================
    Chat Agent — "Soft Horizon"
-   Nio-inspired light soft theme
+   Light soft theme
    ============================================================ */
 
 /* ----- Reset ----- */
@@ -31,7 +31,7 @@
   --text-secondary: #7d7970;
   --text-tertiary: #b0aca4;
 
-  /* Accent — softened Nio blue */
+  /* Accent — softened blue */
   --accent: #0088c0;
   --accent-hover: #009cd8;
   --accent-subtle: rgba(0, 136, 192, 0.07);
@@ -415,22 +415,47 @@ body.is-resizing-columns * {
   color: var(--text-secondary);
 }
 
-.knowledge-mode-toggle {
+.knowledge-policy-control {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface-2);
+  overflow: hidden;
+}
+
+.knowledge-policy-option {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  min-height: 28px;
+  padding: 0 8px;
+  border-right: 1px solid var(--border-light);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 600;
   cursor: pointer;
   user-select: none;
 }
 
-.knowledge-mode-toggle input {
-  accent-color: var(--accent);
+.knowledge-policy-option:last-child {
+  border-right: none;
 }
 
-.knowledge-mode-toggle span {
-  white-space: nowrap;
+.knowledge-policy-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.knowledge-policy-option.active {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.knowledge-policy-option:focus-within {
+  outline: 2px solid var(--border-accent);
+  outline-offset: -2px;
 }
 
 .knowledge-panel-header-right,
@@ -1492,6 +1517,63 @@ body.is-resizing-columns * {
   line-height: 1.45;
 }
 
+.research-provenance {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-light);
+  padding-top: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.research-provenance-header,
+.research-source-list,
+.research-provenance-meta,
+.research-provenance-limit {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.research-provenance-header {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.research-provenance-header strong {
+  color: var(--text);
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.research-source-list {
+  margin-top: 7px;
+  flex-wrap: wrap;
+}
+
+.research-source-tag {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-2);
+  padding: 2px 6px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.research-provenance-meta {
+  margin-top: 7px;
+  color: var(--text-tertiary);
+}
+
+.research-provenance-limit {
+  margin-top: 7px;
+  color: var(--warning);
+  line-height: 1.4;
+}
+
+.research-provenance-limit svg {
+  flex-shrink: 0;
+}
+
 /* Lists */
 .message-content ul,
 .message-content ol {
@@ -2439,10 +2521,6 @@ input:focus-visible {
 
   .knowledge-panel-header-right {
     gap: 6px;
-  }
-
-  .knowledge-mode-toggle span {
-    display: none;
   }
 
   .feishu-import-overlay {

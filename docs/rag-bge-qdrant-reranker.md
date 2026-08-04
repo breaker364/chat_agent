@@ -198,6 +198,99 @@ Responses and tool results are bounded: they include status, identity,
 metadata, counts, settings, and structured errors, but not document bodies,
 provider payloads, cookies, or vectors.
 
+## Agentic evidence orchestration
+
+Chat requests can use the bounded agentic-research coordinator before the
+normal ReAct agent writes its answer. It decides whether a request needs
+evidence, selects an allowed read-only source, evaluates the result, and may
+make one bounded refinement or source transition. It does not replace the RAG
+retrieval stack described above.
+
+The chat API and the knowledge panel use `knowledge_policy`:
+
+| Policy | Behavior |
+| --- | --- |
+| `auto` | The planner may answer directly or select personal knowledge, workspace files, web evidence, or a bounded combination. This is the default. |
+| `required` | The first and only automatic evidence route is personal knowledge. An insufficient result returns an evidence gap instead of silently searching elsewhere. |
+| `disabled` | Personal knowledge is excluded; the planner may still use an eligible workspace or web route when evidence is needed. |
+
+For existing clients, `knowledge_mode: true` is equivalent to `required` and
+an omitted or false `knowledge_mode` is equivalent to `auto`. A contradictory
+legacy and new policy request is rejected as `invalid_request` before an
+agent or evidence tool runs.
+
+Only these read-only source classes are available to the coordinator:
+
+- `personal_knowledge` uses the existing hybrid `knowledge_search` tool and
+  therefore the BGE-M3, Qdrant, FAISS, BM25, and reranker configuration.
+- `workspace` is constrained to the configured workspace root and uses the
+  existing file-reading contract.
+- `web` uses the existing search/fetch contract for public evidence.
+
+Import, sync, download, login, write, delete, and configuration tools are not
+registered as evidence sources. The source selector is generic: it contains
+no entity, brand, domain, or keyword-to-source mappings.
+
+### Provenance and privacy
+
+When the coordinator is enabled, `POST /chat` returns a bounded `research`
+object and `/chat/stream` emits a `research` SSE event. It contains only:
+
+```json
+{
+  "policy": "auto",
+  "outcome": "answer_ready",
+  "sources_attempted": ["personal_knowledge", "web"],
+  "attempts": {"personal_knowledge": 1, "web": 1},
+  "budget": {"route_transitions_used": 2, "route_transitions_limit": 3},
+  "citation_counts": {"personal_knowledge": 2, "web": 2}
+}
+```
+
+The UI shows source-class labels, the terminal result, and the budget summary.
+It does not show planner reasoning. API traces and logs exclude document
+bodies, raw tool payloads, vector values, embeddings, cookies, authorization
+values, provider secrets, and nested credential fields. Retrieved text is
+treated as untrusted reference material and cannot change the policy, budget,
+or registered tools.
+
+An `evidence_gap` or `report_conflict` outcome means the allowed routes did
+not establish sufficient evidence. The final answer is instructed to state
+that limitation rather than fabricate a cited factual conclusion. For a
+`required` request, either import/synchronize the needed personal material or
+choose `auto` only when supplemental sources are acceptable.
+
+### Configuration and troubleshooting
+
+The coordinator is configured under `rag.agentic_research` in
+`runtime_config.json`:
+
+```json
+{
+  "rag": {
+    "agentic_research": {
+      "enabled": true,
+      "max_route_transitions": 3,
+      "source_call_limits": {
+        "personal_knowledge": 1,
+        "workspace": 2,
+        "web": 2
+      },
+      "deadline_seconds": 30,
+      "result_limit": 8,
+      "excerpt_char_limit": 1200
+    }
+  }
+}
+```
+
+Set `enabled` to `false` to leave existing chat behavior unchanged and omit
+agentic trace events. The configuration accepts only these bounded controls;
+credentials and provider secrets are rejected. If a route ends early, inspect
+the safe research summary for the attempted source class and budget usage,
+then verify the corresponding knowledge index, workspace path, or web service
+outside the coordinator.
+
 ## Deterministic Test Profile
 
 Unit and compatibility tests may use the explicit deterministic profile:

@@ -14,6 +14,12 @@ from langchain_core.runnables import Runnable
 from langgraph.prebuilt import create_react_agent
 
 from .config import create_chat_deepseek, load_context_compaction_config, load_llm_config
+from .agentic_research.config import load_agentic_research_config
+from .agentic_research.runtime import (
+    EVIDENCE_TOOL_NAMES,
+    AgenticResearchRuntime,
+    build_agentic_research_runtime,
+)
 from .context_compaction import (
     ContextCompactionError,
     build_compaction_cache,
@@ -844,13 +850,45 @@ async def build_agent(
     cfg = load_llm_config(config_path)
     llm = wrap_chat_model_with_append_injection(create_chat_deepseek(cfg))
     tools = await get_all_tools(workspace_dir=workspace_dir)
-    agent = create_react_agent(
+    workspace = Path(workspace_dir or Path.cwd()).resolve()
+    research_runtime = build_agentic_research_runtime(
         model=llm,
         tools=tools,
+        workspace_root=workspace,
+        config=load_agentic_research_config(),
+    )
+    agent = create_react_agent(
+        model=llm,
+        tools=_react_tools_for_runtime(tools, research_runtime),
         state_schema=None,
     )
     agent.name = "chat_agent"
+    agent.agentic_research_runtime = research_runtime
     return agent
+
+
+def _react_tools_for_runtime(tools: list[Any], runtime: AgenticResearchRuntime | None) -> list[Any]:
+    """Keep evidence collection bounded without changing non-evidence tool authority."""
+    if runtime is None:
+        return list(tools)
+    return [tool for tool in tools if str(getattr(tool, "name", "")) not in EVIDENCE_TOOL_NAMES]
+
+
+def run_agentic_research(
+    agent: Any,
+    message: str,
+    *,
+    knowledge_policy: str | None = None,
+    knowledge_mode: bool | None = None,
+) -> Any | None:
+    runtime = getattr(agent, "agentic_research_runtime", None)
+    if runtime is None:
+        return None
+    return runtime.run(
+        message,
+        knowledge_policy=knowledge_policy,
+        knowledge_mode=knowledge_mode,
+    )
 
 
 async def stream_agent_events(
@@ -858,6 +896,7 @@ async def stream_agent_events(
     message: str,
     session_id: str = "default",
     history: list[dict[str, str]] | None = None,
+    synthesis_context: str = "",
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Stream agent execution events as dicts suitable for SSE serialization.
 
@@ -1530,6 +1569,8 @@ async def stream_agent_events(
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
     if AGENT_POLICY:
         messages.append(SystemMessage(content=f"Agent behavior policy:\n{AGENT_POLICY}"))
+    if synthesis_context:
+        messages.append(SystemMessage(content=synthesis_context[:24_000]))
     skill_catalog_text = get_skill_catalog_text(Path.cwd())
     if skill_catalog_text:
         messages.append(

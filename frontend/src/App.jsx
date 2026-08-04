@@ -1216,6 +1216,52 @@ function KnowledgeCitations({ tools }) {
   );
 }
 
+function ResearchProvenance({ research }) {
+  if (!research || typeof research !== "object") return null;
+  const outcome = String(research.outcome || "evidence_gap").replaceAll("_", " ");
+  const sources = Array.isArray(research.sources_attempted) ? research.sources_attempted : [];
+  const attempts = research.attempts && typeof research.attempts === "object" ? research.attempts : {};
+  const budget = research.budget && typeof research.budget === "object" ? research.budget : {};
+  const citationCounts = research.citation_counts && typeof research.citation_counts === "object"
+    ? research.citation_counts
+    : {};
+  const citationTotal = Object.values(citationCounts).reduce(
+    (total, value) => total + (typeof value === "number" ? value : 0),
+    0
+  );
+  return (
+    <section className={`research-provenance research-${outcome.replace(/[^a-z0-9]+/gi, "-")}`} aria-label="Research provenance">
+      <div className="research-provenance-header">
+        <Search size={13} />
+        <span>Research</span>
+        <strong>{outcome}</strong>
+      </div>
+      {sources.length ? (
+        <div className="research-source-list">
+          {sources.map((source) => (
+            <span className="research-source-tag" key={source}>
+              {String(source).replaceAll("_", " ")}
+              {attempts[source] != null ? ` · ${attempts[source]}` : ""}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="research-provenance-meta">
+        <span>{citationTotal} citations</span>
+        {budget.route_transitions_limit != null ? (
+          <span>route {budget.route_transitions_used || 0}/{budget.route_transitions_limit}</span>
+        ) : null}
+      </div>
+      {research.outcome !== "answer_ready" ? (
+        <div className="research-provenance-limit">
+          <AlertCircle size={13} />
+          <span>Available evidence is insufficient for a fully grounded answer.</span>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function formatKnowledgeCounts(status) {
   const counts = status?.counts || {};
   const parts = ["indexed", "refreshed", "unchanged", "skipped", "failed", "deleted"]
@@ -1613,12 +1659,12 @@ function KnowledgeCenter({
 
 function KnowledgePanel({
   documents,
-  enabled,
+  knowledgePolicy,
   loading,
   status,
   feishuStatus,
   collapsed,
-  onToggleEnabled,
+  onKnowledgePolicyChange,
   onToggleCollapsed,
   onImportFiles,
   onImportFeishu,
@@ -1653,15 +1699,21 @@ function KnowledgePanel({
           <div className="knowledge-panel-subtitle">{documents.length} documents / {formatKnowledgeCounts(status)}</div>
         </div>
         <div className="knowledge-panel-header-right">
-          <label className="knowledge-mode-toggle">
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(event) => onToggleEnabled(event.target.checked)}
-              disabled={loading}
-            />
-            <span>Use knowledge base</span>
-          </label>
+          <div className="knowledge-policy-control" role="radiogroup" aria-label="Knowledge policy">
+            {["auto", "required", "disabled"].map((policy) => (
+              <label className={`knowledge-policy-option ${knowledgePolicy === policy ? "active" : ""}`} key={policy}>
+                <input
+                  type="radio"
+                  name="knowledge-policy"
+                  value={policy}
+                  checked={knowledgePolicy === policy}
+                  onChange={() => onKnowledgePolicyChange(policy)}
+                  disabled={loading}
+                />
+                <span>{policy}</span>
+              </label>
+            ))}
+          </div>
           <button
             type="button"
             className="knowledge-collapse-btn"
@@ -1760,7 +1812,7 @@ export default function App() {
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isDraggingImages, setIsDraggingImages] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
-  const [knowledgeMode, setKnowledgeMode] = useState(false);
+  const [knowledgePolicy, setKnowledgePolicy] = useState("auto");
   const [knowledgeDocuments, setKnowledgeDocuments] = useState([]);
   const [knowledgeSources, setKnowledgeSources] = useState([]);
   const [knowledgeStatus, setKnowledgeStatus] = useState({ message: "ready" });
@@ -2710,7 +2762,7 @@ export default function App() {
     abortControllersRef.current.set(ensuredSessionId, controller);
     setSessionRuns((prev) => startSessionRun(prev, ensuredSessionId, runId));
 
-    const runState = { assistantContent: "", tools: [], debug: [], activities: [], usage: null };
+    const runState = { assistantContent: "", tools: [], debug: [], activities: [], usage: null, research: null, error: "" };
     const appendVisibleMessage = (message) => {
       if (activeSessionIdRef.current === ensuredSessionId) {
         setMessages((prev) => [...prev, message]);
@@ -2769,6 +2821,8 @@ export default function App() {
       if (eventType === "text") {
         runState.assistantContent += String(parsed);
         setSessionRuns((prev) => appendRunText(prev, ensuredSessionId, String(parsed)));
+      } else if (eventType === "research") {
+        runState.research = parsed && typeof parsed === "object" ? parsed : null;
       } else if (eventType === "progress") {
         pushToolEvent({
           type: "progress",
@@ -2836,6 +2890,7 @@ export default function App() {
           content: parsed?.content ?? parsed,
         });
       } else if (eventType === "error") {
+        runState.error = parsed?.message || String(parsed || "Request failed");
         pushDebugEvent({
           type: "debug",
           message: parsed?.message || "Unknown backend error",
@@ -2869,7 +2924,7 @@ export default function App() {
           message: requestText,
           session_id: ensuredSessionId,
           history: currentHistory,
-          knowledge_mode: knowledgeMode,
+          knowledge_policy: knowledgePolicy,
         }),
         signal: controller.signal,
       });
@@ -2895,10 +2950,11 @@ export default function App() {
 
       appendVisibleMessage({
         role: "assistant",
-        content: runState.assistantContent || "(no text reply)",
+        content: runState.assistantContent || (runState.error ? `Request failed: ${runState.error}` : "(no text reply)"),
         tools: runState.tools,
         activities: runState.activities,
         usage: runState.usage || {},
+        research: runState.research,
       });
       setSessionRuns((prev) => finishSessionRun(prev, ensuredSessionId, "completed", { streamingText: "" }));
       await refreshSessions();
@@ -2909,10 +2965,11 @@ export default function App() {
       if (err.name === "AbortError") {
         appendVisibleMessage({
           role: "assistant",
-          content: runState.assistantContent || "(stopped)",
+          content: runState.assistantContent || (runState.error ? `Request failed: ${runState.error}` : "(stopped)"),
           tools: runState.tools,
           activities: runState.activities,
           usage: runState.usage || {},
+          research: runState.research,
         });
         setSessionRuns((prev) => finishSessionRun(prev, ensuredSessionId, "stopped", { streamingText: "" }));
         await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -2927,6 +2984,7 @@ export default function App() {
           tools: runState.tools,
           activities: runState.activities,
           usage: runState.usage || {},
+          research: runState.research,
         });
         pushDebugEvent({
           type: "debug",
@@ -2949,7 +3007,7 @@ export default function App() {
     input,
     loading,
     pendingFiles,
-    knowledgeMode,
+    knowledgePolicy,
     sessionRuns,
     refreshSessions,
     loadSession,
@@ -3099,12 +3157,12 @@ export default function App() {
         <div className="top-panels">
           <KnowledgePanel
             documents={knowledgeDocuments}
-            enabled={knowledgeMode}
+            knowledgePolicy={knowledgePolicy}
             loading={knowledgeLoading}
             status={knowledgeStatus}
             feishuStatus={feishuStatus}
             collapsed={knowledgePanelCollapsed}
-            onToggleEnabled={setKnowledgeMode}
+            onKnowledgePolicyChange={setKnowledgePolicy}
             onToggleCollapsed={() => setKnowledgePanelCollapsed((prev) => !prev)}
             onImportFiles={importKnowledgeFiles}
             onImportFeishu={importFeishuKnowledge}
@@ -3150,6 +3208,7 @@ export default function App() {
                     <ChatMessageContent content={msg.content} />
                     <MessageTokenUsage role={msg.role} usage={msg.usage} />
                     {msg.role === "assistant" ? <KnowledgeCitations tools={msg.tools} /> : null}
+                    {msg.role === "assistant" ? <ResearchProvenance research={msg.research} /> : null}
                   </div>
                 </div>
                 {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
