@@ -925,6 +925,205 @@ body.is-resizing-columns * {
   font-size: 12px;
 }
 
+.feishu-import-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(44, 43, 39, 0.22);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.feishu-import-dialog {
+  width: min(520px, 94vw);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: 0 18px 60px rgba(44, 43, 39, 0.18);
+  overflow: hidden;
+}
+
+.feishu-import-header,
+.feishu-import-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.feishu-import-header {
+  border-bottom: 1px solid var(--border-light);
+}
+
+.feishu-import-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.feishu-import-title svg {
+  color: var(--accent);
+}
+
+.feishu-import-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.feishu-import-close:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-accent);
+}
+
+.feishu-import-close:disabled,
+.feishu-import-cancel:disabled,
+.feishu-import-submit:disabled,
+.feishu-import-login:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.feishu-import-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+
+.feishu-import-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.feishu-import-field input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface-2);
+  color: var(--text);
+  padding: 9px 10px;
+  font: inherit;
+  font-weight: 400;
+}
+
+.feishu-import-field input:focus {
+  outline: 2px solid var(--border-accent);
+  outline-offset: 1px;
+}
+
+.feishu-import-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.feishu-import-checkbox input {
+  accent-color: var(--accent);
+}
+
+.feishu-import-alert,
+.feishu-import-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid rgba(224, 152, 64, 0.28);
+  border-radius: var(--radius);
+  background: rgba(224, 152, 64, 0.09);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.feishu-import-error {
+  border-color: rgba(217, 79, 79, 0.28);
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
+.feishu-import-alert svg,
+.feishu-import-error svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.feishu-import-login {
+  margin-left: auto;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.feishu-import-footer {
+  justify-content: flex-end;
+  padding: 0;
+}
+
+.feishu-import-cancel,
+.feishu-import-submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+.feishu-import-cancel {
+  border: 1px solid var(--border);
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+}
+
+.feishu-import-submit {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.feishu-import-cancel:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-accent);
+}
+
+.feishu-import-submit:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+
 .feishu-panel-title {
   display: flex;
   align-items: center;
@@ -2244,6 +2443,18 @@ input:focus-visible {
 
   .knowledge-mode-toggle span {
     display: none;
+  }
+
+  .feishu-import-overlay {
+    padding: 12px;
+  }
+
+  .feishu-import-alert {
+    flex-wrap: wrap;
+  }
+
+  .feishu-import-login {
+    margin-left: 23px;
   }
 
   .app-header {

@@ -76,6 +76,23 @@ class RerankerConfig:
 
 
 @dataclass
+class Bm25Config:
+    k1: float = 1.2
+    b: float = 0.75
+
+
+@dataclass
+class RemoteSourceConfig:
+    enabled: bool = True
+    provider: str = "feishu"
+    session_mode: str = "existing_session_store"
+    session_file: str = ""
+    max_content_chars: int = 1_000_000
+    max_retries: int = 1
+    retry_backoff_seconds: float = 0.2
+
+
+@dataclass
 class RagConfig:
     enabled: bool = False
     retrieval_profile: str = "deterministic"
@@ -95,7 +112,9 @@ class RagConfig:
     device: str = "auto"
     chunking: SemanticChunkingConfig = field(default_factory=SemanticChunkingConfig)
     hybrid: HybridRetrievalConfig = field(default_factory=HybridRetrievalConfig)
+    bm25: Bm25Config = field(default_factory=Bm25Config)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    remote_source: RemoteSourceConfig = field(default_factory=RemoteSourceConfig)
 
     @property
     def documents_path(self) -> Path:
@@ -124,6 +143,7 @@ class RagConfig:
             f"vector={self.vector_backend}:{self.qdrant_collection};"
             f"sparse={self.sparse_backend};fusion={self.hybrid.fusion_strategy}:"
             f"{self.hybrid.lexical_candidate_depth}:{self.hybrid.dense_candidate_depth}:{self.hybrid.rrf_k};"
+            f"bm25={self.bm25.k1:.4f}:{self.bm25.b:.4f};"
             f"reranker={self.reranker.enabled}:{self.reranker.provider}:{self.reranker.model}:"
             f"{self.reranker.candidate_top_k}"
         )
@@ -133,7 +153,15 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
     data = dict(overrides or {})
     chunking_data = data.get("chunking") if isinstance(data.get("chunking"), dict) else {}
     hybrid_data = data.get("hybrid") if isinstance(data.get("hybrid"), dict) else {}
+    runtime_bm25_data = get_runtime_value("rag", "bm25", {})
+    if not isinstance(runtime_bm25_data, dict):
+        runtime_bm25_data = {}
+    bm25_data = data.get("bm25") if isinstance(data.get("bm25"), dict) else runtime_bm25_data
     reranker_data = data.get("reranker") if isinstance(data.get("reranker"), dict) else {}
+    runtime_remote_data = get_runtime_value("rag", "remote_source", {})
+    if not isinstance(runtime_remote_data, dict):
+        runtime_remote_data = {}
+    remote_data = data.get("remote_source") if isinstance(data.get("remote_source"), dict) else runtime_remote_data
 
     enabled = _as_bool(data.get("enabled", get_runtime_value("rag", "enabled", False)), False)
     retrieval_profile = str(
@@ -264,6 +292,40 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
             30,
         ),
     )
+    bm25 = Bm25Config(
+        k1=max(
+            0.01,
+            _as_float(
+                bm25_data.get("k1", data.get("bm25_k1", get_runtime_value("rag", "bm25_k1", 1.2))),
+                1.2,
+            ),
+        ),
+        b=min(
+            1.0,
+            max(
+                0.0,
+                _as_float(
+                    bm25_data.get("b", data.get("bm25_b", get_runtime_value("rag", "bm25_b", 0.75))),
+                    0.75,
+                ),
+            ),
+        ),
+    )
+    remote_source = RemoteSourceConfig(
+        enabled=_as_bool(remote_data.get("enabled", True), True),
+        provider=str(remote_data.get("provider", "feishu") or "feishu").strip().lower(),
+        session_mode=str(remote_data.get("session_mode", "existing_session_store") or "existing_session_store").strip(),
+        session_file=str(remote_data.get("session_file", "") or "").strip(),
+        max_content_chars=max(
+            1,
+            _as_int(remote_data.get("max_content_chars", 1_000_000), 1_000_000),
+        ),
+        max_retries=max(0, _as_int(remote_data.get("max_retries", 1), 1)),
+        retry_backoff_seconds=max(
+            0.0,
+            _as_float(remote_data.get("retry_backoff_seconds", 0.2), 0.2),
+        ),
+    )
     if retrieval_profile == "deterministic":
         deterministic_reranker_enabled = (
             reranker.enabled
@@ -307,5 +369,7 @@ def load_rag_config(overrides: dict[str, Any] | None = None) -> RagConfig:
         device=device,
         chunking=chunking,
         hybrid=hybrid,
+        bm25=bm25,
         reranker=reranker,
+        remote_source=remote_source,
     )

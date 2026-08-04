@@ -36,7 +36,11 @@
     "reranker_batch_size": 8,
     "max_sequence_length": 8192,
     "device": "auto",
-    "sparse_backend": "qdrant_sparse_or_bm25",
+    "sparse_backend": "bm25",
+    "bm25": {
+      "k1": 1.2,
+      "b": 0.75
+    },
     "hybrid_fusion": "rrf",
     "lexical_candidate_depth": 30,
     "dense_candidate_depth": 30,
@@ -45,6 +49,15 @@
     "reranker_model": "bge-reranker-v2-m3",
     "reranker_enabled_by_default": true,
     "reranker_candidate_top_k": 50,
+    "remote_source": {
+      "enabled": true,
+      "provider": "feishu",
+      "session_mode": "existing_session_store",
+      "session_file": "",
+      "max_content_chars": 1000000,
+      "max_retries": 1,
+      "retry_backoff_seconds": 0.2
+    },
     "final_top_k": 8
   },
   "checkers_game": {

@@ -26,9 +26,21 @@ class KnowledgeImportFilesInput(BaseModel):
     metadata: dict[str, Any] | None = Field(None, description="Optional generic metadata.")
 
 
+class KnowledgeImportFeishuInput(BaseModel):
+    reference: str = Field(..., description="Feishu document URL or object token.")
+    collection: str = Field("default", description="Knowledge collection name.")
+    refresh: bool = Field(False, description="Force a remote content fetch and re-index.")
+
+
 class KnowledgeSyncInput(BaseModel):
     collection: str | None = Field(None, description="Optional collection to sync.")
     dry_run: bool = Field(False, description="Preview sync without changing indexes.")
+
+
+class KnowledgeSyncFeishuInput(BaseModel):
+    collection: str | None = Field(None, description="Optional collection to synchronize.")
+    doc_ids: list[str] | None = Field(None, description="Optional remote document ids to synchronize.")
+    dry_run: bool = Field(False, description="Preview remote sync without changing indexes.")
 
 
 class KnowledgeSearchInput(BaseModel):
@@ -58,6 +70,7 @@ def build_knowledge_tools(
     *,
     workspace_root: str | Path,
     config_overrides: dict[str, Any] | None = None,
+    remote_provider: Any | None = None,
 ) -> list[Any]:
     config = load_rag_config(config_overrides)
     if not config.enabled:
@@ -67,6 +80,7 @@ def build_knowledge_tools(
             workspace_root=workspace_root,
             store_path=config.knowledge_store_path,
             config=config,
+            remote_provider=remote_provider,
         )
 
     def knowledge_import_files(collection: str, paths: list[str], metadata: dict[str, Any] | None = None) -> str:
@@ -74,6 +88,33 @@ def build_knowledge_tools(
 
     def knowledge_sync(collection: str | None = None, dry_run: bool = False) -> str:
         return json.dumps(knowledge_base().sync(collection=collection, dry_run=dry_run), ensure_ascii=False, indent=2)
+
+    def knowledge_import_feishu_document(
+        reference: str,
+        collection: str = "default",
+        refresh: bool = False,
+    ) -> str:
+        return json.dumps(
+            knowledge_base().import_remote_document(collection, reference, refresh=refresh),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def knowledge_sync_feishu_documents(
+        collection: str | None = None,
+        doc_ids: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> str:
+        return json.dumps(
+            knowledge_base().sync_remote_sources(
+                provider_name=config.remote_source.provider,
+                collection=collection,
+                doc_ids=doc_ids,
+                dry_run=dry_run,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
 
     def knowledge_index_files(collection: str, paths: list[str], refresh: bool = False, metadata: dict[str, Any] | None = None) -> str:
         return json.dumps(knowledge_base().index_files(collection, paths, refresh=refresh, metadata=metadata), ensure_ascii=False, indent=2)
@@ -141,6 +182,18 @@ def build_knowledge_tools(
             name="knowledge_sync",
             description="Synchronize the project knowledge base folder with manifests and retrieval indexes.",
             args_schema=KnowledgeSyncInput,
+        ),
+        StructuredTool.from_function(
+            knowledge_import_feishu_document,
+            name="knowledge_import_feishu_document",
+            description="Import one Feishu document URL or token into a personal knowledge collection.",
+            args_schema=KnowledgeImportFeishuInput,
+        ),
+        StructuredTool.from_function(
+            knowledge_sync_feishu_documents,
+            name="knowledge_sync_feishu_documents",
+            description="Synchronize previously imported Feishu documents and preserve bounded status metadata.",
+            args_schema=KnowledgeSyncFeishuInput,
         ),
         StructuredTool.from_function(
             knowledge_index_files,

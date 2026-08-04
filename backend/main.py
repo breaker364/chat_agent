@@ -228,6 +228,79 @@ def _knowledge_mode_message(message: str, enabled: bool) -> str:
     )
 
 
+_REMOTE_KNOWLEDGE_ERROR_STATUS = {
+    "invalid_reference": 400,
+    "content_invalid": 400,
+    "auth_required": 401,
+    "permission_denied": 403,
+    "not_found": 404,
+    "rate_limited": 429,
+}
+
+
+def _remote_knowledge_error(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    error = result.get("error")
+    if isinstance(error, dict):
+        return error
+    for item in result.get("files", []):
+        if isinstance(item, dict) and isinstance(item.get("error"), dict):
+            return item["error"]
+    return None
+
+
+def _remote_knowledge_status(result: Any, *, dry_run: bool = False) -> int:
+    if dry_run:
+        return 200
+    error = _remote_knowledge_error(result)
+    if not error:
+        return 200
+    code = str(error.get("code") or "").strip().lower()
+    details = error.get("details")
+    if isinstance(details, dict):
+        code = str(details.get("category") or code).strip().lower()
+    return _REMOTE_KNOWLEDGE_ERROR_STATUS.get(code, 503)
+
+
+def _remote_import_request(body: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(body, dict):
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "JSON object body is required."}}
+    reference = body.get("reference")
+    if not isinstance(reference, str) or not reference.strip():
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "reference is required."}}
+    collection = body.get("collection", "default")
+    if not isinstance(collection, str) or not collection.strip():
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "collection must be a non-empty string."}}
+    refresh = body.get("refresh", False)
+    if not isinstance(refresh, bool):
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "refresh must be a boolean."}}
+    return {"reference": reference.strip(), "collection": collection.strip(), "refresh": refresh}, None
+
+
+def _remote_sync_request(body: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "JSON object body is required."}}
+    collection = body.get("collection")
+    if collection is not None and (not isinstance(collection, str) or not collection.strip()):
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "collection must be a non-empty string when provided."}}
+    doc_ids = body.get("doc_ids")
+    if doc_ids is not None:
+        if not isinstance(doc_ids, list) or any(not isinstance(item, str) or not item.strip() for item in doc_ids):
+            return None, {"status": "error", "error": {"code": "invalid_request", "message": "doc_ids must be a list of non-empty strings."}}
+        doc_ids = [item.strip() for item in doc_ids]
+    dry_run = body.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        return None, {"status": "error", "error": {"code": "invalid_request", "message": "dry_run must be a boolean."}}
+    return {
+        "collection": collection.strip() if isinstance(collection, str) else None,
+        "doc_ids": doc_ids,
+        "dry_run": dry_run,
+    }, None
+
+
 @app.get("/knowledge/documents")
 async def list_knowledge_documents(collection: str | None = None) -> JSONResponse:
     kb = _project_knowledge_base()
@@ -303,6 +376,71 @@ async def sync_knowledge_documents(request: Request) -> JSONResponse:
             collection=body.get("collection"),
             dry_run=bool(body.get("dry_run", False)),
         )
+    )
+
+
+@app.post("/knowledge/import/feishu")
+async def import_feishu_knowledge_document(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    payload, validation_error = _remote_import_request(body)
+    if validation_error is not None:
+        return JSONResponse(validation_error, status_code=400)
+    assert payload is not None
+    try:
+        kb = _project_knowledge_base()
+        remote_config = getattr(getattr(kb, "config", None), "remote_source", None)
+        result = kb.import_remote_document(
+            payload["collection"],
+            payload["reference"],
+            refresh=payload["refresh"],
+            provider_name=getattr(remote_config, "provider", None),
+        )
+    except Exception:
+        result = {
+            "status": "error",
+            "operation": "import_remote_document",
+            "error": {
+                "code": "rag_backend_error",
+                "message": "Knowledge import failed.",
+            },
+        }
+    return JSONResponse(result, status_code=_remote_knowledge_status(result))
+
+
+@app.post("/knowledge/sync/feishu")
+async def sync_feishu_knowledge_documents(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    payload, validation_error = _remote_sync_request(body)
+    if validation_error is not None:
+        return JSONResponse(validation_error, status_code=400)
+    assert payload is not None
+    try:
+        kb = _project_knowledge_base()
+        remote_config = getattr(getattr(kb, "config", None), "remote_source", None)
+        result = kb.sync_remote_sources(
+            provider_name=getattr(remote_config, "provider", None),
+            collection=payload["collection"],
+            doc_ids=payload["doc_ids"],
+            dry_run=payload["dry_run"],
+        )
+    except Exception:
+        result = {
+            "status": "error",
+            "operation": "sync_remote_sources",
+            "error": {
+                "code": "rag_backend_error",
+                "message": "Knowledge synchronization failed.",
+            },
+        }
+    return JSONResponse(
+        result,
+        status_code=_remote_knowledge_status(result, dry_run=bool(payload["dry_run"])),
     )
 
 

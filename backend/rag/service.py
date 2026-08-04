@@ -15,6 +15,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from .bm25 import BM25Index
 from .chunking import StructureFirstSemanticChunker, content_hash, tokenize
 from .config import RagConfig, SemanticChunkingConfig, load_rag_config
 from .models import DocumentManifest, KnowledgeChunk
@@ -29,6 +30,13 @@ from .retrieval import (
     build_embedding_provider,
     build_reranker_provider,
     build_vector_store,
+)
+from .sources import (
+    FeishuDocumentProvider,
+    RemoteDocumentMetadata,
+    RemoteDocumentProvider,
+    RemoteDocumentSnapshot,
+    RemoteSourceError,
 )
 
 _SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".csv", ".html", ".htm", ".pdf", ".docx"}
@@ -149,6 +157,7 @@ class PersonalKnowledgeBase:
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
         vector_store: Any | None = None,
+        remote_provider: RemoteDocumentProvider | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.store_path = Path(store_path).resolve()
@@ -187,6 +196,7 @@ class PersonalKnowledgeBase:
         self.embedding_provider = embedding_provider
         self.reranker_provider = reranker_provider
         self.vector_store = vector_store
+        self.remote_provider = remote_provider
         self._backend_error: RagBackendError | None = None
         self._initialize_retrieval_backends()
         self.manifests: dict[str, DocumentManifest] = {}
@@ -244,6 +254,8 @@ class PersonalKnowledgeBase:
             "vector_collection": self.config.qdrant_collection,
             "vector_backend_active": bool(vector_active),
             "sparse_backend": self.config.sparse_backend,
+            "bm25_k1": round(float(self.config.bm25.k1), 6),
+            "bm25_b": round(float(self.config.bm25.b), 6),
             "fusion_strategy": self.config.hybrid.fusion_strategy,
             "reranker_provider": self.config.reranker.provider,
             "reranker_model": reranker_model,
@@ -439,6 +451,459 @@ class PersonalKnowledgeBase:
             self.vector_store.refresh(manifest.doc_id, records)
         self.manifests[manifest.doc_id] = manifest
         self.chunks_by_doc[manifest.doc_id] = chunks
+
+    @staticmethod
+    def _is_remote_manifest(manifest: DocumentManifest) -> bool:
+        return bool(manifest.metadata.get("remote_provider"))
+
+    def _remote_snapshot_path(self, collection: str, doc_id: str) -> Path:
+        target = self.documents_path / "_remote" / _safe_component(collection) / f"{_safe_component(doc_id)}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _manifest_snapshot_path(self, manifest: DocumentManifest) -> Path | None:
+        snapshot_value = str(manifest.metadata.get("snapshot_path") or "").strip()
+        if not snapshot_value:
+            return None
+        candidate = Path(snapshot_value)
+        if not candidate.is_absolute():
+            candidate = self.store_path / candidate
+        candidate = candidate.resolve()
+        remote_root = (self.documents_path / "_remote").resolve()
+        return candidate if _is_relative_to(candidate, remote_root) else None
+
+    def _is_remote_snapshot_path(self, path: Path) -> bool:
+        return _is_relative_to(path, self.documents_path / "_remote")
+
+    def _remote_provider_for(self, provider_name: str | None = None) -> RemoteDocumentProvider:
+        selected = str(provider_name or self.config.remote_source.provider or "feishu").strip().lower()
+        if not self.config.remote_source.enabled:
+            raise RemoteSourceError(
+                "Remote document sources are disabled",
+                category="provider_unavailable",
+                retryable=False,
+            )
+        if self.remote_provider is not None:
+            actual = str(getattr(self.remote_provider, "provider_name", selected) or selected).lower()
+            if actual != selected:
+                raise RemoteSourceError(
+                    f"Configured remote provider does not match {selected}",
+                    category="provider_unavailable",
+                    retryable=False,
+                )
+            return self.remote_provider
+        if selected == "feishu":
+            return FeishuDocumentProvider(
+                workspace_root=self.workspace_root,
+                session_file=self.config.remote_source.session_file,
+                max_content_chars=self.config.remote_source.max_content_chars,
+            )
+        raise RemoteSourceError(
+            f"Unsupported remote document provider: {selected}",
+            category="provider_unavailable",
+            retryable=False,
+        )
+
+    def _remote_call(self, operation: str, callback: Any) -> Any:
+        max_retries = max(0, int(self.config.remote_source.max_retries))
+        backoff = max(0.0, float(self.config.remote_source.retry_backoff_seconds))
+        for attempt in range(max_retries + 1):
+            try:
+                return callback()
+            except RemoteSourceError as exc:
+                if not exc.retryable or attempt >= max_retries:
+                    raise
+                delay = min(backoff * (2**attempt), 5.0)
+                if delay > 0:
+                    time.sleep(delay)
+            except Exception as exc:
+                raise RemoteSourceError(
+                    f"Remote provider failed during {operation}",
+                    category="provider_unavailable",
+                    retryable=True,
+                ) from exc
+        raise RemoteSourceError(
+            f"Remote provider failed during {operation}",
+            category="provider_unavailable",
+            retryable=True,
+        )
+
+    def _remote_result(self, status: str, manifest: DocumentManifest) -> dict[str, Any]:
+        metadata = manifest.metadata
+        return {
+            "status": status,
+            "collection": manifest.collection,
+            "doc_id": manifest.doc_id,
+            "source_uri": manifest.source_uri,
+            "source_url": str(metadata.get("source_url") or ""),
+            "source_type": manifest.source_type,
+            "title": manifest.title,
+            "chunk_count": manifest.chunk_count,
+            "content_hash": manifest.content_hash,
+            "remote_revision": str(metadata.get("remote_revision") or ""),
+            "remote_updated_at": str(metadata.get("remote_updated_at") or ""),
+            "owner": str(metadata.get("owner") or ""),
+            "content_format": str(metadata.get("content_format") or "markdown"),
+            "snapshot_path": str(metadata.get("snapshot_path") or ""),
+            "settings": self._stack_settings(
+                embedding_active=bool(self.config.vector_backend == "qdrant" and manifest.chunk_count),
+                vector_active=bool(self.vector_store is not None and manifest.chunk_count),
+            ),
+        }
+
+    def _write_remote_snapshot(self, path: Path, content: str) -> None:
+        temporary = path.with_name(f".{path.name}.tmp")
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _remote_metadata_dict(
+        self,
+        metadata: RemoteDocumentMetadata,
+        *,
+        snapshot_path: Path,
+        content_format: str,
+        existing: DocumentManifest | None = None,
+    ) -> dict[str, Any]:
+        result = dict(existing.metadata if existing else {})
+        result.update(
+            {
+                "remote_provider": metadata.provider,
+                "object_token": metadata.object_token,
+                "source_url": metadata.source_url,
+                "owner": metadata.owner,
+                "remote_revision": metadata.remote_revision,
+                "remote_updated_at": metadata.remote_updated_at,
+                "content_format": str(content_format or "markdown").strip().lower()[:32] or "markdown",
+                "snapshot_path": str(snapshot_path),
+                "active": True,
+            }
+        )
+        if metadata.extra:
+            result["provider_metadata"] = dict(metadata.extra)
+        return result
+
+    def _index_remote_snapshot(
+        self,
+        collection: str,
+        snapshot: RemoteDocumentSnapshot,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        normalized_collection = _safe_component(collection)
+        metadata = snapshot.metadata
+        source_uri = str(metadata.source_uri or "").strip()
+        if not source_uri:
+            raise RemoteSourceError("Remote source URI is required", category="invalid_reference")
+        content = str(snapshot.content or "")
+        max_content_chars = max(1, int(self.config.remote_source.max_content_chars))
+        if not content.strip():
+            raise RemoteSourceError(
+                "Remote document contains no indexable text",
+                category="content_invalid",
+                retryable=False,
+            )
+        if len(content) > max_content_chars or len(content.encode("utf-8")) > max_content_chars:
+            raise RemoteSourceError(
+                "Remote document exceeds the configured content limit",
+                category="content_invalid",
+                retryable=False,
+                details={"max_content_chars": max_content_chars},
+            )
+        doc_id = _doc_id(normalized_collection, source_uri)
+        existing = self.manifests.get(doc_id)
+        retrieval_signature = self._retrieval_signature()
+        chunk_signature = self.chunker_config.signature()
+        same_revision = bool(
+            metadata.remote_revision
+            and existing is not None
+            and existing.metadata.get("remote_revision") == metadata.remote_revision
+        )
+        unchanged = bool(
+            existing is not None
+            and not refresh
+            and existing.status == "indexed"
+            and existing.metadata.get("active", True)
+            and existing.content_hash == snapshot.content_hash
+            and existing.chunking_signature == chunk_signature
+            and existing.retrieval_signature == retrieval_signature
+            and self._document_vectors_current(doc_id)
+            and (not metadata.remote_revision or same_revision)
+        )
+        if unchanged:
+            return self._remote_result("unchanged", existing)
+
+        chunks = self.chunker.chunk_text(
+            snapshot.content,
+            source_ref=metadata.title or source_uri,
+            doc_id=doc_id,
+            collection=normalized_collection,
+        )
+        snapshot_path = self._remote_snapshot_path(normalized_collection, doc_id)
+        manifest = DocumentManifest(
+            doc_id=doc_id,
+            collection=normalized_collection,
+            source_uri=source_uri,
+            source_type=f"{metadata.provider}_document",
+            content_hash=snapshot.content_hash,
+            parser_version=_PARSER_VERSION,
+            chunker_version=self.chunker_config.chunker_version,
+            chunking_signature=chunk_signature,
+            title=metadata.title or source_uri,
+            status="indexed",
+            chunk_count=len(chunks),
+            metadata=self._remote_metadata_dict(
+                metadata,
+                snapshot_path=snapshot_path,
+                content_format=snapshot.content_format,
+                existing=existing,
+            ),
+            retrieval_signature=retrieval_signature,
+            indexed_at=self._indexed_at(),
+        )
+        previous_manifest = existing
+        previous_chunks = list(self.chunks_by_doc.get(doc_id, []))
+        previous_snapshot_path = self._manifest_snapshot_path(existing) if existing else None
+        previous_snapshot = None
+        if previous_snapshot_path is not None and previous_snapshot_path.exists():
+            previous_snapshot = previous_snapshot_path.read_bytes()
+        try:
+            self._write_remote_snapshot(snapshot_path, snapshot.content)
+            self._commit_document(manifest=manifest, chunks=chunks)
+            self._save()
+        except Exception:
+            try:
+                if previous_snapshot is not None and previous_snapshot_path is not None:
+                    previous_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                    previous_snapshot_path.write_bytes(previous_snapshot)
+                elif snapshot_path.exists():
+                    snapshot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if self.config.vector_backend == "qdrant" and self.vector_store is not None:
+                    if previous_manifest is not None:
+                        self.vector_store.refresh(
+                            doc_id,
+                            self._vector_records(previous_chunks, previous_manifest),
+                        )
+                    else:
+                        self.vector_store.delete_document(doc_id)
+            except Exception:
+                pass
+            if previous_manifest is None:
+                self.manifests.pop(doc_id, None)
+                self.chunks_by_doc.pop(doc_id, None)
+            else:
+                self.manifests[doc_id] = previous_manifest
+                self.chunks_by_doc[doc_id] = previous_chunks
+            raise
+        status = "refreshed" if existing is not None else "indexed"
+        return self._remote_result(status, manifest)
+
+    def import_remote_document(
+        self,
+        collection: str,
+        reference: str,
+        *,
+        refresh: bool = False,
+        provider_name: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        normalized_collection = _safe_component(collection)
+        existing_doc_id = ""
+        try:
+            provider = self._remote_provider_for(provider_name)
+            metadata = self._remote_call("inspect", lambda: provider.inspect(reference))
+            existing_doc_id = _doc_id(normalized_collection, metadata.source_uri)
+            existing = self.manifests.get(existing_doc_id)
+            if (
+                existing is not None
+                and not refresh
+                and existing.status == "indexed"
+                and existing.metadata.get("active", True)
+                and metadata.remote_revision
+                and existing.metadata.get("remote_revision") == metadata.remote_revision
+                and existing.chunking_signature == self.chunker_config.signature()
+                and existing.retrieval_signature == self._retrieval_signature()
+                and self._document_vectors_current(existing_doc_id)
+            ):
+                result = self._remote_result("unchanged", existing)
+                result["settings"]["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+                return result
+            snapshot = self._remote_call("fetch", lambda: provider.fetch(metadata))
+            result = self._index_remote_snapshot(normalized_collection, snapshot, refresh=refresh)
+            result["settings"]["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            return result
+        except (RemoteSourceError, RagBackendError) as exc:
+            return self._backend_error_result(
+                operation="import_remote_document",
+                error=exc,
+                collection=normalized_collection,
+                doc_id=existing_doc_id,
+            )
+        except Exception:
+            return self._backend_error_result(
+                operation="import_remote_document",
+                error=RagBackendError("Remote document indexing failed."),
+                collection=normalized_collection,
+                doc_id=existing_doc_id,
+            )
+
+    def _mark_remote_sync_failed(self, manifest: DocumentManifest, error: BaseException) -> None:
+        manifest.status = "sync_failed"
+        manifest.latest_error = json.dumps(self._error_payload(error), ensure_ascii=False)
+        manifest.metadata["active"] = True
+
+    def _deactivate_remote_manifest(self, manifest: DocumentManifest, error: BaseException, status: str) -> None:
+        self._delete_document_vectors(manifest.doc_id)
+        self.manifests[manifest.doc_id] = manifest
+        self.chunks_by_doc.pop(manifest.doc_id, None)
+        snapshot_path = self._manifest_snapshot_path(manifest)
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
+        manifest.status = status
+        manifest.chunk_count = 0
+        manifest.latest_error = json.dumps(self._error_payload(error), ensure_ascii=False)
+        manifest.metadata["active"] = False
+        manifest.metadata.pop("snapshot_path", None)
+
+    def sync_remote_sources(
+        self,
+        *,
+        provider_name: str | None = None,
+        collection: str | None = None,
+        doc_ids: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        selected_provider = str(provider_name or self.config.remote_source.provider or "feishu").lower()
+        normalized_collection = _safe_component(collection) if collection else None
+        selected_ids = set(doc_ids or [])
+        counts = {
+            "indexed": 0,
+            "refreshed": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "access_denied": 0,
+            "remote_deleted": 0,
+            "deleted": 0,
+            "would_refresh": 0,
+            "would_access_denied": 0,
+            "would_delete": 0,
+        }
+        files: list[dict[str, Any]] = []
+        try:
+            provider = self._remote_provider_for(selected_provider)
+        except RemoteSourceError as exc:
+            error = self._error_payload(exc)
+            return {
+                "provider": selected_provider,
+                "collection": normalized_collection,
+                "dry_run": dry_run,
+                "counts": {**counts, "failed": 1},
+                "files": [{"status": "sync_failed", "error": error}],
+                "error": error,
+                "settings": self._stack_settings(
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    candidate_counts={**counts, "failed": 1},
+                ),
+            }
+        manifests = [
+            manifest
+            for manifest in self.manifests.values()
+            if manifest.metadata.get("remote_provider") == selected_provider
+            and (not normalized_collection or manifest.collection == normalized_collection)
+            and (not selected_ids or manifest.doc_id in selected_ids)
+        ]
+        for manifest in sorted(manifests, key=lambda item: item.source_uri):
+            reference = str(manifest.metadata.get("source_url") or manifest.metadata.get("object_token") or manifest.source_uri)
+            try:
+                metadata = self._remote_call("inspect", lambda: provider.inspect(reference))
+                same_revision = bool(
+                    metadata.remote_revision
+                    and manifest.metadata.get("remote_revision") == metadata.remote_revision
+                )
+                vectors_current = self._document_vectors_current(manifest.doc_id)
+                if same_revision and manifest.status == "indexed" and manifest.metadata.get("active", True) and vectors_current:
+                    counts["unchanged"] += 1
+                    files.append({"doc_id": manifest.doc_id, "source_uri": manifest.source_uri, "status": "unchanged"})
+                    continue
+                if dry_run:
+                    files.append({
+                        "doc_id": manifest.doc_id,
+                        "source_uri": manifest.source_uri,
+                        "status": "would_refresh",
+                    })
+                    counts["would_refresh"] += 1
+                    continue
+                snapshot = self._remote_call("fetch", lambda: provider.fetch(metadata))
+                result = self._index_remote_snapshot(manifest.collection, snapshot, refresh=True)
+                status = result["status"]
+                counts[status] = counts.get(status, 0) + 1
+                files.append({"doc_id": manifest.doc_id, "source_uri": manifest.source_uri, "status": status})
+            except RemoteSourceError as exc:
+                if exc.category in {"permission_denied", "not_found"}:
+                    is_deleted = exc.category == "not_found"
+                    if not dry_run:
+                        self._deactivate_remote_manifest(
+                            manifest,
+                            exc,
+                            "access_denied" if not is_deleted else "remote_deleted",
+                        )
+                    if dry_run:
+                        status = "would_access_denied" if not is_deleted else "would_delete"
+                        counts[status] += 1
+                    else:
+                        status = "access_denied" if not is_deleted else "remote_deleted"
+                        counts[status] += 1
+                        if is_deleted:
+                            counts["deleted"] += 1
+                    files.append({
+                        "doc_id": manifest.doc_id,
+                        "source_uri": manifest.source_uri,
+                        "status": status,
+                        "error": self._error_payload(exc),
+                    })
+                else:
+                    if not dry_run:
+                        self._mark_remote_sync_failed(manifest, exc)
+                    counts["failed"] += 1
+                    files.append({
+                        "doc_id": manifest.doc_id,
+                        "source_uri": manifest.source_uri,
+                        "status": "sync_failed",
+                        "error": self._error_payload(exc),
+                    })
+            except RagBackendError as exc:
+                if not dry_run:
+                    self._mark_remote_sync_failed(manifest, exc)
+                counts["failed"] += 1
+                files.append({
+                    "doc_id": manifest.doc_id,
+                    "source_uri": manifest.source_uri,
+                    "status": "sync_failed",
+                    "error": self._error_payload(exc),
+                })
+        if not dry_run:
+            self._save()
+        report = {
+            "provider": selected_provider,
+            "collection": normalized_collection,
+            "dry_run": dry_run,
+            "counts": counts,
+            "files": files,
+            "settings": self._stack_settings(
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                candidate_counts=dict(counts),
+            ),
+        }
+        errors = [item.get("error") for item in files if isinstance(item.get("error"), dict)]
+        if errors:
+            report["error"] = errors[0]
+        return report
 
     def index_files(
         self,
@@ -650,6 +1115,8 @@ class PersonalKnowledgeBase:
         for path in candidates:
             if not path.is_file():
                 continue
+            if self._is_remote_snapshot_path(path):
+                continue
             inferred_collection = self._collection_from_document_path(path)
             if normalized_collection and inferred_collection != normalized_collection:
                 continue
@@ -719,6 +1186,8 @@ class PersonalKnowledgeBase:
 
         deleted: list[str] = []
         for doc_id, manifest in list(self.manifests.items()):
+            if self._is_remote_manifest(manifest):
+                continue
             source_path = Path(manifest.source_uri)
             if normalized_collection and manifest.collection != normalized_collection:
                 continue
@@ -761,7 +1230,7 @@ class PersonalKnowledgeBase:
             report_path = self.sync_reports_path / f"sync-{int(time.time() * 1000)}.json"
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             report["report_path"] = str(report_path)
-        failures = [item.get("error") for item in files if item.get("status") == "failed" and item.get("error")]
+        failures = [item.get("error") for item in files if isinstance(item.get("error"), dict)]
         if failures:
             report["error"] = failures[0]
         return report
@@ -790,6 +1259,8 @@ class PersonalKnowledgeBase:
         sources: list[dict[str, Any]] = []
         for path in sorted(scan_root.rglob("*")):
             if not path.is_file():
+                continue
+            if self._is_remote_snapshot_path(path):
                 continue
             inferred_collection = self._collection_from_document_path(path)
             if normalized_collection and inferred_collection != normalized_collection:
@@ -831,6 +1302,24 @@ class PersonalKnowledgeBase:
                     "reason": reason or latest_error,
                 }
             )
+        for manifest in sorted(self.manifests.values(), key=lambda item: item.source_uri):
+            if not self._is_remote_manifest(manifest):
+                continue
+            if normalized_collection and manifest.collection != normalized_collection:
+                continue
+            sources.append(
+                {
+                    "collection": manifest.collection,
+                    "doc_id": manifest.doc_id,
+                    "source_uri": manifest.source_uri,
+                    "source_url": manifest.metadata.get("source_url", ""),
+                    "title": manifest.title,
+                    "source_type": manifest.source_type,
+                    "status": manifest.status,
+                    "chunk_count": manifest.chunk_count,
+                    "reason": manifest.latest_error,
+                }
+            )
         return sources
 
     def get_document_detail(self, doc_id: str) -> dict[str, Any] | None:
@@ -853,6 +1342,15 @@ class PersonalKnowledgeBase:
         self.vector_store.delete_document(doc_id)
 
     def delete_source_file(self, source_uri: str) -> dict[str, Any]:
+        remote_matches = [
+            manifest.doc_id
+            for manifest in self.manifests.values()
+            if self._is_remote_manifest(manifest) and manifest.source_uri == str(source_uri).strip()
+        ]
+        if remote_matches:
+            return self.delete_document(doc_id=remote_matches[0], remove_source=True)
+        if "://" in str(source_uri):
+            return {"deleted": [], "removed_sources": [], "error": "remote source not found"}
         source_path = Path(source_uri)
         if not source_path.is_absolute():
             source_path = self.workspace_root / source_path
@@ -897,8 +1395,13 @@ class PersonalKnowledgeBase:
                 continue
             if collection and manifest.collection != collection:
                 continue
-            if source_uri and manifest.source_uri != str(Path(source_uri).resolve()):
-                continue
+            if source_uri:
+                requested_source = str(source_uri).strip()
+                if "://" in requested_source:
+                    if manifest.source_uri != requested_source:
+                        continue
+                elif manifest.source_uri != str(Path(requested_source).resolve()):
+                    continue
             to_delete.append(manifest_id)
         removed_sources: list[str] = []
         for manifest_id in to_delete:
@@ -915,10 +1418,16 @@ class PersonalKnowledgeBase:
             self.manifests.pop(manifest_id, None)
             self.chunks_by_doc.pop(manifest_id, None)
             if remove_source and manifest:
-                source_path = Path(manifest.source_uri)
-                if _is_relative_to(source_path, self.documents_path):
-                    source_path.unlink(missing_ok=True)
-                    removed_sources.append(str(source_path))
+                if self._is_remote_manifest(manifest):
+                    snapshot_path = self._manifest_snapshot_path(manifest)
+                    if snapshot_path is not None:
+                        snapshot_path.unlink(missing_ok=True)
+                        removed_sources.append(str(snapshot_path))
+                else:
+                    source_path = Path(manifest.source_uri)
+                    if _is_relative_to(source_path, self.documents_path):
+                        source_path.unlink(missing_ok=True)
+                        removed_sources.append(str(source_path))
         self._save()
         return {"deleted": to_delete, "removed_sources": removed_sources}
 
@@ -971,6 +1480,8 @@ class PersonalKnowledgeBase:
             manifest = self.manifests.get(doc_id)
             if manifest is None:
                 continue
+            if self._is_remote_manifest(manifest) and not manifest.metadata.get("active", True):
+                continue
             if collection and manifest.collection != collection:
                 continue
             chunks.extend(
@@ -980,20 +1491,20 @@ class PersonalKnowledgeBase:
             )
         return chunks
 
-    def _lexical_rank(self, query_tokens: list[str], chunks: list[KnowledgeChunk]) -> list[tuple[KnowledgeChunk, float]]:
-        if not query_tokens:
+    def _bm25_rank(self, query_tokens: list[str], chunks: list[KnowledgeChunk]) -> list[tuple[KnowledgeChunk, float]]:
+        if not query_tokens or not chunks:
             return []
-        scored: list[tuple[KnowledgeChunk, float]] = []
-        for chunk in chunks:
-            tokens = tokenize(chunk.text)
-            if not tokens:
-                continue
-            token_set = set(tokens)
-            overlap = sum(1 for token in query_tokens if token in token_set)
-            if overlap:
-                scored.append((chunk, overlap / max(1, len(set(query_tokens)))))
+        index = BM25Index(
+            chunks,
+            k1=self.config.bm25.k1,
+            b=self.config.bm25.b,
+        )
         depth = max(0, int(self.config.hybrid.lexical_candidate_depth))
-        return sorted(scored, key=lambda item: (-item[1], item[0].chunk_id))[:depth]
+        return index.search(query_tokens, limit=depth)
+
+    def _lexical_rank(self, query_tokens: list[str], chunks: list[KnowledgeChunk]) -> list[tuple[KnowledgeChunk, float]]:
+        """Backward-compatible alias for callers using the old private helper."""
+        return self._bm25_rank(query_tokens, chunks)
 
     def _dense_rank(
         self,
@@ -1081,7 +1592,7 @@ class PersonalKnowledgeBase:
         chunks = self._candidate_chunks(normalized_collection, filters)
         query_tokens = tokenize(query)
         try:
-            lexical = self._lexical_rank(query_tokens, chunks)
+            bm25 = self._bm25_rank(query_tokens, chunks)
             dense = self._dense_rank(
                 query,
                 chunks,
@@ -1089,11 +1600,11 @@ class PersonalKnowledgeBase:
                 filters=filters,
             )
             rrf_scores = self._rrf(
-                [lexical, dense],
+                [bm25, dense],
                 k=max(1, int(self.config.hybrid.rrf_k)),
             )
             by_id = {chunk.chunk_id: chunk for chunk in chunks}
-            lexical_scores = {chunk.chunk_id: score for chunk, score in lexical}
+            bm25_scores = {chunk.chunk_id: score for chunk, score in bm25}
             dense_scores = {chunk.chunk_id: score for chunk, score in dense}
             fused = [
                 (by_id[chunk_id], score)
@@ -1136,7 +1647,8 @@ class PersonalKnowledgeBase:
                 manifest = self.manifests.get(chunk.doc_id)
                 score_payload = {
                     "fusion_score": round(fused_score, 6),
-                    "lexical_score": round(lexical_scores.get(chunk.chunk_id, 0.0), 6),
+                    "bm25_score": round(bm25_scores.get(chunk.chunk_id, 0.0), 6),
+                    "lexical_score": round(bm25_scores.get(chunk.chunk_id, 0.0), 6),
                     "dense_score": round(dense_scores.get(chunk.chunk_id, 0.0), 6),
                 }
                 if chunk.chunk_id in reranker_scores:
@@ -1148,6 +1660,7 @@ class PersonalKnowledgeBase:
                     "citation_id": chunk.chunk_id,
                     "source_ref": chunk.source_ref,
                     "source_uri": manifest.source_uri if manifest else "",
+                    "source_url": (manifest.metadata.get("source_url", "") if manifest else ""),
                     "source_type": manifest.source_type if manifest else "",
                     "title": manifest.title if manifest else chunk.source_ref,
                     "heading_path": chunk.heading_path,
@@ -1175,7 +1688,8 @@ class PersonalKnowledgeBase:
                     vector_active=bool(self.config.vector_backend == "qdrant" and self.vector_store is not None),
                     reranker_active=reranker_active,
                     candidate_counts={
-                        "lexical": len(lexical),
+                        "bm25": len(bm25),
+                        "lexical": len(bm25),
                         "dense": len(dense),
                         "fused": len(rrf_scores),
                         "reranked": len(reranker_scores),

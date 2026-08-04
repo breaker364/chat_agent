@@ -34,6 +34,8 @@ import {
   LogOut,
   QrCode,
   Paperclip,
+  Link2,
+  AlertCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -1233,6 +1235,32 @@ function knowledgeStatusClass(status) {
   return `knowledge-status-${String(status || "unknown").replace(/[^a-z0-9_-]+/gi, "_").toLowerCase()}`;
 }
 
+const REMOTE_KNOWLEDGE_ERROR_MESSAGES = {
+  invalid_reference: "The document connection is not a supported URL or token.",
+  content_invalid: "The document content is empty, too large, or could not be normalized.",
+  auth_required: "The Feishu session is missing or expired. Sign in again before importing.",
+  permission_denied: "The current account cannot access this document.",
+  not_found: "The document could not be found.",
+  rate_limited: "The remote service is rate-limiting requests. Try again later.",
+  provider_unavailable: "The remote document service is temporarily unavailable.",
+};
+
+function remoteKnowledgeStatusMessage(payload) {
+  const status = String(payload?.status || "").toLowerCase();
+  const title = payload?.title || payload?.source_uri || "document";
+  if (["indexed", "refreshed", "unchanged"].includes(status)) {
+    return `${status} / ${title}`;
+  }
+  return payload?.message || "Knowledge operation completed.";
+}
+
+function remoteKnowledgeErrorMessage(payload, httpStatus) {
+  const code = String(payload?.error?.code || "").toLowerCase();
+  return REMOTE_KNOWLEDGE_ERROR_MESSAGES[code]
+    || payload?.error?.message
+    || `Knowledge import failed${httpStatus ? ` (HTTP ${httpStatus})` : ""}.`;
+}
+
 function knowledgeSyncDetails(status) {
   return Array.isArray(status?.files)
     ? status.files.filter((item) => ["failed", "skipped", "unsupported"].includes(String(item.status || "").toLowerCase()))
@@ -1251,6 +1279,166 @@ function KnowledgeSyncDetails({ status }) {
           {item.reason ? <span className="knowledge-sync-reason">{item.reason}</span> : null}
         </div>
       ))}
+    </div>
+  );
+}
+
+function FeishuImportDialog({
+  open,
+  loggedIn,
+  loading,
+  onClose,
+  onSubmit,
+  onOpenLogin,
+}) {
+  const [reference, setReference] = useState("");
+  const [collection, setCollection] = useState("default");
+  const [refresh, setRefresh] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setReference("");
+    setCollection("default");
+    setRefresh(false);
+    setError("");
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape" && !loading) onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [loading, onClose, open]);
+
+  if (!open) return null;
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    const nextReference = reference.trim();
+    const nextCollection = collection.trim();
+    if (!nextReference) {
+      setError("Enter a document URL or token.");
+      return;
+    }
+    if (!nextCollection) {
+      setError("Enter a knowledge collection.");
+      return;
+    }
+    if (!loggedIn) {
+      setError("Sign in to Feishu before importing a document.");
+      return;
+    }
+
+    setError("");
+    try {
+      const result = await onSubmit({
+        reference: nextReference,
+        collection: nextCollection,
+        refresh,
+      });
+      if (result?.ok) onClose();
+      else setError(result?.message || "The document could not be imported.");
+    } catch (submitError) {
+      setError(submitError?.message || "The document could not be imported.");
+    }
+  };
+
+  const handleOpenLogin = () => {
+    onClose();
+    onOpenLogin();
+  };
+
+  return (
+    <div
+      className="feishu-import-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Import Feishu document"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !loading) onClose();
+      }}
+    >
+      <section className="feishu-import-dialog">
+        <header className="feishu-import-header">
+          <div className="feishu-import-title">
+            <Link2 size={17} />
+            <span>Import Feishu document</span>
+          </div>
+          <button
+            type="button"
+            className="feishu-import-close"
+            onClick={onClose}
+            disabled={loading}
+            aria-label="Close Feishu document import"
+          >
+            <X size={16} />
+          </button>
+        </header>
+
+        <form className="feishu-import-form" onSubmit={handleSubmit}>
+          <label className="feishu-import-field">
+            <span>Feishu document URL or token</span>
+            <input
+              value={reference}
+              onChange={(event) => setReference(event.target.value)}
+              placeholder="Paste a document URL or token"
+              autoFocus
+              disabled={loading}
+            />
+          </label>
+          <label className="feishu-import-field">
+            <span>Knowledge collection</span>
+            <input
+              value={collection}
+              onChange={(event) => setCollection(event.target.value)}
+              placeholder="default"
+              disabled={loading}
+            />
+          </label>
+          <label className="feishu-import-checkbox">
+            <input
+              type="checkbox"
+              checked={refresh}
+              onChange={(event) => setRefresh(event.target.checked)}
+              disabled={loading}
+            />
+            <span>Force refresh the remote content</span>
+          </label>
+
+          {!loggedIn ? (
+            <div className="feishu-import-alert" role="status">
+              <AlertCircle size={15} />
+              <span>Sign in to Feishu before importing a document.</span>
+              <button type="button" className="feishu-import-login" onClick={handleOpenLogin} disabled={loading}>
+                Open login panel
+              </button>
+            </div>
+          ) : null}
+          {error ? (
+            <div className="feishu-import-error" role="alert">
+              <AlertCircle size={15} />
+              <span>{error}</span>
+            </div>
+          ) : null}
+
+          <footer className="feishu-import-footer">
+            <button type="button" className="feishu-import-cancel" onClick={onClose} disabled={loading}>
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="feishu-import-submit"
+              disabled={loading || !loggedIn || !reference.trim() || !collection.trim()}
+            >
+              {loading ? <Loader2 className="spin" size={14} /> : <Link2 size={14} />}
+              Add to knowledge base
+            </button>
+          </footer>
+        </form>
+      </section>
     </div>
   );
 }
@@ -1428,15 +1616,19 @@ function KnowledgePanel({
   enabled,
   loading,
   status,
+  feishuStatus,
   collapsed,
   onToggleEnabled,
   onToggleCollapsed,
   onImportFiles,
+  onImportFeishu,
+  onOpenFeishuLogin,
   onSync,
   onDeleteDocument,
   onOpenCenter,
 }) {
   const importInputRef = useRef(null);
+  const [feishuImportOpen, setFeishuImportOpen] = useState(false);
   const handleDrop = (event) => {
     if (!event.dataTransfer.files.length) return;
     event.preventDefault();
@@ -1508,6 +1700,17 @@ function KnowledgePanel({
             <button
               type="button"
               className="knowledge-action-btn"
+              onClick={() => setFeishuImportOpen(true)}
+              disabled={loading}
+              aria-label="Import Feishu document"
+              title="Import Feishu document"
+            >
+              <Link2 size={14} />
+              Feishu doc
+            </button>
+            <button
+              type="button"
+              className="knowledge-action-btn"
               onClick={onOpenCenter}
               disabled={loading}
               aria-label="Open knowledge center"
@@ -1536,6 +1739,14 @@ function KnowledgePanel({
           <KnowledgeSyncDetails status={status} />
         </>
       ) : null}
+      <FeishuImportDialog
+        open={feishuImportOpen}
+        loggedIn={Boolean(feishuStatus?.logged_in)}
+        loading={loading}
+        onClose={() => setFeishuImportOpen(false)}
+        onSubmit={onImportFeishu}
+        onOpenLogin={onOpenFeishuLogin}
+      />
     </section>
   );
 }
@@ -2356,6 +2567,33 @@ export default function App() {
     }
   }, [refreshFeishuStatus]);
 
+  const importFeishuKnowledge = useCallback(async ({ reference, collection, refresh }) => {
+    setKnowledgeLoading(true);
+    try {
+      const resp = await fetch(`${API_BASE}/knowledge/import/feishu`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ reference, collection, refresh }),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (!resp.ok || payload.status === "error" || payload.error) {
+        const message = remoteKnowledgeErrorMessage(payload, resp.status);
+        setKnowledgeStatus({ ...payload, message, counts: { failed: 1 } });
+        return { ok: false, message, payload };
+      }
+
+      setKnowledgeStatus({ ...payload, message: remoteKnowledgeStatusMessage(payload) });
+      await refreshKnowledgeCenter();
+      return { ok: true, payload };
+    } catch (err) {
+      const message = err?.message || "Knowledge import failed.";
+      setKnowledgeStatus({ message, counts: { failed: 1 } });
+      return { ok: false, message };
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  }, [refreshKnowledgeCenter]);
+
   useEffect(() => {
     if (!feishuPolling || !feishuLoginState?.flow_key) return undefined;
     let cancelled = false;
@@ -2864,10 +3102,13 @@ export default function App() {
             enabled={knowledgeMode}
             loading={knowledgeLoading}
             status={knowledgeStatus}
+            feishuStatus={feishuStatus}
             collapsed={knowledgePanelCollapsed}
             onToggleEnabled={setKnowledgeMode}
             onToggleCollapsed={() => setKnowledgePanelCollapsed((prev) => !prev)}
             onImportFiles={importKnowledgeFiles}
+            onImportFeishu={importFeishuKnowledge}
+            onOpenFeishuLogin={() => setFeishuPanelCollapsed(false)}
             onSync={syncKnowledge}
             onDeleteDocument={deleteKnowledgeDocument}
             onOpenCenter={() => {

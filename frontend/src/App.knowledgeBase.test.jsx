@@ -82,6 +82,86 @@ describe("App knowledge base controls", () => {
     expect(screen.getByText(/indexed 1/i)).toBeTruthy();
   });
 
+  it("imports a Feishu document by connection and refreshes the knowledge center", async () => {
+    const calls = [];
+    let documentListCalls = 0;
+    let sourceListCalls = 0;
+    renderWithFetch(async (url, options = {}) => {
+      calls.push({ url: String(url), method: options.method || "GET", body: options.body });
+      if (url === "/feishu/session") {
+        return jsonResponse({ logged_in: true, has_session: true, issued_at: 1785466251, metadata: {} });
+      }
+      if (url === "/sessions") return jsonResponse({ sessions: [] });
+      if (url === "/knowledge/documents") {
+        documentListCalls += 1;
+        return jsonResponse({ documents: [] });
+      }
+      if (url === "/knowledge/sources") {
+        sourceListCalls += 1;
+        return jsonResponse({ sources: [] });
+      }
+      if (url === "/knowledge/import/feishu" && options.method === "POST") {
+        return jsonResponse({
+          status: "indexed",
+          collection: "project-notes",
+          doc_id: "doc-1",
+          source_uri: "feishu://document/remote-token",
+          source_url: "https://docs.example.test/docx/remote-token",
+          title: "Project notes",
+          chunk_count: 3,
+        });
+      }
+      return jsonResponse({ error: "unexpected request" }, { status: 404 });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /import feishu document/i }));
+    fireEvent.change(screen.getByLabelText(/feishu document url or token/i), {
+      target: { value: "https://docs.example.test/docx/remote-token" },
+    });
+    fireEvent.change(screen.getByLabelText(/knowledge collection/i), {
+      target: { value: "project-notes" },
+    });
+    fireEvent.click(screen.getByLabelText(/force refresh/i));
+    fireEvent.click(screen.getByRole("button", { name: /add to knowledge base/i }));
+
+    await waitFor(() => {
+      expect(calls.some((call) => call.url === "/knowledge/import/feishu" && call.method === "POST")).toBe(true);
+    });
+    const importCall = calls.find((call) => call.url === "/knowledge/import/feishu");
+    expect(JSON.parse(importCall.body)).toEqual({
+      reference: "https://docs.example.test/docx/remote-token",
+      collection: "project-notes",
+      refresh: true,
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /import feishu document/i })).toBeNull());
+    expect(documentListCalls).toBeGreaterThan(1);
+    expect(sourceListCalls).toBeGreaterThan(1);
+    expect(screen.getByText(/indexed \/ project notes/i)).toBeTruthy();
+  });
+
+  it("blocks Feishu import until the web session is logged in", async () => {
+    const calls = [];
+    renderWithFetch(async (url, options = {}) => {
+      calls.push({ url: String(url), method: options.method || "GET" });
+      if (url === "/feishu/session") {
+        return jsonResponse({ logged_in: false, has_session: false, issued_at: null, metadata: {} });
+      }
+      if (url === "/sessions") return jsonResponse({ sessions: [] });
+      if (url === "/knowledge/documents") return jsonResponse({ documents: [] });
+      if (url === "/knowledge/sources") return jsonResponse({ sources: [] });
+      return jsonResponse({ error: "unexpected request" }, { status: 404 });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /import feishu document/i }));
+    expect(screen.getByText(/sign in to Feishu before importing/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /add to knowledge base/i }).disabled).toBe(true);
+    expect(calls.some((call) => call.url === "/knowledge/import/feishu")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: /open login panel/i }));
+    expect(screen.queryByRole("dialog", { name: /import feishu document/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /init qr/i })).toBeTruthy();
+  });
+
   it("sends knowledge_mode when the user enables knowledge-base answering", async () => {
     const calls = [];
     renderWithFetch(async (url, options = {}) => {
