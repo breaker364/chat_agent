@@ -22,6 +22,9 @@
   "feishu": {
     "session_cookie": ""
   },
+  "sandbox": {
+    "external_read_roots": []
+  },
   "rag": {
     "enabled": true,
     "retrieval_profile": "production",

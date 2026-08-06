@@ -683,6 +683,28 @@ curl -X POST http://127.0.0.1:8000/chat \
 
 `research` 返回字段只包含策略、来源类别、尝试次数、预算和引用计数，不会返回模型内部推理、完整文档正文、向量或凭证。
 
+### 6.1 读取和复制 workspace 外的文件
+
+默认情况下，文件工具只访问当前 workspace。若飞书 CLI 或其他本地程序将文件下载到 workspace 外的目录，可以在 `runtime_config.json` 中配置外部只读根目录：
+
+```json
+{
+  "sandbox": {
+    "external_read_roots": [
+      "C:/path/to/downloads"
+    ]
+  }
+}
+```
+
+也可以在启动后端的同一终端使用环境变量；Windows 多个目录用分号分隔，macOS/Linux 多个目录用冒号分隔：
+
+```powershell
+$env:CHAT_AGENT_SANDBOX_EXTERNAL_READ_ROOTS = "C:\path\to\downloads;D:\shared\documents"
+```
+
+配置后重启后端。Agent 可以对这些目录使用 `list_directory`、`read_file` 和 `get_file_info`，也可以使用 `copy_file` 将外部文件复制到 workspace 内的 `tmp/` 或其他目标路径。复制源可以是 workspace 外的已配置目录，但复制目标、`write_file`、`append_file` 和 `delete_file` 仍只能位于 workspace 内。未列入 `external_read_roots` 的外部路径会被拒绝；单个复制文件超过安全大小限制时也会被拒绝。
+
 ### 7. 测试、排错与安全
 
 ```powershell

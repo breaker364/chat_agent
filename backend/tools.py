@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 # Constants (tunable parameters only — no entity-specific values)
 # ---------------------------------------------------------------------------
 _ALLOWED_ROOT: str | None = None
+_EXTERNAL_READ_ROOTS: tuple[Path, ...] = ()
 _SEARCH_CACHE: dict[str, dict[str, Any]] = {}
 _FETCH_CACHE: dict[str, dict[str, Any]] = {}
 _SEARCH_CACHE_TTL_SECONDS = 900
@@ -69,6 +70,7 @@ _MAX_FETCH_REDIRECTS = 10
 _PYTHON_RUN_TIMEOUT_SECONDS = 60
 _PYTHON_RUN_MAX_TIMEOUT_SECONDS = 120
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
+_MAX_EXTERNAL_COPY_BYTES = 100 * 1024 * 1024
 _MAX_PARALLEL_SEARCH_ROUTES = 2
 _DOWNLOAD_DIR_NAME = str(get_runtime_value("paths", "download_dir", "tmp") or "tmp")
 _SUBAGENT_SYNC_TIMEOUT_SECONDS = 120
@@ -90,6 +92,7 @@ _TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
 }
 _TOOL_SIDE_EFFECT_NAMES = {
     "Agent",
+    "copy_file",
     "write_file",
     "append_file",
     "delete_file",
@@ -940,25 +943,74 @@ _FETCH_HEADERS = {
 # ---------------------------------------------------------------------------
 
 
-def set_allowed_root(path: str | Path) -> None:
-    global _ALLOWED_ROOT
+def _normalize_external_read_roots(raw: Any) -> tuple[Path, ...]:
+    if raw is None:
+        raw = get_runtime_value("sandbox", "external_read_roots", [])
+    if isinstance(raw, str):
+        values = raw.split(os.pathsep)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = []
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        root = Path(text).expanduser().resolve()
+        key = os.path.normcase(str(root))
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return tuple(roots)
+
+
+def set_allowed_root(
+    path: str | Path,
+    *,
+    external_read_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+) -> None:
+    global _ALLOWED_ROOT, _EXTERNAL_READ_ROOTS
     _ALLOWED_ROOT = str(Path(path).resolve())
+    _EXTERNAL_READ_ROOTS = _normalize_external_read_roots(external_read_roots)
+
+
+def _resolve_access_path(path: str | Path) -> Path:
+    raw = str(path or "").strip() or "."
+    candidate = Path(raw).expanduser()
+    root = _workspace_root()
+    return candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _ensure_allowed(path: str) -> Path:
-    raw = (path or "").strip() or "."
-    candidate = Path(raw)
-    root_str = _ALLOWED_ROOT or os.getcwd()
-    root = Path(root_str).resolve()
-    if candidate.is_absolute():
-        target = candidate.resolve()
-    else:
-        target = (root / candidate).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise PermissionError(f"Access denied: {target} is outside {root}") from exc
+    target = _resolve_access_path(path)
+    root = _workspace_root()
+    if not _is_within(target, root):
+        raise PermissionError(f"Access denied: {target} is outside {root}")
     return target
+
+
+def _ensure_readable(path: str | Path) -> Path:
+    target = _resolve_access_path(path)
+    workspace = _workspace_root()
+    if _is_within(target, workspace) or any(
+        _is_within(target, root) for root in _EXTERNAL_READ_ROOTS
+    ):
+        return target
+    configured = ", ".join(str(root) for root in _EXTERNAL_READ_ROOTS) or "(none)"
+    raise PermissionError(
+        f"Access denied: {target} is outside workspace {workspace} and configured external read roots: {configured}"
+    )
 
 
 def _workspace_root() -> Path:
@@ -1537,11 +1589,11 @@ def _blocked_feishu_script_payload(path: str, reason: str) -> str:
 
 @tool
 def list_directory(path: str) -> str:
-    """List files and folders in a directory. Provide a relative path from the workspace root."""
+    """List a workspace directory or a configured external read-only directory."""
     if not path or path.strip() == "":
         path = "."
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_readable(path)
     except PermissionError as exc:
         return str(exc)
     if not target.is_dir():
@@ -1555,9 +1607,9 @@ def list_directory(path: str) -> str:
 
 @tool
 def read_file(path: str) -> str:
-    """Read text, PDF, DOCX, and XLSX files from the workspace."""
+    """Read text, PDF, DOCX, and XLSX files from the workspace or configured external roots."""
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_readable(path)
     except PermissionError as exc:
         return str(exc)
     if not target.is_file():
@@ -1580,6 +1632,45 @@ def read_file(path: str) -> str:
         return f"[Binary file: {target.name}, size={len(raw)} bytes, path={target}]"
     except Exception as exc:
         return f"Failed to read {target.name}: {exc}"
+
+
+class CopyFileInput(BaseModel):
+    """Arguments for copying a readable file into the workspace."""
+
+    source_path: str = Field(..., description="Source file path. Workspace paths or configured external read roots are allowed.")
+    destination_path: str = Field(..., description="Destination path. Must remain inside the workspace root.")
+    overwrite: bool = Field(True, description="Whether to replace an existing destination file.")
+
+
+@tool(args_schema=CopyFileInput)
+def copy_file(source_path: str, destination_path: str, overwrite: bool = True) -> str:
+    """Copy a file from the workspace or an external read root into the workspace."""
+    try:
+        source = _ensure_readable(source_path)
+        destination = _ensure_allowed(destination_path)
+    except PermissionError as exc:
+        return str(exc)
+
+    if not source.is_file():
+        return f"File not found: {source}"
+    if source == destination:
+        return f"Source and destination are the same file: {source}"
+    if source.stat().st_size > _MAX_EXTERNAL_COPY_BYTES:
+        return (
+            f"Copy refused: {source} is larger than the configured safety limit "
+            f"of {_MAX_EXTERNAL_COPY_BYTES:,} bytes"
+        )
+    if destination.exists() and destination.is_dir():
+        return f"Cannot copy to a directory: {destination}"
+    if destination.exists() and not overwrite:
+        return f"File already exists and overwrite is false: {destination}"
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    except Exception as exc:
+        return f"Failed to copy {source.name}: {exc}"
+    return f"Copied file: {source} -> {destination}"
 
 
 @tool(args_schema=AnalyzeImageInput)
@@ -1624,9 +1715,9 @@ def analyze_images(paths: list[str], prompt: str = "") -> str:
 
 @tool
 def get_file_info(path: str) -> str:
-    """Get metadata about a file or directory (size, modified time, type)."""
+    """Get metadata about a workspace or configured external file/directory."""
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_readable(path)
     except PermissionError as exc:
         return str(exc)
     if not target.exists():
@@ -2738,6 +2829,7 @@ def query_recent_mcd_orders(last_id: int = 0, size: int = 10) -> str:
 _FILE_TOOLS: list[Any] = [
     list_directory,
     read_file,
+    copy_file,
     analyze_image,
     analyze_images,
     get_file_info,
@@ -2767,9 +2859,8 @@ async def get_all_tools(
     rag_config_overrides: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Return the complete tool list: local search, file ops, and 12306 tools."""
-    if workspace_dir is not None:
-        set_allowed_root(workspace_dir)
     workspace = Path(workspace_dir or os.getcwd()).resolve()
+    set_allowed_root(workspace)
     tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
     try:
         from .rag.tools import build_knowledge_tools

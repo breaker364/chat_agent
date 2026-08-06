@@ -718,7 +718,7 @@ def _extract_artifact_paths(tools: list[dict[str, Any]]) -> list[str]:
     for item in tools:
         args = item.get("arguments")
         if isinstance(args, dict):
-            for key in ("path", "output_path", "artifact_path", "file_path"):
+            for key in ("path", "output_path", "artifact_path", "file_path", "source_path", "destination_path"):
                 raw = args.get(key)
                 if isinstance(raw, str) and raw.strip():
                     paths.append(raw.strip())
@@ -742,7 +742,9 @@ def _infer_modifications(tools: list[dict[str, Any]]) -> list[str]:
         name = str(item.get("name") or "")
         args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
         target = args.get("path") or args.get("artifact_path") or args.get("output_path") or ""
-        if name in {"write_file", "append_file", "delete_file"}:
+        if name in {"copy_file", "write_file", "append_file", "delete_file"}:
+            if name == "copy_file":
+                target = f"{args.get('source_path', '')} -> {args.get('destination_path', '')}".strip()
             modifications.append(f"{name}: {target}".strip())
         elif name == "run_python_file":
             modifications.append(f"verification/script run: {target or args.get('path', '')}".strip())

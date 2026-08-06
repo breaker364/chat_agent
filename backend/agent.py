@@ -1029,7 +1029,7 @@ async def stream_agent_events(
             return "context_gathering"
         if lowered in {"read_file", "list_directory", "get_file_info", "web_search", "web_fetch", "fetch_webpage"}:
             return "context_gathering"
-        if lowered in {"write_file", "append_file", "delete_file", "run_python_file"}:
+        if lowered in {"copy_file", "write_file", "append_file", "delete_file", "run_python_file"}:
             return "target_write" if lowered != "run_python_file" else "verification"
         return lowered or "tool_work"
 
