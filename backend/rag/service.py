@@ -1199,6 +1199,8 @@ class PersonalKnowledgeBase:
             source_path = Path(manifest.source_uri)
             if normalized_collection and manifest.collection != normalized_collection:
                 continue
+            if normalized_collection and not _is_relative_to(source_path, scan_root):
+                continue
             if not _is_relative_to(source_path, self.documents_path):
                 continue
             if str(source_path.resolve()) in supported_paths:

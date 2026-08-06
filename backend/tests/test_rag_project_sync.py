@@ -70,6 +70,21 @@ class RagProjectSyncTests(unittest.TestCase):
         self.assertEqual(third["counts"]["deleted"], 1)
         self.assertEqual(kb.search("sync token", collection="notes")["results"], [])
 
+    def test_collection_sync_preserves_indexed_legacy_root_file(self):
+        _, PersonalKnowledgeBase, _ = _load_symbols()
+        kb = PersonalKnowledgeBase(workspace_root=self.workspace, store_path=self.store_dir)
+        legacy_source = kb.documents_path / "legacy.md"
+        legacy_source.write_text("# Legacy\nroot-scoped knowledge token", encoding="utf-8")
+
+        initial = kb.sync()
+        self.assertEqual(initial["counts"]["indexed"], 1)
+        self.assertTrue(kb.search("root-scoped knowledge token", collection="default")["results"])
+
+        scoped = kb.sync(collection="default")
+
+        self.assertEqual(scoped["counts"]["deleted"], 0)
+        self.assertTrue(kb.search("root-scoped knowledge token", collection="default")["results"])
+
     def test_frontend_import_copies_file_to_collection_documents_without_indexing_until_sync(self):
         _, PersonalKnowledgeBase, _ = _load_symbols()
         incoming_dir = self.workspace / "incoming"
