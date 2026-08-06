@@ -6,6 +6,10 @@ Thumbs.db
 # Local editor settings
 .vscode/
 
+# Local credentials (copy config.example.json to config.json)
+config.json
+config.local.json
+
 # Python
 __pycache__/
 *.py[cod]

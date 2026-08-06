@@ -534,3 +534,172 @@ A: 在 `skills/` 目录创建新的技能文件夹，按照 `SKILL.md` 规范实
 ---
 
 **Chat Agent** - 让 AI 助手更智能、更强大
+
+---
+
+## 2026 更新：克隆、配置、本地模型与安全补充
+
+本节是当前推荐的从 GitHub 克隆到可用服务的完整流程。它补充上文的项目介绍、API、功能和开发说明；依赖、配置与启动请以本节为准。
+
+### 1. 前置条件
+
+- Git。
+- Python 3.11（项目当前验证环境）。
+- Node.js 18 或更高版本，含 npm。
+- 首次安装依赖和下载模型时可访问包仓库和模型仓库。
+- 使用本地 BGE-M3 embedding 与 reranker 时需预留足够磁盘空间。程序会在可用时使用 GPU；CPU 也可运行，但首次索引更慢。
+
+本项目使用嵌入式本地 Qdrant 数据目录，默认不需要额外运行 Qdrant 服务或 Docker。
+
+### 2. 克隆与安装
+
+Windows PowerShell：
+
+```powershell
+git clone <repository-url>
+cd chat-agent
+
+py -3.11 -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+npm --prefix frontend ci
+```
+
+如果 PowerShell 阻止激活脚本，只在当前终端执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\\.venv\\Scripts\\Activate.ps1
+```
+
+根目录的 `requirements.txt` 是当前后端依赖清单。上文历史说明中的 `backend/requirements.txt` 已不再使用。
+
+PyTorch 应按本机 CPU 或 CUDA 环境选择合适的安装包；如需覆盖默认安装方式，请先按 PyTorch 官方说明安装 `torch`，再执行 `pip install -r requirements.txt`。
+
+FAISS 仅用于候选向量加速，非启动 RAG 的必要条件。当前平台有可用轮子时再安装：
+
+```powershell
+python -m pip install faiss-cpu
+```
+
+无法安装 FAISS 时，在本机 `runtime_config.json` 中将 `rag.faiss_enabled` 设置为 `false`；Qdrant、BM25 与 reranker 仍可正常工作。
+
+macOS/Linux：
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+npm --prefix frontend ci
+```
+
+### 3. LLM 与可选 API
+
+仓库中的 `config.example.json` 是无密钥模板，不能直接用于对话。克隆后复制为仅本机使用的配置文件：
+
+```powershell
+Copy-Item config.example.json config.json
+notepad config.json
+```
+
+在 `config.json` 中至少填写：
+
+```json
+{
+  "base_url": "https://<your-provider>/v1",
+  "api_key": "<your-api-key>",
+  "model": "<your-model-name>"
+}
+```
+
+`config.json` 已被 Git 忽略，启动时会由项目默认配置路径读取。不要把该本机文件加入暂存区或提交到仓库。
+
+可选服务使用环境变量，且优先于配置文件：
+
+| 能力 | 环境变量 | 是否必需 |
+| --- | --- | --- |
+| 网页搜索 | `TAVILY_API_KEY` | 否 |
+| 图像模型 | `VISION_API_KEY`，并在本机配置启用 `vision.enabled` | 否 |
+| 外部 MCP 服务 | `MCD_MCP_URL`、`MCD_MCP_TOKEN` | 否 |
+| 飞书文档 | 通过前端登录，登录会话仅保存在本机 | 否 |
+
+`runtime_config.json` 是本机端口、路径与 RAG 配置。克隆到新机器后，请检查其中的绝对路径，例如 `paths.python_executable` 与 `paths.deepseek_tokenizer_dir`，但不要把 API key、令牌或 Cookie 写入其中。
+
+### 4. 下载与校验本地 RAG 模型
+
+当前生产 RAG 配置使用 BGE-M3 embedding 和 BGE reranker。它们不会在第一次检索时自动下载，首次启用知识库前应显式执行：
+
+```powershell
+python -m backend.rag.model_assets
+python -m backend.rag.model_assets --local-files-only
+```
+
+模型会写入 `knowledge_base/models/`。若模型仓库需要认证，请先在当前终端设置相应访问令牌；离线机器可将已下载的模型目录复制到同一位置，然后用 `--local-files-only` 校验。
+
+### 5. 启动服务
+
+推荐脚本会启动后端和前端并执行健康检查：
+
+```powershell
+.\\start-dev.ps1
+```
+
+默认地址：
+
+- 前端：`http://127.0.0.1:5173`
+- 后端：`http://127.0.0.1:8000`
+- 健康检查：`http://127.0.0.1:8000/health`
+
+也可分别启动：
+
+```powershell
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173
+```
+
+### 6. 知识库与 Agentic RAG
+
+知识库面板上传文件后会先显示 `PENDING_SYNC`；这是正常的两阶段流程。再点击“同步知识库”或调用 `POST /knowledge/sync` 后，系统才会完成分块、BGE-M3 向量化、Qdrant 写入、BM25 构建与 rerank 准备。
+
+建议通过前端或 API 导入文件，不要手动将文件放入 `knowledge_base/documents/` 根目录。按 collection 同步时，系统基于 collection 子目录维护索引；需要巡检全部资料时，调用不带 `collection` 的全库同步。
+
+对话提供三种知识策略：
+
+| 策略 | 行为 |
+| --- | --- |
+| `auto` | Agent 自行决定直接回答或使用个人知识、工作区、网页等只读证据。默认值。 |
+| `required` | 首次证据必须来自个人知识库；没有足够证据时不会自动改用公开网页。 |
+| `disabled` | 不访问个人知识库；工作区和网页仍可作为自动路由候选。 |
+
+API 示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"总结当前知识库中的项目计划","session_id":"demo","knowledge_policy":"required"}'
+```
+
+`research` 返回字段只包含策略、来源类别、尝试次数、预算和引用计数，不会返回模型内部推理、完整文档正文、向量或凭证。
+
+### 7. 测试、排错与安全
+
+```powershell
+python -m pytest backend/tests -q
+npm --prefix frontend exec vitest run --reporter=dot
+npm --prefix frontend run build
+```
+
+常见问题：
+
+- 对话提示缺少配置：确认已从 `config.example.json` 创建 `config.json`，并填写 `base_url`、`api_key`、`model`。
+- BGE-M3 或 reranker 报模型不存在：执行 `python -m backend.rag.model_assets`；离线部署复制缓存后执行 `--local-files-only`。
+- Qdrant 初始化失败：确认 `knowledge_base/qdrant/` 可写。
+- 导入后长期 `PENDING_SYNC`：检查同步 API 返回的 `failed` 项与 `reports/` 中的同步报告。
+
+安全要求：
+
+- 仅提交 `config.example.json` 模板；绝不提交 `config.json`、`config.local.json`、会话文件、下载目录、知识库索引或日志。
+- 将已暴露、曾写入工作区或 Git 历史的 API key、令牌和 Cookie 在其提供方控制台轮换或撤销。仅从文件删除它们不会使旧凭证失效。
+- 提交前检查：`git status` 与 `git diff --cached`。

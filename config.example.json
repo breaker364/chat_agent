@@ -1,0 +1,30 @@
+{
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "model_context_window": 128000,
+  "context_compaction": {
+    "enabled": true,
+    "trigger_remaining_tokens": 20000,
+    "retain_recent_turns": 3,
+    "summary_max_output_tokens": 4096,
+    "chunk_target_tokens": 12000,
+    "merge_target_tokens": 12000,
+    "max_retries": 1
+  },
+  "tavily_api_key": "",
+  "tavily_base_url": "",
+  "mcd_mcp_url": "",
+  "mcd_mcp_token": "",
+  "vision": {
+    "enabled": false,
+    "base_url": "",
+    "model": "",
+    "api_key_env": "VISION_API_KEY",
+    "api_key": "",
+    "max_images_per_request": 4,
+    "max_image_bytes": 20971520,
+    "max_output_tokens": 2048,
+    "timeout_seconds": 60
+  }
+}
