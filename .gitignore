@@ -28,6 +28,7 @@ env/
 env_*/
 sessions/
 sessionss/
+agent_memory/
 # Frontend dependencies / build
 frontend/node_modules/
 frontend/dist/

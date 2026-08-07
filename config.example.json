@@ -12,6 +12,19 @@
     "merge_target_tokens": 12000,
     "max_retries": 1
   },
+  "agent_memory": {
+    "enabled": false,
+    "directory": "agent_memory",
+    "recent_message_limit": 10,
+    "max_index_lines": 200,
+    "max_index_bytes": 25600,
+    "max_record_bytes": 16384,
+    "max_scan_records": 200,
+    "max_name_length": 120,
+    "max_description_length": 600,
+    "max_candidates": 8,
+    "extraction_timeout_seconds": 30
+  },
   "tavily_api_key": "",
   "tavily_base_url": "",
   "mcd_mcp_url": "",

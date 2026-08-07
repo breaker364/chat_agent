@@ -41,7 +41,7 @@ from .adapters import (
 from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
-from .config import get_runtime_value, load_mcd_mcp_config
+from .config import get_runtime_value, load_agent_memory_config, load_mcd_mcp_config
 from .runtime_context import copy_runtime_context, current_run_id, current_session_id
 from .vision import analyze_image_file, analyze_image_files
 from .feishu_web_login import (
@@ -1000,6 +1000,27 @@ def _ensure_allowed(path: str) -> Path:
     return target
 
 
+def _managed_memory_root() -> Path | None:
+    """Return the enabled memory root without granting generic write access to it."""
+    try:
+        settings = load_agent_memory_config(workspace_dir=_workspace_root())
+        if settings.get("enabled", False):
+            return Path(str(settings["directory"])).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_writable(path: str) -> Path:
+    target = _ensure_allowed(path)
+    memory_root = _managed_memory_root()
+    if memory_root is not None and _is_within(target, memory_root):
+        raise PermissionError(
+            f"Access denied: {target} is managed by the persistent memory service"
+        )
+    return target
+
+
 def _ensure_readable(path: str | Path) -> Path:
     target = _resolve_access_path(path)
     workspace = _workspace_root()
@@ -1647,7 +1668,7 @@ def copy_file(source_path: str, destination_path: str, overwrite: bool = True) -
     """Copy a file from the workspace or an external read root into the workspace."""
     try:
         source = _ensure_readable(source_path)
-        destination = _ensure_allowed(destination_path)
+        destination = _ensure_writable(destination_path)
     except PermissionError as exc:
         return str(exc)
 
@@ -1739,7 +1760,7 @@ def get_file_info(path: str) -> str:
 def write_file(path: str, content: str, overwrite: bool = True) -> str:
     """Create or replace a text file in the workspace. Use overwrite=false to avoid replacing an existing file."""
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_writable(path)
     except PermissionError as exc:
         return str(exc)
     if target.suffix.lower() == ".py":
@@ -1761,7 +1782,7 @@ def write_file(path: str, content: str, overwrite: bool = True) -> str:
 def append_file(path: str, content: str) -> str:
     """Append text to a file in the workspace. Creates the file if it does not exist."""
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_writable(path)
     except PermissionError as exc:
         return str(exc)
     if target.suffix.lower() == ".py":
@@ -1781,7 +1802,7 @@ def append_file(path: str, content: str) -> str:
 def delete_file(path: str) -> str:
     """Delete a file in the workspace. Does not delete directories."""
     try:
-        target = _ensure_allowed(path)
+        target = _ensure_writable(path)
     except PermissionError as exc:
         return str(exc)
     if not target.exists():
@@ -2861,7 +2882,10 @@ async def get_all_tools(
     """Return the complete tool list: local search, file ops, and 12306 tools."""
     workspace = Path(workspace_dir or os.getcwd()).resolve()
     set_allowed_root(workspace)
-    tools = list(_FILE_TOOLS) + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
+    file_tools = list(_FILE_TOOLS)
+    if _managed_memory_root() is not None:
+        file_tools = [tool_obj for tool_obj in file_tools if getattr(tool_obj, "name", "") != "run_python_file"]
+    tools = file_tools + list(_SEARCH_TOOLS) + list(_AGENT_TOOLS)
     try:
         from .rag.tools import build_knowledge_tools
 

@@ -19,7 +19,14 @@ from sse_starlette.sse import EventSourceResponse
 from .agent import build_agent, run_agentic_research, stream_agent_events
 from .agentic_research.models import ResearchPolicyError, resolve_knowledge_policy
 from .agentic_research.runtime import build_synthesis_context
-from .config import PROJECT_ROOT, get_runtime_value
+from .config import PROJECT_ROOT, get_runtime_value, load_agent_memory_config
+from .memory import (
+    AgentMemoryStore,
+    MemoryExtractionScheduler,
+    MemoryNotFoundError,
+    MemoryValidationError,
+    StructuredMemoryExtractor,
+)
 from .session_store import SessionStore, TOOL_EVENT_SCHEMA_VERSION
 from .session_events import get_session_event_hub
 from .subagent_runtime import get_subagent_manager as get_runtime_subagent_manager
@@ -75,6 +82,8 @@ async def bootstrap_feishu_auth_on_startup() -> None:
 _agent: Any = None
 _agent_lock: Any = None
 _session_store: SessionStore | None = None
+_memory_scheduler: MemoryExtractionScheduler | None = None
+_memory_scheduler_key: tuple[Any, ...] | None = None
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
 _ACTIVE_RUNS_LOCK = RLock()
 _CONTEXT_FAILURE_CODES = {
@@ -98,6 +107,85 @@ def get_session_store() -> SessionStore:
     if _session_store is None:
         _session_store = SessionStore(Path.cwd().resolve())
     return _session_store
+
+
+def get_agent_memory_store() -> AgentMemoryStore | None:
+    """Return the enabled memory store scoped to the current trusted workspace."""
+    settings = load_agent_memory_config(workspace_dir=_workspace())
+    if not settings.get("enabled", False):
+        return None
+    return AgentMemoryStore(Path(str(settings["directory"])), settings)
+
+
+def _record_memory_activity(session_id: str, payload: dict[str, Any]) -> None:
+    """Persist bounded memory metadata without conversation content or model reasoning."""
+    stage = str(payload.get("stage") or "memory_extraction_skipped")[:80]
+    activity: dict[str, Any] = {"stage": stage, "at": round(time.time(), 3)}
+    if isinstance(payload.get("count"), int):
+        activity["count"] = max(0, min(int(payload["count"]), 100))
+    if isinstance(payload.get("types"), list):
+        activity["types"] = [
+            str(item) for item in payload["types"]
+            if str(item) in {"user", "feedback", "project", "reference"}
+        ][:4]
+    if isinstance(payload.get("error_category"), str):
+        activity["error_category"] = str(payload["error_category"])[:80]
+    if isinstance(payload.get("reason"), str):
+        activity["reason"] = str(payload["reason"])[:80]
+    if isinstance(payload.get("coalesced"), bool):
+        activity["coalesced"] = payload["coalesced"]
+    try:
+        store = get_session_store()
+        session = store.create_or_get_session(session_id)
+        progress = session.setdefault("task_progress", {})
+        events = progress.get("memory_activity")
+        events = list(events) if isinstance(events, list) else []
+        events.append(activity)
+        store.update_progress(session_id, memory_activity=events[-20:])
+    except Exception:
+        pass
+
+
+def get_memory_scheduler() -> MemoryExtractionScheduler | None:
+    """Get the in-process scheduler for this workspace's enabled memory root."""
+    global _memory_scheduler, _memory_scheduler_key
+    settings = load_agent_memory_config(workspace_dir=_workspace())
+    if not settings.get("enabled", False):
+        return None
+    key = (
+        str(settings["directory"]),
+        int(settings["recent_message_limit"]),
+        int(settings["max_candidates"]),
+        int(settings["extraction_timeout_seconds"]),
+    )
+    if _memory_scheduler is None or _memory_scheduler_key != key:
+        store = AgentMemoryStore(Path(str(settings["directory"])), settings)
+        extractor = StructuredMemoryExtractor(
+            timeout_seconds=int(settings["extraction_timeout_seconds"]),
+            max_candidates=int(settings["max_candidates"]),
+        )
+        _memory_scheduler = MemoryExtractionScheduler(
+            store,
+            extractor,
+            recent_message_limit=int(settings["recent_message_limit"]),
+            on_activity=_record_memory_activity,
+        )
+        _memory_scheduler_key = key
+    return _memory_scheduler
+
+
+def _schedule_memory_extraction(store: SessionStore, session_id: str) -> str:
+    """Schedule best-effort extraction only after the assistant turn is persisted."""
+    scheduler = get_memory_scheduler()
+    if scheduler is None:
+        return "disabled"
+    try:
+        session = store.load_session(session_id) or {}
+        messages = session.get("messages") if isinstance(session, dict) else []
+        return scheduler.schedule(session_id, messages if isinstance(messages, list) else [])
+    except Exception:
+        _record_memory_activity(session_id, {"stage": "memory_extraction_failed", "error_category": "schedule_error"})
+        return "failed"
 
 
 def get_subagent_manager() -> Any:
@@ -1155,6 +1243,50 @@ async def execute_skill_api(name: str, request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _memory_disabled_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "Persistent memory is disabled", "code": "memory_disabled"},
+        status_code=404,
+    )
+
+
+@app.get("/memories")
+async def list_memories() -> JSONResponse:
+    store = get_agent_memory_store()
+    if store is None:
+        return _memory_disabled_response()
+    return JSONResponse({"memories": [summary.to_dict() for summary in store.list_summaries()]})
+
+
+@app.get("/memories/{memory_id}")
+async def get_memory(memory_id: str) -> JSONResponse:
+    store = get_agent_memory_store()
+    if store is None:
+        return _memory_disabled_response()
+    try:
+        return JSONResponse({"memory": store.read(memory_id).to_dict()})
+    except MemoryValidationError:
+        return JSONResponse({"error": "Invalid memory id", "code": "invalid_memory_id"}, status_code=400)
+    except MemoryNotFoundError:
+        return JSONResponse({"error": "Memory not found", "code": "memory_not_found"}, status_code=404)
+
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str) -> JSONResponse:
+    store = get_agent_memory_store()
+    if store is None:
+        return _memory_disabled_response()
+    try:
+        deleted = store.delete(memory_id)
+    except MemoryValidationError:
+        return JSONResponse({"error": "Invalid memory id", "code": "invalid_memory_id"}, status_code=400)
+    except OSError:
+        return JSONResponse({"error": "Memory could not be deleted", "code": "memory_delete_failed"}, status_code=500)
+    if not deleted:
+        return JSONResponse({"error": "Memory not found", "code": "memory_not_found"}, status_code=404)
+    return JSONResponse({"ok": True, "memory_id": memory_id})
+
+
 @app.get("/sessions")
 async def list_sessions() -> JSONResponse:
     return JSONResponse({"sessions": get_session_store().list_sessions()})
@@ -1618,6 +1750,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             elapsed_seconds=0,
                             last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
                         )
+                        _schedule_memory_extraction(store, session["session_id"])
                         turn_finalized = True
 
                     if await request.is_disconnected():
@@ -1659,6 +1792,7 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                     last_debug_stage="interrupted",
                     usage=partial_usage,
                 )
+                _schedule_memory_extraction(store, session["session_id"])
             event_hub.unsubscribe(session["session_id"], event_queue)
             reset_runtime_context(context_tokens)
             clear_tool_dedupe_cache(run_id)
@@ -1816,6 +1950,7 @@ async def chat_sync(request: Request) -> JSONResponse:
             last_debug_stage="done" if not terminal_status else "protected_context_capacity_exceeded",
             usage=final_usage,
         )
+        _schedule_memory_extraction(store, session["session_id"])
         payload: dict[str, Any] = {
             "reply": final_text,
             "session_id": session["session_id"],

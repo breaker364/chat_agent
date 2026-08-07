@@ -13,7 +13,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import Runnable
 from langgraph.prebuilt import create_react_agent
 
-from .config import create_chat_deepseek, load_context_compaction_config, load_llm_config
+from .config import (
+    create_chat_deepseek,
+    load_agent_memory_config,
+    load_context_compaction_config,
+    load_llm_config,
+)
 from .agentic_research.config import load_agentic_research_config
 from .agentic_research.runtime import (
     EVIDENCE_TOOL_NAMES,
@@ -34,6 +39,7 @@ from .context_compaction import (
 from .prompts import load_agent_policy, load_system_prompt
 from .session_events import get_session_event_hub
 from .session_store import SessionStore
+from .memory import MemoryContextProvider
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
 from .runtime_context import current_run_id, current_session_id
@@ -256,6 +262,7 @@ def _estimate_context_metrics(
     effective_message: str,
     skill_catalog_text: str,
     resume_text: str,
+    memory_context: str = "",
 ) -> dict[str, Any]:
     history_payloads = [_history_entry_text(entry) for entry in (history_items or [])]
     protected_tool_chars = sum(
@@ -272,8 +279,18 @@ def _estimate_context_metrics(
     if resume_text:
         context_char_count += len(resume_text)
         context_message_count += 1
+    if memory_context:
+        context_char_count += len(memory_context)
+        context_message_count += 1
     context_token_estimate = estimate_tokens_from_text("".join(
-        [SYSTEM_PROMPT, AGENT_POLICY or "", skill_catalog_text or "", resume_text or "", effective_message]
+        [
+            SYSTEM_PROMPT,
+            AGENT_POLICY or "",
+            memory_context or "",
+            skill_catalog_text or "",
+            resume_text or "",
+            effective_message,
+        ]
         + history_payloads
     ))
     return {
@@ -1569,6 +1586,14 @@ async def stream_agent_events(
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
     if AGENT_POLICY:
         messages.append(SystemMessage(content=f"Agent behavior policy:\n{AGENT_POLICY}"))
+    memory_context = ""
+    try:
+        memory_config = load_agent_memory_config(workspace_dir=Path.cwd())
+        memory_context = MemoryContextProvider.from_config(memory_config).get_context()
+    except Exception:
+        memory_context = ""
+    if memory_context:
+        messages.append(SystemMessage(content=memory_context))
     if synthesis_context:
         messages.append(SystemMessage(content=synthesis_context[:24_000]))
     skill_catalog_text = get_skill_catalog_text(Path.cwd())
@@ -1757,6 +1782,7 @@ async def stream_agent_events(
         effective_message=effective_message,
         skill_catalog_text=skill_catalog_text,
         resume_text=resume_text,
+        memory_context=memory_context,
     )
     pre_capacity_info = check_context_capacity(
         pre_compaction_metrics["context_token_estimate"],
@@ -1841,6 +1867,7 @@ async def stream_agent_events(
         effective_message=effective_message,
         skill_catalog_text=skill_catalog_text,
         resume_text=resume_text,
+        memory_context=memory_context,
     )
     history_payloads = context_metrics["history_payloads"]
     protected_tool_chars = context_metrics["protected_tool_chars"]

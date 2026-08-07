@@ -101,6 +101,82 @@ DEFAULT_CONTEXT_COMPACTION_CONFIG: dict[str, Any] = {
 }
 
 
+DEFAULT_AGENT_MEMORY_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "directory": "agent_memory",
+    "recent_message_limit": 10,
+    "max_index_lines": 200,
+    "max_index_bytes": 25 * 1024,
+    "max_record_bytes": 16 * 1024,
+    "max_scan_records": 200,
+    "max_name_length": 120,
+    "max_description_length": 600,
+    "max_candidates": 8,
+    "extraction_timeout_seconds": 30,
+}
+
+
+def load_agent_memory_config(
+    config_path: str | Path | None = None,
+    *,
+    workspace_dir: str | Path | None = None,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load bounded persistent-memory settings for one trusted workspace.
+
+    The directory is intentionally constrained to the supplied workspace.  This
+    MVP has no user ownership namespace, so callers must use it only for the
+    current trusted workspace.
+    """
+    data = raw if isinstance(raw, dict) else load_app_config(config_path)
+    section = data.get("agent_memory")
+    section = section if isinstance(section, dict) else {}
+    workspace = Path(workspace_dir or Path.cwd()).expanduser().resolve()
+
+    def positive_int(key: str) -> int:
+        default = int(DEFAULT_AGENT_MEMORY_CONFIG[key])
+        value = section.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return default
+        return value
+
+    enabled = section.get("enabled", DEFAULT_AGENT_MEMORY_CONFIG["enabled"])
+    if not isinstance(enabled, bool):
+        enabled = bool(DEFAULT_AGENT_MEMORY_CONFIG["enabled"])
+
+    configured_directory = section.get("directory", DEFAULT_AGENT_MEMORY_CONFIG["directory"])
+    directory_text = str(configured_directory or "").strip()
+    candidate = Path(directory_text or str(DEFAULT_AGENT_MEMORY_CONFIG["directory"])).expanduser()
+    safe_relative_directory = (
+        bool(directory_text or candidate)
+        and not candidate.is_absolute()
+        and "\x00" not in directory_text
+        and candidate != Path(".")
+        and ".." not in candidate.parts
+    )
+    resolved_directory = (workspace / candidate).resolve()
+    try:
+        if not safe_relative_directory:
+            raise ValueError("memory directory must be a nested workspace path")
+        resolved_directory.relative_to(workspace)
+    except ValueError:
+        resolved_directory = (workspace / str(DEFAULT_AGENT_MEMORY_CONFIG["directory"])).resolve()
+
+    return {
+        "enabled": enabled,
+        "directory": str(resolved_directory),
+        "recent_message_limit": positive_int("recent_message_limit"),
+        "max_index_lines": positive_int("max_index_lines"),
+        "max_index_bytes": positive_int("max_index_bytes"),
+        "max_record_bytes": positive_int("max_record_bytes"),
+        "max_scan_records": positive_int("max_scan_records"),
+        "max_name_length": positive_int("max_name_length"),
+        "max_description_length": positive_int("max_description_length"),
+        "max_candidates": positive_int("max_candidates"),
+        "extraction_timeout_seconds": positive_int("extraction_timeout_seconds"),
+    }
+
+
 def load_context_compaction_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """Load optional context-compaction settings with safe defaults."""
     data = load_app_config(config_path)

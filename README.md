@@ -178,6 +178,30 @@ npm run dev
 | `tavily_api_key` | string | 否 | Tavily 搜索 API 密钥 |
 | `tavily_base_url` | string | 否 | Tavily API 地址 |
 
+### 持久化 Agent 记忆
+
+持久化记忆默认关闭。启用后，它的作用域是当前受信任工作区，所有该工作区的 session 共享同一组记忆；它不适用于未经所有者隔离和访问控制的多用户部署。
+
+```json
+{
+  "agent_memory": {
+    "enabled": true,
+    "directory": "agent_memory",
+    "recent_message_limit": 10,
+    "max_index_lines": 200,
+    "max_index_bytes": 25600,
+    "max_record_bytes": 16384,
+    "max_scan_records": 200,
+    "max_candidates": 8,
+    "extraction_timeout_seconds": 30
+  }
+}
+```
+
+每次助手消息成功写入会话后，系统会在后台从最近的用户和助手消息中提取可能跨会话复用的信息。只会保留用户偏好、协作反馈、不能从代码或 Git 推导的项目背景及外部参考摘要；不会保存临时任务、当前执行进度、代码模式、Git 历史、完整工具结果、调试过程、模型推理或原始敏感数据。提取失败不会影响本轮回复。
+
+记录保存在工作区内受控的 `agent_memory/` 目录。`MEMORY.md` 只保存有界索引，后续 Agent 会把索引作为可能过时的数据参考，并在需要时通过现有读文件能力读取单条 `.md` 记录；完整正文不会自动进入 system prompt。可通过 `DELETE /memories/{memory_id}` 遗忘记录，删除不影响聊天历史、工具 transcript 或知识库。
+
 ## API 接口
 
 ### 对话接口
@@ -232,6 +256,16 @@ Content-Type: application/json
 ```http
 DELETE /sessions/{session_id}
 ```
+
+### 持久化记忆管理
+
+```http
+GET /memories
+GET /memories/{memory_id}
+DELETE /memories/{memory_id}
+```
+
+列表接口只返回摘要；读取单条记录才返回正文。功能关闭时接口返回 `memory_disabled`，不创建或读取任何记忆文件。
 
 ### 知识库接口
 
