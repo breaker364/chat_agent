@@ -1759,30 +1759,30 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                     if not private_transcript_event:
                         yield _with_run_attribution(event, parsed, session["session_id"], run_id)
         finally:
-            if not turn_finalized and (assistant_text.strip() or assistant_tools):
-                partial_text = assistant_text.strip() or "(stopped before text reply)"
+            if not turn_finalized:
                 failure_reason = (
                     "Client disconnected before the agent finished. "
                     "Continue from persisted task_plan and task_outputs instead of restarting."
                     if interrupted
                     else "Agent stream ended before a final done event. Continue from persisted context."
                 )
-                partial_text = _finalize_agent_response(
-                    store=store,
-                    session_id=session["session_id"],
-                    user_message=message,
-                    final_text=partial_text,
-                    tools=assistant_tools,
-                    status="blocked",
-                    failure_reason=failure_reason,
-                )
-                partial_usage = normalize_usage(run_usage, output_text=partial_text)
-                store.replace_last_assistant_message(
-                    session["session_id"],
-                    partial_text,
-                    tools=assistant_tools,
-                    usage=partial_usage,
-                )
+                partial_usage = normalize_usage(run_usage)
+                recovery = {
+                    "run_id": run_id,
+                    "status": "interrupted" if interrupted else "blocked",
+                    "reason": failure_reason,
+                    "completed_tool_call_ids": [
+                        str(event.get("tool_call_id") or "")
+                        for event in assistant_tools
+                        if event.get("type") == "tool_result" and event.get("tool_call_id")
+                    ],
+                    "tool_ledger_references": [
+                        str(event.get("tool_call_id") or "")
+                        for event in assistant_tools
+                        if event.get("tool_call_id")
+                    ],
+                    "recovery_action": "continue",
+                }
                 store.update_progress(
                     session["session_id"],
                     status="blocked",
@@ -1791,8 +1791,8 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                     elapsed_seconds=0,
                     last_debug_stage="interrupted",
                     usage=partial_usage,
+                    interrupted_run=recovery,
                 )
-                _schedule_memory_extraction(store, session["session_id"])
             event_hub.unsubscribe(session["session_id"], event_queue)
             reset_runtime_context(context_tokens)
             clear_tool_dedupe_cache(run_id)

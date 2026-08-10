@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import threading
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,33 @@ MAX_TOOL_RESULT_CACHE_ENTRIES = 200
 TOOL_EVENT_SCHEMA_VERSION = 1
 RECENT_TOOL_HISTORY_TURNS = 3
 _SESSION_FILE_LOCK = threading.RLock()
+
+
+class SessionPersistenceError(RuntimeError):
+    def __init__(self, candidate_path: Path, cause: Exception) -> None:
+        self.candidate_path = str(candidate_path)
+        super().__init__(f"Session replacement failed; recovery candidate retained at {candidate_path}: {cause}")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    json.loads(serialized)
+    candidate = path.with_name(f"session.tmp-{uuid4().hex}.json")
+    try:
+        with candidate.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            candidate.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    try:
+        candidate.replace(path)
+    except Exception as exc:
+        raise SessionPersistenceError(candidate, exc) from exc
 
 
 def _now_iso() -> str:
@@ -355,11 +384,43 @@ def _append_historical_tool_history_entry(
 ) -> None:
     if not events:
         return
+    calls = {
+        str(event.get("tool_call_id") or ""): event
+        for event in events
+        if event.get("type") == "tool_call" and event.get("tool_call_id")
+    }
+    records: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("type") != "tool_result":
+            continue
+        call = calls.get(str(event.get("tool_call_id") or ""), {})
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        target = next(
+            (
+                str(arguments.get(key) or "")
+                for key in ("target", "path", "url", "resource_id", "id")
+                if arguments.get(key)
+            ),
+            "",
+        )
+        content = event.get("content")
+        serialized = _stable_history_projection_value(content)
+        failed = isinstance(content, dict) and bool(content.get("error"))
+        records.append(
+            {
+                "operation": str(call.get("name") or event.get("name") or "tool"),
+                "target": target,
+                "status": "failed" if failed else "succeeded",
+                "summary": f"Completed tool result ({len(serialized)} characters).",
+                "content_hash": "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+                "audit_reference": str(event.get("tool_call_id") or ""),
+            }
+        )
     history.append(
         {
             "role": "historical_tool_context",
             "content": json.dumps(
-                {"historical_tool_events": events},
+                {"completed_tool_records": records},
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
@@ -553,12 +614,6 @@ class SessionStore:
             session["updated_at"] = _now_iso()
             path = self.session_path(session["session_id"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            for stale_tmp in path.parent.glob("session.tmp-*.json"):
-                try:
-                    stale_tmp.unlink()
-                except Exception:
-                    pass
-
             payload = dict(session)
             progress = payload.get("task_progress")
             if isinstance(progress, dict):
@@ -572,12 +627,7 @@ class SessionStore:
                     _compact_message(message) if isinstance(message, dict) else message
                     for message in messages
                 ]
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            for stale_tmp in path.parent.glob("session.tmp-*.json"):
-                try:
-                    stale_tmp.unlink()
-                except Exception:
-                    pass
+            _atomic_write_json(path, payload)
 
     def get_context_compaction(self, session_id: str) -> dict[str, Any] | None:
         session = self.load_session(session_id)
@@ -611,20 +661,7 @@ class SessionStore:
                     _compact_message(message) if isinstance(message, dict) else message
                     for message in messages
                 ]
-            temporary_path = path.with_name(f"session.tmp-{uuid4().hex}.json")
-            try:
-                temporary_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                temporary_path.replace(path)
-            finally:
-                try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    pass
+            _atomic_write_json(path, payload)
 
     def record_execution_summary(self, session_id: str, summary: dict[str, Any]) -> dict[str, Any]:
         session = self.create_or_get_session(session_id)

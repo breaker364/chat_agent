@@ -24,6 +24,18 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from .mutation_guard import (
+    CommandManifest,
+    MutationLedger,
+    append_conflicts_with_workflow,
+    build_idempotency_key,
+    parse_standardized_remote_command,
+)
+from .mutation_manifest import normalize_command_manifest
+from .runtime_context import current_run_id
+
+
+_RUN_MUTATION_LEDGERS: dict[str, MutationLedger] = {}
 @dataclass
 class SkillDefinition:
     name: str
@@ -317,21 +329,78 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
     if skill is None:
         raise ValueError(f"Skill '{skill_name}' is not installed.")
 
-    runner = _skill_runner_path(skill)
-    if runner is not None:
-        return await asyncio.to_thread(_execute_skill_runner_sync, skill, params, root)
+    request = str(params.get("request") or "").strip()
+    is_standardized = request.lower().startswith(("lark ", "lark_cli "))
+    manifest: CommandManifest | None = None
+    if is_standardized:
+        try:
+            request_manifest = normalize_command_manifest(request)
+        except ValueError as exc:
+            raise ValueError("Unclassified standardized remote command was blocked before dispatch.") from exc
+        supplied_manifest = params.get("manifest")
+        if supplied_manifest is not None:
+            manifest = normalize_command_manifest(supplied_manifest)
+            if manifest != request_manifest:
+                raise ValueError("Provided manifest disagrees with the standardized request.")
+        else:
+            manifest = request_manifest
+        params = dict(params)
+        params["manifest"] = manifest.to_dict()
 
-    cfg = load_llm_config()
-    llm = create_chat_deepseek(cfg, temperature=0.3, streaming=False, max_tokens=8192)
-    prompt = fill_prompt_template(skill.prompt_template, params)
-    system_prompt = (
-        "You are a skill execution engine. Follow the skill definition exactly. "
-        "If resources or scripts are listed, treat them as part of the skill context."
+    async def dispatch() -> str:
+        runner = _skill_runner_path(skill)
+        if runner is not None:
+            return await asyncio.to_thread(_execute_skill_runner_sync, skill, params, root)
+
+        cfg = load_llm_config()
+        llm = create_chat_deepseek(cfg, temperature=0.3, streaming=False, max_tokens=8192)
+        prompt = fill_prompt_template(skill.prompt_template, params)
+        system_prompt = (
+            "You are a skill execution engine. Follow the skill definition exactly. "
+            "If resources or scripts are listed, treat them as part of the skill context."
+        )
+        response = await llm.ainvoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
+        )
+        return response.content if hasattr(response, "content") else str(response)
+
+    if manifest is None:
+        return await dispatch()
+    if not manifest.provider or not manifest.resource:
+        raise ValueError("Command manifest is missing provider or resource.")
+    if not manifest.mutating:
+        return await dispatch()
+    if append_conflicts_with_workflow(manifest):
+        raise ValueError("append was blocked because the workflow requires a replacement operation.")
+
+    run_id = current_run_id()
+    if not run_id:
+        return await dispatch()
+    ledger = _RUN_MUTATION_LEDGERS.setdefault(run_id, MutationLedger())
+    key = build_idempotency_key(manifest, params)
+    existing = ledger.succeeded_result(key)
+    if existing is not None:
+        return str(existing.result)
+
+    result = await dispatch()
+    try:
+        audit = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        audit = {}
+    ledger.record_success(
+        key,
+        manifest,
+        result,
+        before_version=str(audit.get("before_version") or "") if isinstance(audit, dict) else "",
+        after_version=str(audit.get("after_version") or "") if isinstance(audit, dict) else "",
+        verified=bool(audit.get("verified", False)) if isinstance(audit, dict) else False,
     )
-    response = await llm.ainvoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
-    )
-    return response.content if hasattr(response, "content") else str(response)
+    return result
+
+
+def clear_run_mutation_ledger(run_id: str | None) -> None:
+    if run_id:
+        _RUN_MUTATION_LEDGERS.pop(str(run_id), None)
 
 
 def _run_coro_in_thread(coro: Any) -> Any:

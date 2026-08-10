@@ -136,7 +136,7 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual(tool_entries[0]["tool_calls"][0]["args"], arguments)
         self.assertEqual(tool_entries[1]["content"], content)
 
-    def test_older_tool_history_is_available_as_textual_compaction_source(self):
+    def test_older_tool_history_is_projected_without_replaying_raw_payload(self):
         old_tools = [
             _tool_call(0, "old-call", "lookup", {"query": "old exact query"}),
             _tool_result(1, "old-call", "lookup", "old exact result"),
@@ -156,8 +156,13 @@ class ToolHistoryTests(unittest.TestCase):
             entry for entry in history if entry.get("role") == "historical_tool_context"
         ]
         self.assertEqual(len(old_context), 1)
-        self.assertIn("old exact query", old_context[0]["content"])
-        self.assertIn("old exact result", old_context[0]["content"])
+        projection = json.loads(old_context[0]["content"])
+        self.assertEqual(projection["completed_tool_records"][0]["operation"], "lookup")
+        self.assertEqual(projection["completed_tool_records"][0]["status"], "succeeded")
+        self.assertEqual(projection["completed_tool_records"][0]["audit_reference"], "old-call")
+        self.assertTrue(projection["completed_tool_records"][0]["content_hash"].startswith("sha256:"))
+        self.assertNotIn("old exact query", old_context[0]["content"])
+        self.assertNotIn("old exact result", old_context[0]["content"])
         self.assertEqual(
             len([entry for entry in history if entry.get("role") == "assistant_tool_calls"]),
             0,
@@ -469,7 +474,7 @@ class ToolHistoryTests(unittest.TestCase):
             self.assertFalse(any(isinstance(message, AIMessage) and message.tool_calls for message in messages))
             self.assertIn("malformed_tool_call", messages[0].content)
 
-    def test_capacity_overflow_marks_sync_turn_failed(self):
+    def test_character_threshold_does_not_block_sync_turn(self):
         tools = [_tool_call(0, "call-1", "lookup", {"query": "x" * 100}), _tool_result(1, "call-1", "lookup", "y" * 100)]
         self._complete_turn("overflow-sync", "question", "answer", tools)
         agent = CapturingAgent()
@@ -482,12 +487,10 @@ class ToolHistoryTests(unittest.TestCase):
 
         payload = json.loads(response.body)
         session = self.store.load_session("overflow-sync")
-        self.assertIn("Protected tool history exceeds", payload["reply"])
-        self.assertEqual(agent.calls, [])
-        self.assertEqual(session["task_progress"]["execution_summary"]["status"], "failed")
-        self.assertEqual(session["task_progress"]["status"], "failed")
+        self.assertNotIn("Protected tool history exceeds", payload["reply"])
+        self.assertEqual(len(agent.calls), 1)
 
-    def test_capacity_overflow_marks_stream_turn_failed(self):
+    def test_character_threshold_does_not_block_stream_turn(self):
         tools = [_tool_call(0, "call-1", "lookup", {"query": "x" * 100}), _tool_result(1, "call-1", "lookup", "y" * 100)]
         self._complete_turn("overflow-stream", "question", "answer", tools)
         agent = CapturingAgent()
@@ -504,10 +507,8 @@ class ToolHistoryTests(unittest.TestCase):
             events = asyncio.run(consume())
 
         session = self.store.load_session("overflow-stream")
-        self.assertTrue(any(event["event"] == "error" for event in events))
-        self.assertEqual(agent.calls, [])
-        self.assertEqual(session["task_progress"]["execution_summary"]["status"], "failed")
-        self.assertEqual(session["task_progress"]["status"], "failed")
+        self.assertFalse(any("Protected tool history exceeds" in event["data"] for event in events))
+        self.assertEqual(len(agent.calls), 1)
 
     def test_context_compaction_failure_marks_sync_turn_failed(self):
         async def fake_get_agent():
@@ -537,6 +538,31 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertIn("Context summary unavailable", payload["reply"])
         self.assertEqual(session["task_progress"]["execution_summary"]["status"], "failed")
         self.assertEqual(session["task_progress"]["status"], "failed")
+
+    def test_non_terminal_stream_text_is_not_persisted_as_assistant_message(self):
+        async def fake_stream(*_args, **_kwargs):
+            yield {"event": "text", "data": json.dumps("planning narration")}
+
+        async def fake_get_agent():
+            return object()
+
+        request = StreamRequest({"message": "request", "session_id": "interrupted"})
+        with patch("backend.main.get_session_store", return_value=self.store), patch(
+            "backend.main.get_agent", fake_get_agent
+        ), patch("backend.main.stream_agent_events", fake_stream), patch(
+            "backend.main.EventSourceResponse", lambda generator: generator
+        ):
+            generator = asyncio.run(chat_stream(request))
+
+            async def consume():
+                return [event async for event in generator]
+
+            asyncio.run(consume())
+
+        session = self.store.load_session("interrupted")
+        self.assertEqual([item["role"] for item in session["messages"]], ["user"])
+        self.assertEqual(session["task_progress"]["status"], "blocked")
+        self.assertEqual(session["task_progress"]["interrupted_run"]["run_id"].split(":")[0], "interrupted")
 
     def test_only_latest_three_turns_rehydrate_native_tool_messages_in_event_order(self):
         for turn in range(1, 5):
@@ -599,7 +625,7 @@ class ToolHistoryTests(unittest.TestCase):
         self.assertEqual(unmatched[0]["content"], "unmatched")
         self.assertTrue(unmatched[0]["legacy_unmatched"])
 
-    def test_protected_tool_context_overflow_stops_before_model_invocation(self):
+    def test_character_threshold_does_not_stop_before_model_invocation(self):
         tools = [
             _tool_call(0, "call-1", "lookup", {"query": "x" * 100}),
             _tool_result(1, "call-1", "lookup", "y" * 100),
@@ -612,9 +638,8 @@ class ToolHistoryTests(unittest.TestCase):
                 return [event async for event in stream_agent_events(agent, "next request", "overflow", self.store.get_history("overflow"))]
 
         events = asyncio.run(collect())
-        errors = [json.loads(event["data"]) for event in events if event["event"] == "error"]
-        self.assertEqual(agent.calls, [])
-        self.assertEqual(errors[0]["code"], "protected_context_capacity_exceeded")
+        self.assertEqual(len(agent.calls), 1)
+        self.assertFalse(any("Protected tool history exceeds" in event["data"] for event in events))
 
     def test_get_history_deduplicates_identical_protected_tool_pairs_without_mutating_storage(self):
         arguments = {"query": "same"}

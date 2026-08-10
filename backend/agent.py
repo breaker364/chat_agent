@@ -209,6 +209,7 @@ def get_model_context_window(model_name: str) -> int | None:
 def check_context_capacity(
     context_token_estimate: int,
     model_name: str,
+    reserved_output_tokens: int = 0,
 ) -> dict[str, Any]:
     """Check the remaining context capacity for the current model.
 
@@ -224,21 +225,27 @@ def check_context_capacity(
         - is_exceeded: Whether the context exceeds the model limit.
     """
     model_limit = get_model_context_window(model_name)
+    output_reserve = max(0, int(reserved_output_tokens))
 
     if model_limit is None:
         return {
             "model_context_window": None,
             "context_token_estimate": context_token_estimate,
+            "reserved_output_tokens": output_reserve,
+            "input_token_budget": None,
             "remaining_tokens": None,
             "is_exceeded": False,
         }
 
-    remaining = max(0, model_limit - context_token_estimate)
+    input_budget = max(0, model_limit - output_reserve)
+    remaining = max(0, input_budget - context_token_estimate)
     return {
         "model_context_window": model_limit,
         "context_token_estimate": context_token_estimate,
+        "reserved_output_tokens": output_reserve,
+        "input_token_budget": input_budget,
         "remaining_tokens": remaining,
-        "is_exceeded": context_token_estimate > model_limit,
+        "is_exceeded": context_token_estimate > input_budget,
     }
 
 
@@ -1777,6 +1784,7 @@ async def stream_agent_events(
     model_config = load_llm_config()
     model_name = model_config.get("model", "")
     compaction_settings = load_context_compaction_config()
+    reserved_output_tokens = int(compaction_settings.get("reserved_output_tokens", 0))
     pre_compaction_metrics = _estimate_context_metrics(
         raw_history,
         effective_message=effective_message,
@@ -1787,6 +1795,7 @@ async def stream_agent_events(
     pre_capacity_info = check_context_capacity(
         pre_compaction_metrics["context_token_estimate"],
         model_name,
+        reserved_output_tokens=reserved_output_tokens,
     )
     pre_partition = partition_history(
         raw_history,
@@ -1794,7 +1803,7 @@ async def stream_agent_events(
     )
     pre_triggered = should_compact_context(
         pre_compaction_metrics["context_token_estimate"],
-        pre_capacity_info["model_context_window"],
+        pre_capacity_info.get("input_token_budget", pre_capacity_info.get("model_context_window")),
         int(compaction_settings.get("trigger_remaining_tokens", 20_000)),
     )
     if compaction_settings.get("enabled", True) and pre_triggered and pre_partition.eligible_items:
@@ -1826,7 +1835,7 @@ async def stream_agent_events(
             raw_history,
             session_id=session_id,
             model_config=model_config,
-            model_context_window=pre_capacity_info["model_context_window"],
+            model_context_window=pre_capacity_info.get("input_token_budget", pre_capacity_info.get("model_context_window")),
             context_token_estimate=pre_compaction_metrics["context_token_estimate"],
             settings=compaction_settings,
         )
@@ -1930,47 +1939,6 @@ async def stream_agent_events(
                 ensure_ascii=False,
             ),
         }
-    if protected_tool_chars and context_char_count > MAX_HISTORY_TOTAL_CHARS:
-        capacity_message = (
-            "Protected tool history exceeds the configured context budget; "
-            "no tool arguments or results were truncated."
-        )
-        capacity_code = (
-            "context_compaction_capacity_exceeded"
-            if compaction_details.get("triggered")
-            else "protected_context_capacity_exceeded"
-        )
-        if compaction_details.get("triggered"):
-            yield {
-                "event": "debug",
-                "data": json.dumps(
-                    {
-                        "stage": "context_compaction_failed",
-                        "message": capacity_message,
-                        "code": capacity_code,
-                        "session_id": session_id,
-                        "context_token_estimate_after": context_metrics["context_token_estimate"],
-                        "protected_tool_chars": protected_tool_chars,
-                    },
-                    ensure_ascii=False,
-                ),
-            }
-        yield {
-            "event": "error",
-            "data": json.dumps(
-                {
-                    "code": capacity_code,
-                    "message": capacity_message,
-                    "context_chars": context_char_count,
-                    "protected_tool_chars": protected_tool_chars,
-                    "context_budget_chars": MAX_HISTORY_TOTAL_CHARS,
-                },
-                ensure_ascii=False,
-            ),
-        }
-        yield {"event": "done", "data": json.dumps(capacity_message, ensure_ascii=False)}
-        return
-
     malformed_protected_entries = [
         entry for entry in effective_history
         if entry.get("role") == "malformed_tool_result"
@@ -1994,7 +1962,11 @@ async def stream_agent_events(
     messages.append(HumanMessage(content=effective_message))
 
     _repair_dangling_tool_call_messages(messages)
-    capacity_info = check_context_capacity(context_token_estimate, model_name)
+    capacity_info = check_context_capacity(
+        context_token_estimate,
+        model_name,
+        reserved_output_tokens=reserved_output_tokens,
+    )
     if compaction_details.get("triggered") and capacity_info["is_exceeded"]:
         capacity_message = (
             "Context compaction completed, but the protected recent history and required prompt "

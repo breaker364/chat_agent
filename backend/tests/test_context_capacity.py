@@ -77,6 +77,20 @@ class TestContextCapacityCheck(unittest.TestCase):
         self.assertEqual(result["remaining_tokens"], 128000)
         self.assertFalse(result["is_exceeded"])
 
+    @patch("backend.agent.get_model_context_window")
+    def test_check_context_capacity_reserves_output_tokens_from_input_budget(self, mock_get_window):
+        mock_get_window.return_value = 1_000
+
+        result = check_context_capacity(
+            context_token_estimate=850,
+            model_name="deepseek-chat",
+            reserved_output_tokens=200,
+        )
+
+        self.assertEqual(result["input_token_budget"], 800)
+        self.assertEqual(result["reserved_output_tokens"], 200)
+        self.assertTrue(result["is_exceeded"])
+
 
 class TestGetModelContextWindow(unittest.TestCase):
     """Test model context window configuration retrieval."""
