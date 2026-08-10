@@ -1,0 +1,42 @@
+{
+  "multi_page": {
+    "source_path": "input/source.pdf",
+    "pages": [
+      {
+        "number": 1,
+        "reading_order_confidence": 0.96,
+        "blocks": [
+          {"type": "title", "text": "Document title"},
+          {"type": "heading", "level": 2, "text": "First section"},
+          {"type": "paragraph", "text": "First paragraph."},
+          {"type": "unordered_list", "text": "First item"},
+          {"type": "ordered_list", "text": "Second item"}
+        ]
+      },
+      {
+        "number": 2,
+        "reading_order_confidence": 0.94,
+        "blocks": [
+          {"type": "quote", "text": "Quoted text."},
+          {"type": "code", "language": "python", "text": "print('ok')"},
+          {"type": "table", "rows": [["Key", "Value"], ["A", "B"]]}
+        ]
+      }
+    ],
+    "metadata": {"source_timestamp": "2026-08-10T00:00:00Z"}
+  },
+  "ambiguous": {
+    "source_path": "input/ambiguous.pdf",
+    "pages": [
+      {
+        "number": 1,
+        "reading_order_confidence": 0.42,
+        "diagnostics": ["two_columns_overlap"],
+        "blocks": [
+          {"type": "paragraph", "text": "Uncertain order."}
+        ]
+      }
+    ],
+    "metadata": {}
+  }
+}

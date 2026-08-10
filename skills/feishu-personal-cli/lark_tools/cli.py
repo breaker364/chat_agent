@@ -31,8 +31,9 @@ from lark_tools.commands.file import cmd_download_file
 from lark_tools.commands.doc import cmd_doc_read, cmd_doc_meta, cmd_doc_length, cmd_doc_download, cmd_doc_blocks
 from lark_tools.commands.doc_write import (
     cmd_doc_create, cmd_doc_append, cmd_doc_set_title,
-    cmd_doc_delete_block, cmd_doc_edit, cmd_doc_edit_code, cmd_doc_insert_image,
+    cmd_doc_delete_block, cmd_doc_edit, cmd_doc_edit_code, cmd_doc_insert_image, cmd_doc_replace,
 )
+from lark_tools.command_manifest import parse_command_manifest
 from lark_tools.commands.bitable import (
     resolve_bitable_token, resolve_wiki_to_bitable,
     cmd_bitable_tables, cmd_bitable_schema,
@@ -511,6 +512,14 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             from_stdin = _has_flag(filtered_args, '--stdin')
             with audit_write('doc.append', target=token):
                 cmd_doc_append(cookies, token, text_val, md_file, from_stdin)
+        elif sub == 'replace':
+            if not token:
+                print(json.dumps({'error': 'Missing token. Usage: doc replace <token|url> --md-file <path> [--dry-run]'})); sys.exit(1)
+            md_file = _get_arg(filtered_args, '--md-file')
+            if not md_file:
+                print(json.dumps({'error': 'Usage: doc replace <token|url> --md-file <path> [--dry-run]'})); sys.exit(1)
+            with audit_write('doc.replace', target=token, extra={'dry_run': _has_flag(filtered_args, '--dry-run')}):
+                cmd_doc_replace(cookies, token, md_file, dry_run=_has_flag(filtered_args, '--dry-run'))
         elif sub == 'set-title':
             new_title = filtered_args[3] if len(filtered_args) > 3 else None
             if not token or not new_title: print(json.dumps({'error': 'Usage: doc set-title <token|url> <new_title>'})); sys.exit(1)
@@ -562,7 +571,7 @@ def _dispatch_extended(command, cookies, args, filtered_args, raw):  # noqa: C90
             with audit_write('doc.edit-code', target=token, extra={'block_id': block_id}):
                 cmd_doc_edit_code(cookies, token, block_id, new_lang, new_content, content_file)
         else:
-            print(json.dumps({'error': 'Usage: doc read|meta|length|download|blocks|create|append|set-title|delete-block|edit|edit-code|insert-image <token|url>'})); sys.exit(1)
+            print(json.dumps({'error': 'Usage: doc read|meta|length|download|blocks|create|append|replace|set-title|delete-block|edit|edit-code|insert-image <token|url>'})); sys.exit(1)
 
     elif command == 'bitable':
         sub = filtered_args[1] if len(filtered_args) > 1 else None

@@ -24,9 +24,15 @@ from ..docx_ot import (
     parse_markdown, build_insert_change_map, parse_inline_markdown, _new_block_id,
     _multiline_text_payload, _normalise_language,
 )
+from ..command_manifest import parse_command_manifest
+from ..document_replacement import (
+    build_root_replacement_change_map,
+    canonical_block_summary,
+    canonical_content_hash,
+)
 from ..docx_upload import probe_image, upload_docx_image
 from ..easysync import build_code_block_replace_op, build_easysync_op
-from .doc import resolve_doc_token, fetch_doc_blocks, extract_block_text
+from .doc import doc_blocks_to_markdown, resolve_doc_token, fetch_doc_blocks, extract_block_text
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +239,170 @@ def _read_input(text_arg: Optional[str], md_file: Optional[str], from_stdin: boo
     return ''
 
 
+def _document_command_result(operation: str, target: str, result: dict) -> dict:
+    """Attach the stable command contract shared with the mutation guard."""
+    manifest = parse_command_manifest(['lark', 'doc', operation, target])
+    payload = dict(result)
+    payload['manifest'] = manifest.to_dict()
+    payload['verification'] = {
+        'mode': manifest.verification_mode,
+        'status': 'not_required' if manifest.verification_mode == 'none' else 'pending',
+        'verified': False,
+    }
+    payload['result_reference'] = manifest.idempotency_input
+    return payload
+
+
+def _read_document_snapshot(cookies, docx_token: str) -> dict:
+    """Read only root children for replacement verification."""
+    result = fetch_doc_blocks(cookies, docx_token)
+    if result.get('error'):
+        raise RuntimeError(f'Failed to read document for verification: {result}')
+    root = result['blocks'].get(docx_token) or {}
+    root_data = root.get('data') or {}
+    version = root.get('version', root_data.get('version'))
+    if version is None:
+        raise RuntimeError('Replacement verification could not determine the target version.')
+    return {
+        'version': int(version),
+        'markdown': doc_blocks_to_markdown(root_data.get('children') or [], result['blocks'], cookies),
+    }
+
+
+def _replacement_result(
+    *,
+    docx_token: str,
+    before_version: int,
+    source_hash: str,
+    planned_block_summary: dict,
+    status: str,
+    after_version: int | None = None,
+    verified: bool = False,
+    verification_status: str = 'blocked',
+    error: str = '',
+    blocks_removed: int = 0,
+    blocks_added: int = 0,
+) -> dict:
+    result = {
+        'success': bool(verified) or status == 'dry_run',
+        'status': status,
+        'target': docx_token,
+        'operation': 'replace',
+        'before_version': before_version,
+        'after_version': after_version,
+        'source_hash': source_hash,
+        'content_hash': source_hash if verified else '',
+        'planned_block_summary': planned_block_summary,
+        'verified': bool(verified),
+        'verification': {
+            'mode': 'read_back',
+            'status': verification_status,
+            'verified': bool(verified),
+        },
+        'rollback_reference': f'document:{docx_token}:version:{before_version}',
+        'result_reference': f'replace:{docx_token}:{before_version}:{source_hash}',
+        'blocks_removed': blocks_removed,
+        'blocks_added': blocks_added,
+    }
+    result['version_history'] = {
+        'before_version': before_version,
+        'after_version': after_version,
+        'rollback_reference': result['rollback_reference'],
+    }
+    if error:
+        result['error'] = error
+    return result
+
+
+def replace_markdown(cookies, docx_token: str, markdown: str, *, dry_run: bool = False) -> dict:
+    """Replace all writable root children with Markdown in one version-checked mutation."""
+    blocks = parse_markdown(markdown)
+    if not blocks:
+        raise ValueError('Replacement source is empty; use an explicit clear operation when available.')
+
+    source_hash = canonical_content_hash(blocks)
+    planned_block_summary = canonical_block_summary(blocks)
+    preflight = fetch_root_block_info(cookies, docx_token)
+    before_version = int(preflight['version'])
+    existing_child_ids = list((preflight.get('block_data') or {}).get('children') or [])
+    if dry_run:
+        return _replacement_result(
+            docx_token=docx_token,
+            before_version=before_version,
+            source_hash=source_hash,
+            planned_block_summary=planned_block_summary,
+            status='dry_run',
+            verification_status='not_dispatched',
+            blocks_removed=len(existing_child_ids),
+            blocks_added=len(blocks),
+        )
+
+    change_map, new_ids = build_root_replacement_change_map(
+        blocks,
+        docx_token,
+        before_version,
+        existing_child_ids,
+        get_current_user_uid(cookies),
+    )
+    try:
+        post_user_change(
+            cookies,
+            docx_token,
+            generate_member_id(),
+            change_map,
+            retry_on_conflict=False,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if 'code=-1101' in message or 'code=1021' in message:
+            return _replacement_result(
+                docx_token=docx_token,
+                before_version=before_version,
+                source_hash=source_hash,
+                planned_block_summary=planned_block_summary,
+                status='conflict',
+                verification_status='not_dispatched',
+                error=message,
+                blocks_removed=len(existing_child_ids),
+                blocks_added=len(new_ids),
+            )
+        raise
+
+    snapshot = _read_document_snapshot(cookies, docx_token)
+    after_version = int(snapshot['version'])
+    actual_blocks = parse_markdown(str(snapshot.get('markdown') or ''))
+    actual_hash = canonical_content_hash(actual_blocks)
+    actual_summary = canonical_block_summary(actual_blocks)
+    verified = (
+        after_version > before_version
+        and actual_hash == source_hash
+        and actual_summary == planned_block_summary
+    )
+    if not verified:
+        return _replacement_result(
+            docx_token=docx_token,
+            before_version=before_version,
+            after_version=after_version,
+            source_hash=source_hash,
+            planned_block_summary=planned_block_summary,
+            status='verification_failed',
+            verification_status='blocked',
+            error='Read-back content did not match the replacement plan.',
+            blocks_removed=len(existing_child_ids),
+            blocks_added=len(new_ids),
+        )
+    return _replacement_result(
+        docx_token=docx_token,
+        before_version=before_version,
+        after_version=after_version,
+        source_hash=source_hash,
+        planned_block_summary=planned_block_summary,
+        status='verified',
+        verified=True,
+        verification_status='verified',
+        blocks_removed=len(existing_child_ids),
+        blocks_added=len(new_ids),
+    )
 def cmd_doc_create(cookies, title: str, text: Optional[str] = None, md_file: Optional[str] = None,
                    from_stdin: bool = False, parent_wiki_token: Optional[str] = None):
     """Create a new docx. Optionally write initial content from --text / --md-file / stdin."""
@@ -264,11 +434,30 @@ def cmd_doc_append(cookies, token_or_url: str, text: Optional[str] = None, md_fi
         print(json.dumps({'error': 'No content to append (use --text, --md-file, or --stdin)'}))
         return
     ap = append_markdown(cookies, docx_token, content)
-    print(json.dumps({
+    print(json.dumps(_document_command_result('append', token_or_url, {
         'success': True,
         'obj_token': docx_token,
         'blocks_added': ap['blocks_added'],
-    }, indent=2, ensure_ascii=False))
+    }), indent=2, ensure_ascii=False))
+
+
+def cmd_doc_replace(cookies, token_or_url: str, md_file: str, *, dry_run: bool = False):
+    """Replace complete writable document content from an explicit Markdown file."""
+    docx_token = resolve_doc_token(cookies, token_or_url)
+    content = _read_input(None, md_file, False)
+    result = replace_markdown(cookies, docx_token, content, dry_run=dry_run)
+    manifest_args = ['lark', 'doc', 'replace', token_or_url, '--md-file', md_file]
+    if dry_run:
+        manifest_args.append('--dry-run')
+    manifest = parse_command_manifest(manifest_args)
+    result['manifest'] = manifest.to_dict()
+    result.setdefault('version_history', {
+        'before_version': result.get('before_version'),
+        'after_version': result.get('after_version'),
+        'rollback_reference': result.get('rollback_reference', ''),
+    })
+    result['result_reference'] = result.get('result_reference') or manifest.idempotency_input
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def _set_root_block_title(cookies, docx_token: str, new_title: str) -> dict:

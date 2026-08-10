@@ -205,7 +205,7 @@ _BLOCK_OPS_TEMPLATE = """# Lark CLI write-op blocklist.
 #
 # Available write ops:
 #   send.text  send.media  send.recall
-#   doc.create  doc.append  doc.set-title  doc.delete-block
+#   doc.create  doc.append  doc.replace  doc.set-title  doc.delete-block
 #   doc.edit  doc.edit-code  doc.insert-image
 #   bitable.create  bitable.add-record  bitable.set-record
 #   bitable.delete-record  bitable.add-field  bitable.rename-field

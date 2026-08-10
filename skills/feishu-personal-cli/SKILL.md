@@ -44,6 +44,7 @@ lark doc download <token-or-url> [--out output.md]
 lark doc blocks <token-or-url> [--type TYPE] [--grep PATTERN] [--limit N] [--offset N] [--format json|compact] [--preview N]
 lark doc create <title> [--text "..."] [--md-file path] [--stdin] [--parent <wiki-token>]
 lark doc append <token-or-url> [--text "..."] [--md-file path] [--stdin]
+lark doc replace <token-or-url> --md-file path [--dry-run]
 lark doc set-title <token-or-url> <new-title>
 lark doc delete-block <token-or-url> <block-id>
 lark doc edit <token-or-url> <block-id> --replace "new text"
@@ -52,6 +53,8 @@ lark doc insert-image <token-or-url> <image-path>
 ```
 
 For long Markdown or generated content, write it to `tmp/` and use `--md-file` or `--stdin` rather than placing large text inline.
+
+`doc replace` is a complete-content operation, not an append. It preflights the document version and writable root children, performs one version-checked mutation, and reads the document back to verify its canonical content hash and block summary. Use `--dry-run` to inspect the replacement plan without a remote write. Conflicts, empty sources, and verification mismatches are reported as blocked results; they never trigger a corrective append.
 
 ## Bitable Commands
 
