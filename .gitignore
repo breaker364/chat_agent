@@ -61,6 +61,7 @@ tmp_*
 /fixed_doc2.md
 skills/pisces-ebom-matcher
 tmp/
+.worktrees/
 knowledge_base/documents/
 knowledge_base/index/
 knowledge_base/manifests/
