@@ -2,8 +2,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const runtimeConfigPath = path.resolve(__dirname, "..", "runtime_config.json");
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const runtimeConfigPath = path.resolve(moduleDir, "..", "runtime_config.json");
 const runtimeConfig = fs.existsSync(runtimeConfigPath)
   ? JSON.parse(fs.readFileSync(runtimeConfigPath, "utf-8"))
   : {};

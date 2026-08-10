@@ -23,6 +23,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv_py*/
 venv/
 env/
 env_*/
@@ -32,12 +33,32 @@ agent_memory/
 # Frontend dependencies / build
 frontend/node_modules/
 frontend/dist/
+.npm-cache/
 *.csv
 # Logs
 *.log
 *.docx
 # Temporary debug / test artifacts
 tmp_*
+/check_file_exists.py
+/check_files.py
+/extract_pdf_text.py
+/fix_and_update_docs.py
+/fix_docs_content.py
+/fix_feishu_docs.py
+/fix_format.py
+/fix_format_and_update.py
+/format_fixer.py
+/install_pypdf2.py
+/process_feishu_docs.py
+/read_and_fix_docs.py
+/read_text_file.py
+/update_docs.py
+/update_docs_final.py
+/update_feishu_docs.py
+/update_feishu_docs_final.py
+/fixed_doc1.md
+/fixed_doc2.md
 skills/pisces-ebom-matcher
 tmp/
 knowledge_base/documents/
