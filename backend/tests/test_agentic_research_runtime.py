@@ -23,7 +23,7 @@ class FakeModel:
 
 
 class AgenticResearchRuntimeTests(unittest.TestCase):
-    def test_binds_only_read_only_evidence_tools_and_filters_react_tools(self):
+    def test_binds_only_read_only_evidence_tools_and_keeps_react_tools_visible(self):
         from backend.agent import _react_tools_for_runtime
         from backend.agentic_research.config import AgenticResearchConfig
         from backend.agentic_research.runtime import EVIDENCE_TOOL_NAMES, build_agentic_research_runtime
@@ -57,7 +57,7 @@ class AgenticResearchRuntimeTests(unittest.TestCase):
         self.assertIs(workspace_adapter.get_file_info, tools[2])
         self.assertEqual(
             [tool.name for tool in _react_tools_for_runtime(tools, runtime)],
-            ["knowledge_import_files", "write_file"],
+            [tool.name for tool in tools],
         )
 
     def test_builds_source_labeled_context_only_for_usable_evidence(self):

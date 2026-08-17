@@ -22,7 +22,6 @@ class StreamRequest(JsonRequest):
 
 
 async def fake_stream_agent_events(_agent, _message, _session_id, _history, synthesis_context=""):
-    assert synthesis_context
     yield {"event": "done", "data": json.dumps("grounded answer")}
 
 
@@ -58,7 +57,7 @@ class AgenticResearchApiTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_sync_accepts_policy_and_returns_only_bounded_research_summary(self):
+    def test_sync_lets_agent_own_research_route(self):
         from backend.main import chat_sync
 
         async def fake_get_agent():
@@ -66,8 +65,6 @@ class AgenticResearchApiTests(unittest.TestCase):
 
         with patch("backend.main.get_session_store", return_value=self.store), patch(
             "backend.main.get_agent", fake_get_agent
-        ), patch("backend.main.run_agentic_research", return_value=research_result()), patch(
-            "backend.main.build_synthesis_context", return_value="safe research context"
         ), patch("backend.main.stream_agent_events", fake_stream_agent_events):
             response = asyncio.run(chat_sync(JsonRequest({
                 "message": "question",
@@ -77,11 +74,11 @@ class AgenticResearchApiTests(unittest.TestCase):
 
         payload = json.loads(response.body)
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["research"]["route_class"], "direct")
         self.assertEqual(payload["research"]["policy"], "auto")
-        self.assertEqual(payload["research"]["outcome"], "answer_ready")
-        self.assertNotIn("bounded evidence", json.dumps(payload))
+        self.assertNotIn("planner_reasoning", json.dumps(payload))
 
-    def test_stream_emits_research_summary_before_agent_events(self):
+    def test_stream_emits_bounded_route_after_agent_events(self):
         from backend.main import chat_stream
 
         async def fake_get_agent():
@@ -89,8 +86,6 @@ class AgenticResearchApiTests(unittest.TestCase):
 
         with patch("backend.main.get_session_store", return_value=self.store), patch(
             "backend.main.get_agent", fake_get_agent
-        ), patch("backend.main.run_agentic_research", return_value=research_result()), patch(
-            "backend.main.build_synthesis_context", return_value="safe research context"
         ), patch("backend.main.stream_agent_events", fake_stream_agent_events), patch(
             "backend.main.EventSourceResponse", lambda generator: generator
         ):
@@ -103,15 +98,8 @@ class AgenticResearchApiTests(unittest.TestCase):
 
         research_events = [event for event in events if event["event"] == "research"]
         self.assertEqual(len(research_events), 1)
-        self.assertEqual(json.loads(research_events[0]["data"])["outcome"], "answer_ready")
-        debug_events = [
-            json.loads(event["data"])
-            for event in events
-            if event["event"] == "debug" and "agentic_research" in event["data"]
-        ]
-        self.assertEqual(len(debug_events), 1)
-        self.assertIsInstance(debug_events[0]["duration_seconds"], float)
-        self.assertNotIn("bounded evidence", json.dumps(debug_events[0]))
+        self.assertEqual(json.loads(research_events[0]["data"])["route_class"], "direct")
+        self.assertNotIn("planner_reasoning", json.dumps(events))
 
     def test_conflicting_policy_is_rejected_before_agent_execution(self):
         from backend.main import chat_sync

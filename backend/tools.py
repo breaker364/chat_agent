@@ -42,7 +42,14 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_agent_memory_config, load_mcd_mcp_config
-from .runtime_context import copy_runtime_context, current_run_id, current_session_id
+from .runtime_context import (
+    copy_runtime_context,
+    current_knowledge_policy,
+    current_run_id,
+    current_session_id,
+    record_source_call,
+    source_call_allowed,
+)
 from .vision import analyze_image_file, analyze_image_files
 from .feishu_web_login import (
     FeishuWebSessionStore,
@@ -115,6 +122,25 @@ _TOOL_SIDE_EFFECT_PREFIXES = (
 )
 _TOOL_DEFAULT_CACHE_TTL_SECONDS = 0
 _TOOL_FAILED_CACHE_TTL_SECONDS = 10
+_EVIDENCE_TOOL_NAMES = frozenset({
+    "knowledge_search",
+    "list_directory",
+    "get_file_info",
+    "read_file",
+    "web_search",
+    "web_fetch",
+})
+_DEFAULT_SOURCE_CALL_LIMITS = {"personal_knowledge": 1, "workspace": 2, "web": 2}
+
+
+def _source_kind_for_tool(tool_name: str) -> str | None:
+    if tool_name == "knowledge_search":
+        return "personal_knowledge"
+    if tool_name in {"read_file", "list_directory", "get_file_info"}:
+        return "workspace"
+    if tool_name in {"web_search", "web_fetch"}:
+        return "web"
+    return None
 
 
 def _run_coro_in_thread(coro: Any) -> Any:
@@ -709,7 +735,30 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
     policy = _tool_policy(tool_name)
     same_run_dedupe = _uses_same_run_dedupe(policy)
 
+    def _policy_denial() -> str | None:
+        request_policy = current_knowledge_policy()
+        if request_policy == "disabled" and tool_name == "knowledge_search":
+            return json.dumps(
+                {"status": "policy_denied", "error_category": "knowledge_disabled", "tool": tool_name},
+                ensure_ascii=False,
+            )
+        if request_policy == "required" and tool_name in _EVIDENCE_TOOL_NAMES - {"knowledge_search"}:
+            return json.dumps(
+                {"status": "policy_denied", "error_category": "required_source_only", "tool": tool_name},
+                ensure_ascii=False,
+            )
+        source_kind = _source_kind_for_tool(tool_name)
+        if source_kind and not source_call_allowed(source_kind, _DEFAULT_SOURCE_CALL_LIMITS):
+            return json.dumps(
+                {"status": "budget_denied", "error_category": "source_call_budget_exhausted", "tool": tool_name},
+                ensure_ascii=False,
+            )
+        return None
+
     def cached_func(**kwargs: Any) -> str:
+        denial = _policy_denial()
+        if denial is not None:
+            return denial
         cache = _run_cache_for_current_request() if same_run_dedupe else None
         cache_key = _dedupe_key(tool_name, kwargs)
         if cache is not None and cache_key in cache:
@@ -748,6 +797,9 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
 
         started_at = time.monotonic()
         try:
+            source_kind = _source_kind_for_tool(tool_name)
+            if source_kind:
+                record_source_call(source_kind)
             result = tool_obj.invoke(kwargs)
             result_text = result if isinstance(result, str) else str(result)
             latency_ms = int((time.monotonic() - started_at) * 1000)
@@ -793,6 +845,9 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             raise
 
     async def cached_coroutine(**kwargs: Any) -> str:
+        denial = _policy_denial()
+        if denial is not None:
+            return denial
         cache = _run_cache_for_current_request() if same_run_dedupe else None
         cache_key = _dedupe_key(tool_name, kwargs)
 
@@ -870,6 +925,9 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
 
         started_at = time.monotonic()
         try:
+            source_kind = _source_kind_for_tool(tool_name)
+            if source_kind:
+                record_source_call(source_kind)
             result = await tool_obj.ainvoke(kwargs)
             result_text = result if isinstance(result, str) else str(result)
             if cache is not None:
@@ -1024,6 +1082,10 @@ def _ensure_writable(path: str) -> Path:
 def _ensure_readable(path: str | Path) -> Path:
     target = _resolve_access_path(path)
     workspace = _workspace_root()
+    if current_run_id() and _is_within(target, _knowledge_index_root()):
+        raise PermissionError(
+            f"Access denied: internal knowledge index is only accessible through knowledge_search: {target}"
+        )
     if _is_within(target, workspace) or any(
         _is_within(target, root) for root in _EXTERNAL_READ_ROOTS
     ):
@@ -1036,6 +1098,14 @@ def _ensure_readable(path: str | Path) -> Path:
 
 def _workspace_root() -> Path:
     return Path(_ALLOWED_ROOT or os.getcwd()).resolve()
+
+
+def _knowledge_index_root() -> Path:
+    configured = get_runtime_value("rag", "knowledge_store_path", "knowledge_base")
+    candidate = Path(str(configured or "knowledge_base")).expanduser()
+    if not candidate.is_absolute():
+        candidate = _workspace_root() / candidate
+    return (candidate / "index").resolve()
 
 
 def _download_dir() -> Path:
@@ -2174,6 +2244,20 @@ def run_python_file(
     reason = _feishu_crud_script_block_reason(script_text)
     if reason:
         return _blocked_feishu_script_payload(str(target), reason)
+    if current_run_id():
+        index_root = _knowledge_index_root()
+        normalized_script = script_text.replace("\\", "/")
+        normalized_index = str(index_root).replace("\\", "/")
+        if _is_within(target, index_root) or normalized_index in normalized_script:
+            return json.dumps(
+                {
+                    "path": str(target),
+                    "error": "Access denied: internal knowledge index must be accessed through knowledge_search.",
+                    "error_category": "internal_index_access",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
 
     try:
         timeout_value = min(_PYTHON_RUN_MAX_TIMEOUT_SECONDS, max(1, int(timeout_seconds)))
@@ -2204,6 +2288,17 @@ def run_python_file(
             )
     else:
         cwd_path = target.parent if target.parent.exists() else _workspace_root()
+
+    if current_run_id() and _is_within(cwd_path.resolve(), _knowledge_index_root()):
+        return json.dumps(
+            {
+                "path": str(target),
+                "error": "Access denied: internal knowledge index must be accessed through knowledge_search.",
+                "error_category": "internal_index_access",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     if not cwd_path.exists() or not cwd_path.is_dir():
         return json.dumps(

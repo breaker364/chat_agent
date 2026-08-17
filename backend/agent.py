@@ -21,9 +21,9 @@ from .config import (
 )
 from .agentic_research.config import load_agentic_research_config
 from .agentic_research.runtime import (
-    EVIDENCE_TOOL_NAMES,
     AgenticResearchRuntime,
     build_agentic_research_runtime,
+    build_research_planner_tool,
 )
 from .context_compaction import (
     ContextCompactionError,
@@ -42,7 +42,7 @@ from .session_store import SessionStore
 from .memory import MemoryContextProvider
 from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
-from .runtime_context import current_run_id, current_session_id
+from .runtime_context import current_knowledge_policy, current_run_id, current_session_id
 from .run_append import consume_pending_append_commands
 from .tools import get_all_tools, _normalize_tool_payload_for_key
 from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
@@ -881,9 +881,12 @@ async def build_agent(
         workspace_root=workspace,
         config=load_agentic_research_config(),
     )
+    visible_tools = list(tools)
+    if research_runtime is not None:
+        visible_tools.append(build_research_planner_tool(llm))
     agent = create_react_agent(
         model=llm,
-        tools=_react_tools_for_runtime(tools, research_runtime),
+        tools=_react_tools_for_runtime(visible_tools, research_runtime),
         state_schema=None,
     )
     agent.name = "chat_agent"
@@ -892,10 +895,8 @@ async def build_agent(
 
 
 def _react_tools_for_runtime(tools: list[Any], runtime: AgenticResearchRuntime | None) -> list[Any]:
-    """Keep evidence collection bounded without changing non-evidence tool authority."""
-    if runtime is None:
-        return list(tools)
-    return [tool for tool in tools if str(getattr(tool, "name", "")) not in EVIDENCE_TOOL_NAMES]
+    """Keep the registered tool schema aligned with the tools Agent can call."""
+    return list(tools)
 
 
 def run_agentic_research(
@@ -1593,6 +1594,18 @@ async def stream_agent_events(
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
     if AGENT_POLICY:
         messages.append(SystemMessage(content=f"Agent behavior policy:\n{AGENT_POLICY}"))
+    messages.append(
+        SystemMessage(
+            content=(
+                "Request evidence policy: "
+                f"{current_knowledge_policy()}. Treat this as an execution constraint. "
+                "If the user explicitly requests knowledge-base search, call knowledge_search directly. "
+                "If the user explicitly requests web search, call web_search directly unless policy denies it. "
+                "For an ambiguous request that needs evidence, call plan_research_route once before evidence tools. "
+                "Do not read internal retrieval indexes with file or Python tools."
+            )
+        )
+    )
     memory_context = ""
     try:
         memory_config = load_agent_memory_config(workspace_dir=Path.cwd())

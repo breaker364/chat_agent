@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from pydantic import BaseModel, Field
+from langchain_core.tools import StructuredTool
+
 from .adapters import EvidenceRegistry, KnowledgeEvidenceAdapter, WebEvidenceAdapter, WorkspaceEvidenceAdapter
 from .config import AgenticResearchConfig
 from .models import ResearchBudget
@@ -33,6 +36,42 @@ def _tools_by_name(tools: Iterable[Any]) -> dict[str, Any]:
         for tool in tools
         if str(getattr(tool, "name", "")).strip()
     }
+
+
+class ResearchPlannerInput(BaseModel):
+    request: str = Field(..., min_length=1, max_length=4000)
+    knowledge_policy: str = Field(default="auto", pattern="^(auto|required|disabled)$")
+
+
+def build_research_planner_tool(model: Any) -> StructuredTool:
+    """Expose only the schema-bounded planning step to the main Agent."""
+
+    def plan_research_route(request: str, knowledge_policy: str = "auto") -> str:
+        try:
+            planner = ModelResearchPlanner(model)
+            plan = planner.plan(request, knowledge_policy)
+            payload = {
+                "status": "ok",
+                "requires_evidence": plan.requires_evidence,
+                "source_sequence": list(plan.source_sequence),
+                "query_or_scope": plan.query_or_scope,
+                "freshness_need": plan.freshness_need,
+                "success_criteria": list(plan.success_criteria),
+            }
+        except Exception as exc:
+            category = "invalid_plan" if isinstance(exc, (ValueError, TypeError)) else "planner_error"
+            payload = {"status": "error", "error_category": category}
+        return json.dumps(payload, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        func=plan_research_route,
+        name="plan_research_route",
+        description=(
+            "Create a bounded evidence route for an ambiguous request. "
+            "This tool plans only; it never searches knowledge, files, or the web."
+        ),
+        args_schema=ResearchPlannerInput,
+    )
 
 
 @dataclass

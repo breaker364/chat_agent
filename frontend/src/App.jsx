@@ -1218,7 +1218,8 @@ function KnowledgeCitations({ tools }) {
 
 function ResearchProvenance({ research }) {
   if (!research || typeof research !== "object") return null;
-  const outcome = String(research.outcome || "evidence_gap").replaceAll("_", " ");
+  const routeClass = String(research.route_class || "").trim();
+  const outcome = String(research.outcome || routeClass || "evidence_gap").replaceAll("_", " ");
   const sources = Array.isArray(research.sources_attempted) ? research.sources_attempted : [];
   const attempts = research.attempts && typeof research.attempts === "object" ? research.attempts : {};
   const budget = research.budget && typeof research.budget === "object" ? research.budget : {};
@@ -1252,7 +1253,7 @@ function ResearchProvenance({ research }) {
           <span>route {budget.route_transitions_used || 0}/{budget.route_transitions_limit}</span>
         ) : null}
       </div>
-      {research.outcome !== "answer_ready" ? (
+      {research.outcome && research.outcome !== "answer_ready" || routeClass === "failed" ? (
         <div className="research-provenance-limit">
           <AlertCircle size={13} />
           <span>Available evidence is insufficient for a fully grounded answer.</span>

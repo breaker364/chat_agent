@@ -18,6 +18,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .agent import build_agent, run_agentic_research, stream_agent_events
 from .agentic_research.models import ResearchPolicyError, resolve_knowledge_policy
+from .agentic_research.config import load_agentic_research_config
 from .agentic_research.runtime import build_synthesis_context
 from .config import PROJECT_ROOT, get_runtime_value, load_agent_memory_config
 from .memory import (
@@ -333,10 +334,30 @@ def _resolve_chat_knowledge_policy(body: Any) -> tuple[str | None, dict[str, Any
     return policy, None
 
 
-def _research_trace_payload(result: Any) -> dict[str, Any] | None:
-    trace = getattr(result, "trace", None)
-    to_dict = getattr(trace, "to_dict", None)
-    return to_dict() if callable(to_dict) else None
+def _research_route_payload(policy: str, tool_names: list[str]) -> dict[str, Any]:
+    names = {str(name or "").strip() for name in tool_names}
+    if "knowledge_search" in names or policy == "required":
+        route_class = "explicit"
+    elif "web_search" in names or "web_fetch" in names:
+        route_class = "explicit"
+    elif "plan_research_route" in names:
+        route_class = "planned"
+    else:
+        route_class = "direct"
+    sources = [
+        source for source, tool_names_for_source in (
+            ("personal_knowledge", {"knowledge_search"}),
+            ("workspace", {"read_file", "list_directory", "get_file_info"}),
+            ("web", {"web_search", "web_fetch"}),
+        )
+        if names.intersection(tool_names_for_source)
+    ]
+    return {
+        "route_class": route_class,
+        "policy": policy,
+        "sources_attempted": sources,
+        "failure_category": "" if sources or route_class == "direct" else "no_evidence_tool_call",
+    }
 
 
 def _log_research_completion(trace: dict[str, Any], duration_seconds: float) -> None:
@@ -360,13 +381,7 @@ def _stream_with_research_context(
 ) -> Any:
     if not synthesis_context:
         return stream_agent_events(agent, message, session_id, history)
-    return stream_agent_events(
-        agent,
-        message,
-        session_id,
-        history,
-        synthesis_context=synthesis_context,
-    )
+    return stream_agent_events(agent, message, session_id, history, synthesis_context=synthesis_context)
 
 
 _REMOTE_KNOWLEDGE_ERROR_STATUS = {
@@ -1535,64 +1550,22 @@ async def chat_stream(request: Request) -> EventSourceResponse:
         interrupted = False
         terminal_status = ""
         terminal_failure_reason = ""
-        context_tokens = bind_runtime_context(session["session_id"], run_id)
+        research_config = load_agentic_research_config()
+        context_tokens = bind_runtime_context(
+            session["session_id"],
+            run_id,
+            knowledge_policy=policy,
+            source_call_limits=research_config.source_call_limits,
+        )
         event_hub = get_session_event_hub()
         event_queue = event_hub.subscribe(session["session_id"])
         try:
-            research_result = None
-            research_context = ""
-            research_started_at = time.monotonic()
-            try:
-                research_result = await asyncio.to_thread(
-                    run_agentic_research,
-                    agent,
-                    message,
-                    knowledge_policy=policy,
-                )
-            except Exception:
-                research_result = None
-            research_trace = _research_trace_payload(research_result)
-            if research_trace is not None:
-                research_duration_seconds = round(time.monotonic() - research_started_at, 3)
-                _log_research_completion(research_trace, research_duration_seconds)
-                research_context = build_synthesis_context(research_result)
-                research_event = {
-                    "event": "research",
-                    "data": json.dumps(research_trace, ensure_ascii=False),
-                }
-                yield _with_run_attribution(
-                    research_event,
-                    research_trace,
-                    session["session_id"],
-                    run_id,
-                )
-                research_debug = {
-                    "event": "debug",
-                    "data": json.dumps(
-                        {
-                            "stage": "agentic_research_completed",
-                            "message": "Bounded evidence route completed.",
-                            "outcome": research_trace.get("outcome"),
-                            "sources_attempted": research_trace.get("sources_attempted", []),
-                            "attempts": research_trace.get("attempts", {}),
-                            "budget": research_trace.get("budget", {}),
-                            "duration_seconds": research_duration_seconds,
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-                yield _with_run_attribution(
-                    research_debug,
-                    json.loads(research_debug["data"]),
-                    session["session_id"],
-                    run_id,
-                )
             agent_iter = _stream_with_research_context(
                 agent,
                 message,
                 session["session_id"],
                 merged_history,
-                research_context,
+                "",
             ).__aiter__()
             pending_agent = asyncio.create_task(agent_iter.__anext__())
             pending_subagent = asyncio.create_task(event_queue.get())
@@ -1720,6 +1693,17 @@ async def chat_stream(request: Request) -> EventSourceResponse:
                             terminal_failure_reason = assistant_text
                     elif event_type == "done":
                         assistant_text = str(parsed or assistant_text)
+                        research_route = _research_route_payload(
+                            policy,
+                            [str(item.get("name") or "") for item in assistant_tools if isinstance(item, dict)],
+                        )
+                        store.update_progress(session["session_id"], research_route=research_route)
+                        yield _with_run_attribution(
+                            {"event": "research", "data": json.dumps(research_route, ensure_ascii=False)},
+                            research_route,
+                            session["session_id"],
+                            run_id,
+                        )
                         resolved_status = terminal_status or ("completed" if assistant_text.strip() else "failed")
                         resolved_failure_reason = terminal_failure_reason or (
                             "" if assistant_text.strip() else "Agent returned no final text."
@@ -1848,34 +1832,26 @@ async def chat_sync(request: Request) -> JSONResponse:
         )
 
         agent = await get_agent()
-        research_started_at = time.monotonic()
-        try:
-            research_result = await asyncio.to_thread(
-                run_agentic_research,
-                agent,
-                message,
-                knowledge_policy=policy,
-            )
-        except Exception:
-            research_result = None
-        research_context = build_synthesis_context(research_result) if research_result is not None else ""
-        research_trace = _research_trace_payload(research_result)
-        if research_trace is not None:
-            _log_research_completion(research_trace, round(time.monotonic() - research_started_at, 3))
         final_text = ""
         tools: list[dict[str, Any]] = []
         pending_tool_ids: dict[str, list[str]] = {}
         run_usage: dict[str, Any] = {}
         terminal_status = ""
         terminal_failure_reason = ""
-        context_tokens = bind_runtime_context(session["session_id"], run_id)
+        research_config = load_agentic_research_config()
+        context_tokens = bind_runtime_context(
+            session["session_id"],
+            run_id,
+            knowledge_policy=policy,
+            source_call_limits=research_config.source_call_limits,
+        )
         try:
             async for event in _stream_with_research_context(
                 agent,
                 message,
                 session["session_id"],
                 merged_history,
-                research_context,
+                "",
             ):
                 event_type = event["event"]
                 try:
@@ -1951,13 +1927,17 @@ async def chat_sync(request: Request) -> JSONResponse:
             usage=final_usage,
         )
         _schedule_memory_extraction(store, session["session_id"])
+        research_route = _research_route_payload(
+            policy,
+            [str(item.get("name") or "") for item in tools if isinstance(item, dict)],
+        )
+        store.update_progress(session["session_id"], research_route=research_route)
         payload: dict[str, Any] = {
             "reply": final_text,
             "session_id": session["session_id"],
             "usage": final_usage,
+            "research": research_route,
         }
-        if research_trace is not None:
-            payload["research"] = research_trace
         return JSONResponse(payload)
     finally:
         try:
