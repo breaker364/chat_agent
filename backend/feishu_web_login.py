@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import qrcode
 import requests
@@ -232,13 +233,34 @@ def is_feishu_session_valid(payload: dict[str, Any] | None) -> bool:
     return (time.time() - issued_at) < SESSION_MAX_AGE_SECONDS
 
 
-def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int = 10) -> dict[str, Any]:
+def _resolve_feishu_probe_url(probe_url: str | None = None) -> str:
+    configured = (
+        probe_url
+        or os.environ.get("FEISHU_WEB_URL")
+        or os.environ.get("FEISHU_DOC_HOST")
+        or DEFAULT_REDIRECT_URL
+    ).strip()
+    if "://" not in configured:
+        configured = f"https://{configured}"
+    parsed = urlparse(configured)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or not (
+        hostname == "feishu.cn" or hostname.endswith(".feishu.cn")
+    ):
+        raise ValueError("Feishu probe URL must use an https feishu.cn host")
+    return configured if configured.endswith("/") else f"{configured}/"
+
+
+def is_feishu_session_server_valid(
+    payload: dict[str, Any] | None,
+    timeout: int = 10,
+    probe_url: str | None = None,
+) -> dict[str, Any]:
     """Verify the session against the Feishu server with a real HTTP request.
 
-    Probes ``https://nio.feishu.cn/`` with the stored session cookie and
-    follows up to 2 redirects. A valid session stays within nio.feishu.cn;
-    an invalid/expired session is redirected to ``accounts.feishu.cn``
-    (the login page).
+    Probes a configurable Feishu web URL with the stored session cookie and
+    follows up to 2 redirects. An invalid/expired session is redirected to
+    the account login page.
 
     Returns a dict with keys:
       - valid: bool — whether the session is accepted by the server
@@ -252,6 +274,16 @@ def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int 
     if not session:
         return {"valid": False, "reason": "empty_session_cookie", "status_code": None, "final_url": None}
 
+    try:
+        initial_url = _resolve_feishu_probe_url(probe_url)
+    except ValueError as exc:
+        return {
+            "valid": False,
+            "reason": f"server_probe_invalid_url: {exc}",
+            "status_code": None,
+            "final_url": None,
+        }
+
     session_cookies = {"session": session}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -259,9 +291,8 @@ def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int 
     }
 
     try:
-        # Step 1: probe the root — nio.feishu.cn always 302s to /drive/home/
         resp = requests.get(
-            "https://nio.feishu.cn/",
+            initial_url,
             cookies=session_cookies,
             headers=headers,
             timeout=timeout,
@@ -275,17 +306,15 @@ def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int 
         return {"valid": False, "reason": f"server_probe_error: {exc}", "status_code": None, "final_url": None}
 
     # Step 2: follow the redirect chain (up to 2 hops).
-    # Valid session: nio.feishu.cn/drive/home/ → 200 (or 302 to another nio page)
-    # Invalid session: nio.feishu.cn/drive/home/ → 302 → accounts.feishu.cn/.../login
-    current_url = resp.headers.get("Location") or resp.headers.get("location") or ""
+    current_url = initial_url
     final_status = resp.status_code
-    final_url = current_url
+    location = resp.headers.get("Location") or resp.headers.get("location") or ""
+    final_url = urljoin(current_url, location) if location else current_url
 
     for _ in range(2):
-        if not current_url or final_status not in (301, 302, 307, 308):
+        if not location or final_status not in (301, 302, 307, 308):
             break
-        if not current_url.startswith("http"):
-            current_url = f"https://nio.feishu.cn{current_url}" if current_url.startswith("/") else f"https://{current_url}"
+        current_url = urljoin(current_url, location)
         try:
             next_resp = requests.get(
                 current_url,
@@ -297,7 +326,8 @@ def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int 
         except Exception:
             break
         final_status = next_resp.status_code
-        final_url = next_resp.headers.get("Location") or next_resp.headers.get("location") or current_url
+        location = next_resp.headers.get("Location") or next_resp.headers.get("location") or ""
+        final_url = urljoin(current_url, location) if location else current_url
 
         # Check if this redirect targets the login page
         loc_lower = final_url.lower()
@@ -311,7 +341,6 @@ def is_feishu_session_server_valid(payload: dict[str, Any] | None, timeout: int 
 
         if final_status not in (301, 302, 307, 308):
             break
-        current_url = final_url
 
     if final_status == 200:
         return {
