@@ -1277,9 +1277,19 @@ async def stream_agent_events(
         try:
             payload = json.loads(text)
             if isinstance(payload, dict):
-                if payload.get("success") is False or payload.get("error"):
+                if payload.get("success") is False or payload.get("error") or payload.get("blocked"):
                     return True
-                if str(payload.get("status") or "").lower() in {"failed", "error", "blocked"}:
+                if str(payload.get("status") or "").lower() in {
+                    "failed",
+                    "error",
+                    "blocked",
+                    "write_failed",
+                    "verification_failed",
+                    "skill_execution_failed",
+                    "policy_denied",
+                    "budget_denied",
+                    "runtime_unavailable",
+                }:
                     return True
         except Exception:
             pass

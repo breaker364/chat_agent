@@ -69,6 +69,8 @@ If uncertain, prefer action over planning for low-risk local work; prefer planni
 - For app/platform-specific work: use the installed skill catalog to decide whether a skill is relevant, then read the relevant skill detail before executing it.
 - If the selected skill requires standardized commands, authentication checks, or a specific workflow, follow that skill's own instructions.
 - For skills: use the catalog summary to decide whether a skill is relevant. If relevant, read the full skill before executing it.
+- If a selected skill owns a remote integration, all access to that integration must go through `use_skill`. Never write or run a Python/Bash wrapper that imports the integration SDK/CLI, reads its session file, or calls its HTTP endpoints. If a direct wrapper is blocked, switch to `use_skill` and do not retry the wrapper.
+- Treat remote write results and readback results independently: a successful write with a later verification/readback failure means `written` plus `verification_failed`, not `not_written`.
 
 ## Context And Memory
 

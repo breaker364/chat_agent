@@ -82,6 +82,72 @@ def _workspace_helpers() -> tuple[Any, Any, Any, Any]:
     return _ensure_readable, _is_within, _knowledge_index_root, _workspace_root
 
 
+def _managed_skill_script_block_reason(content: str) -> tuple[str, dict[str, str]] | None:
+    """Return a skill boundary denial for provider automation in Bash text."""
+    try:
+        from .skills import find_managed_skill_policy
+
+        workspace_root = _workspace_helpers()[3]
+        policy = find_managed_skill_policy(workspace_root(), content)
+    except Exception:
+        return None
+    if policy is None:
+        return None
+    reason = (
+        "Direct automation for a managed remote integration is blocked when an installed skill owns the operation. "
+        f"Use {policy['required_tool']} with skill {policy['skill_name']!r} so its authentication and command boundary are reused."
+    )
+    return reason, policy
+
+
+def _managed_skill_command_block_reason(command: str) -> tuple[str, dict[str, str]] | None:
+    """Inspect referenced workspace scripts before Bash starts them."""
+    blocked = _managed_skill_script_block_reason(command)
+    if blocked is not None:
+        return blocked
+    try:
+        workspace = _workspace_helpers()[3]().resolve()
+    except Exception:
+        return None
+    for raw_path in re.findall(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_./\\-]+\.py)(?![A-Za-z0-9_.-])", command, re.I):
+        candidate = Path(raw_path).expanduser()
+        candidate = candidate if candidate.is_absolute() else workspace / candidate
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(workspace)
+            if not resolved.is_file():
+                continue
+            script_text = resolved.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+        blocked = _managed_skill_script_block_reason(script_text)
+        if blocked is not None:
+            return blocked
+    return None
+
+
+def _blocked_managed_skill_result(
+    command: str,
+    reason: str,
+    policy: dict[str, str],
+) -> str:
+    return _json_result(
+        {
+            "blocked": True,
+            "status": "policy_denied",
+            "error_category": "managed_skill_required",
+            "reason": reason,
+            "command_hash": "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            "suggested_tool": policy["required_tool"],
+            "skill_name": policy["skill_name"],
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "truncated": False,
+        }
+    )
+
+
 def _base_result(*, status: str, pattern: str = "", scope: str = ".") -> dict[str, Any]:
     return {
         "status": status,
@@ -406,6 +472,10 @@ def bash(
     if len(command_text) > int(settings["max_command_chars"]):
         result["error_category"] = "command_length"
         return _json_result(result)
+    blocked = _managed_skill_command_block_reason(command_text)
+    if blocked:
+        reason, policy = blocked
+        return _blocked_managed_skill_result(command_text, reason, policy)
     timeout_value = int(timeout_seconds or settings["default_timeout_seconds"])
     output_limit = int(max_output_chars or settings["max_output_chars"])
     if timeout_value > int(settings["max_timeout_seconds"]):

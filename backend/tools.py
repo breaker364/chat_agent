@@ -42,6 +42,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_agent_memory_config, load_mcd_mcp_config
+from .mutation_manifest import normalize_command_manifest
 from .runtime_context import (
     copy_runtime_context,
     current_knowledge_policy,
@@ -68,7 +69,7 @@ from .feishu_web_login import (
     is_feishu_session_valid,
     poll_feishu_qr_login,
 )
-from .skills import build_skill_tools
+from .skills import build_skill_tools, find_managed_skill_policy, get_installed_skill
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ _MAX_FETCH_REDIRECTS = 10
 _PYTHON_RUN_TIMEOUT_SECONDS = 60
 _PYTHON_RUN_MAX_TIMEOUT_SECONDS = 120
 _PYTHON_OUTPUT_MAX_CHARS = 12_000
+_SCRIPT_FILE_SUFFIXES = frozenset({".py", ".sh", ".bash", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".ts"})
 _MAX_EXTERNAL_COPY_BYTES = 100 * 1024 * 1024
 _MAX_PARALLEL_SEARCH_ROUTES = 2
 _DOWNLOAD_DIR_NAME = str(get_runtime_value("paths", "download_dir", "tmp") or "tmp")
@@ -671,6 +673,145 @@ def _primary_result_is_stronger_than_created(primary: Any) -> bool:
     return bool(primary.get("verified"))
 
 
+def _standardized_skill_manifest(arguments: dict[str, Any]) -> Any | None:
+    """Resolve a skill request's manifest using that skill's own configuration."""
+    request = str(arguments.get("request") or "").strip()
+    if not request.lower().startswith(("lark ", "lark_cli ")):
+        return None
+    skill_name = str(arguments.get("skill_name") or "").strip()
+    skill = get_installed_skill(_workspace_root(), skill_name) if skill_name else None
+    configured = None
+    if skill is not None and isinstance(skill.manifest_config, dict):
+        configured = skill.manifest_config.get("subcommand_operations")
+    try:
+        return normalize_command_manifest(request, subcommand_operations=configured)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_result_object(content: str) -> dict[str, Any] | None:
+    failure_statuses = {
+        "invalid_input",
+        "permission_denied",
+        "policy_denied",
+        "budget_denied",
+        "runtime_unavailable",
+        "timed_out",
+        "output_truncated",
+        "command_failed",
+        "verification_failed",
+        "write_failed",
+        "skill_execution_failed",
+    }
+    for obj in _json_objects_from_text(content):
+        if obj.get("success") is False or obj.get("error"):
+            continue
+        if str(obj.get("status") or "").strip().lower() in failure_statuses:
+            continue
+        if obj.get("success") is True or any(
+            obj.get(key) for key in ("url", "token", "base_token", "obj_token", "docx_token", "path")
+        ):
+            return obj
+    return None
+
+
+def _skill_result_location(
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> tuple[str, str]:
+    url = str(result.get("url") or result.get("source_url") or "").strip()
+    token = str(
+        result.get("token")
+        or result.get("base_token")
+        or result.get("obj_token")
+        or result.get("docx_token")
+        or result.get("spreadsheet_token")
+        or ""
+    ).strip()
+    if not url:
+        request = str(arguments.get("request") or "")
+        match = re.search(r"https?://[^\s，。；;]+", request)
+        if match:
+            url = match.group(0).rstrip(".,);]")
+    return url, token
+
+
+def _record_successful_skill_result(
+    session_id: str,
+    arguments: dict[str, Any],
+    content: str,
+    store: SessionStore,
+) -> None:
+    """Persist a successful mutating skill result as the durable progress anchor."""
+    manifest = _standardized_skill_manifest(arguments)
+    if manifest is None or not bool(getattr(manifest, "mutating", False)):
+        return
+    if str(getattr(manifest, "operation", "")).lower() == "delete":
+        return
+    result = _first_result_object(content)
+    if result is None:
+        return
+    url, token = _skill_result_location(arguments, result)
+    table_id = str(result.get("table_id") or result.get("tableId") or "").strip()
+    path = str(result.get("path") or "").strip()
+    target = url or path or token
+    if not target:
+        return
+    verified = bool(result.get("verified", False))
+    operation = str(getattr(manifest, "operation", "write") or "write").lower()
+    record_count = result.get("record_count")
+    if record_count is None:
+        record_count = result.get("records_added")
+    if record_count is None:
+        record_count = result.get("count")
+    payload = {
+        "type": str(getattr(manifest, "resource", "remote_result") or "remote_result"),
+        "title": str(result.get("title") or result.get("name") or "Remote result").strip(),
+        "url": url,
+        "path": path,
+        "token": token,
+        "table_id": table_id,
+        "record_count": _coerce_optional_int(record_count),
+        "status": "verified" if verified else "written",
+        "verified": verified,
+        "summary": str(
+            result.get("summary")
+            or result.get("message")
+            or f"Skill operation {operation} completed successfully."
+        ).strip()[:1200],
+        "source_tool": "use_skill",
+    }
+    store.record_primary_result(session_id, payload)
+
+    plan = store.load_task_plan(session_id)
+    todos = plan.get("todos") if isinstance(plan, dict) else []
+    operation_terms = {
+        "create": ("create", "new", "创建", "新建", "建立"),
+        "append": ("append", "add", "write", "insert", "批量", "写入", "添加", "新增"),
+        "edit": ("edit", "update", "rename", "修改", "编辑", "更新", "重命名"),
+        "replace": ("replace", "overwrite", "reformat", "替换", "覆盖", "重写"),
+    }
+    terms = operation_terms.get(operation, ())
+    candidates = [
+        item
+        for item in todos
+        if isinstance(item, dict)
+        and str(item.get("status") or "") in {"pending", "in_progress"}
+        and any(term.casefold() in str(item.get("content") or "").casefold() for term in terms)
+    ]
+    active = next((item for item in candidates if item.get("status") == "in_progress"), None)
+    if active is None and len(candidates) == 1:
+        active = candidates[0]
+    if active is not None:
+        store.update_task_plan_todo(
+            session_id,
+            str(active.get("task_id") or ""),
+            status="completed",
+            details=payload["summary"],
+            result_ref=target,
+        )
+
+
 def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> None:
     session_id = _current_session_id()
     if not session_id:
@@ -680,6 +821,8 @@ def _auto_register_tool_result(tool_name: str, arguments: Any, content: str) -> 
         return
     args = arguments if isinstance(arguments, dict) else {}
     try:
+        if tool_name == "use_skill":
+            _record_successful_skill_result(session_id, args, content, store)
         for obj in _json_objects_from_text(content):
             if obj.get("success") is False or obj.get("error"):
                 continue
@@ -1659,48 +1802,31 @@ def _read_workbook_text(target: Path) -> str:
     return "\n".join(sections)
 
 
-def _feishu_crud_script_block_reason(content: str) -> str:
-    text = (content or "").lower()
-    has_feishu_marker = any(
-        marker in text
-        for marker in (
-            "feishu_web_session.json",
-            "/space/api/",
-            "/bitable/",
-            "lark_tools.commands.bitable",
-            "lark_tools.bitable",
-        )
+def _managed_skill_script_block_reason(content: str) -> tuple[str, dict[str, str]] | None:
+    policy = find_managed_skill_policy(_workspace_root(), content)
+    if policy is None:
+        return None
+    reason = (
+        "Direct automation for a managed remote integration is blocked when an installed skill owns the operation. "
+        f"Use {policy['required_tool']} with skill {policy['skill_name']!r} so its authentication and command boundary are reused."
     )
-    has_write_intent = any(
-        marker in text
-        for marker in (
-            "requests.post",
-            "requests.patch",
-            "requests.delete",
-            "add-record",
-            "add_records",
-            "set-record",
-            "delete-record",
-            "cmd_bitable_add",
-            "cmd_bitable_set",
-            "cmd_bitable_delete",
-        )
-    )
-    if has_feishu_marker and has_write_intent:
-        return (
-            "Direct CRUD automation scripts are blocked when a matching installed skill can handle the operation. "
-            "Select the appropriate skill from the catalog and follow that skill's own command and auth instructions."
-        )
-    return ""
+    return reason, policy
 
 
-def _blocked_feishu_script_payload(path: str, reason: str) -> str:
+def _blocked_managed_skill_payload(
+    target: str,
+    reason: str,
+    policy: dict[str, str],
+) -> str:
     return json.dumps(
         {
             "blocked": True,
+            "status": "policy_denied",
+            "error_category": "managed_skill_required",
             "reason": reason,
-            "path": path,
-            "suggested_tool": "use_skill",
+            "path": target,
+            "suggested_tool": policy["required_tool"],
+            "skill_name": policy["skill_name"],
         },
         ensure_ascii=False,
         indent=2,
@@ -1862,10 +1988,11 @@ def write_file(path: str, content: str, overwrite: bool = True) -> str:
         target = _ensure_writable(path)
     except PermissionError as exc:
         return str(exc)
-    if target.suffix.lower() == ".py":
-        reason = _feishu_crud_script_block_reason(content or "")
-        if reason:
-            return _blocked_feishu_script_payload(str(target), reason)
+    if target.suffix.lower() in _SCRIPT_FILE_SUFFIXES:
+        blocked = _managed_skill_script_block_reason(content or "")
+        if blocked:
+            reason, policy = blocked
+            return _blocked_managed_skill_payload(str(target), reason, policy)
     if target.exists() and target.is_dir():
         return f"Cannot write file because target is a directory: {target}"
     if target.exists() and not overwrite:
@@ -1884,11 +2011,12 @@ def append_file(path: str, content: str) -> str:
         target = _ensure_writable(path)
     except PermissionError as exc:
         return str(exc)
-    if target.suffix.lower() == ".py":
+    if target.suffix.lower() in _SCRIPT_FILE_SUFFIXES:
         existing = target.read_text(encoding="utf-8", errors="ignore") if target.exists() and target.is_file() else ""
-        reason = _feishu_crud_script_block_reason(existing + "\n" + (content or ""))
-        if reason:
-            return _blocked_feishu_script_payload(str(target), reason)
+        blocked = _managed_skill_script_block_reason(existing + "\n" + (content or ""))
+        if blocked:
+            reason, policy = blocked
+            return _blocked_managed_skill_payload(str(target), reason, policy)
     if target.exists() and target.is_dir():
         return f"Cannot append because target is a directory: {target}"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2270,9 +2398,10 @@ def run_python_file(
         script_text = target.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         script_text = ""
-    reason = _feishu_crud_script_block_reason(script_text)
-    if reason:
-        return _blocked_feishu_script_payload(str(target), reason)
+    blocked = _managed_skill_script_block_reason(script_text)
+    if blocked:
+        reason, policy = blocked
+        return _blocked_managed_skill_payload(str(target), reason, policy)
     if current_run_id():
         index_root = _knowledge_index_root()
         normalized_script = script_text.replace("\\", "/")

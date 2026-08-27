@@ -219,6 +219,39 @@ def get_installed_skill(root: Path, name: str) -> SkillDefinition | None:
     for skill in list_installed_skills(root):
         if _safe_name(skill.name) == normalized:
             return skill
+
+
+def find_managed_skill_policy(root: Path, content: str) -> dict[str, str] | None:
+    """Find a manifest-declared skill boundary referenced by script text.
+
+    The generic runtime does not identify providers or entities itself.  A
+    skill that owns a remote integration declares its own execution markers
+    and the tool that must be used for that integration in its manifest.
+    """
+    text = str(content or "").casefold()
+    if not text:
+        return None
+    try:
+        skills = list_installed_skills(root)
+    except Exception:
+        return None
+    for skill in skills:
+        manifest = skill.manifest_config if isinstance(skill.manifest_config, dict) else {}
+        raw_policy = manifest.get("execution_policy")
+        if not isinstance(raw_policy, dict):
+            continue
+        raw_markers = raw_policy.get("script_markers")
+        if not isinstance(raw_markers, (list, tuple, set)):
+            continue
+        markers = [str(marker or "").strip().casefold() for marker in raw_markers]
+        if not any(marker and marker in text for marker in markers):
+            continue
+        required_tool = str(raw_policy.get("required_tool") or "use_skill").strip()
+        skill_name = str(raw_policy.get("skill_name") or skill.name).strip()
+        return {
+            "required_tool": required_tool or "use_skill",
+            "skill_name": skill_name or skill.name,
+        }
     return None
 
 
@@ -320,6 +353,76 @@ def _skill_runner_path(skill: SkillDefinition) -> Path | None:
     return runner if runner.exists() else None
 
 
+def _skill_runtime_environment(
+    skill: SkillDefinition,
+    workspace_root: Path | None,
+) -> dict[str, str]:
+    """Return the runner environment, including only manifest-declared paths.
+
+    Skill runners must execute with the same workspace context as the agent.
+    A skill may declare non-secret path variables in ``runtime_environment``;
+    values are expanded from the runner's skill and workspace roots.  This
+    keeps provider-specific session discovery in the skill manifest instead of
+    making the generic agent runtime guess paths from a temporary cwd.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["CHAT_AGENT_SKILL_ROOT"] = str(Path(skill.source_path).resolve())
+    if workspace_root is not None:
+        env["CHAT_AGENT_WORKSPACE_ROOT"] = str(workspace_root.resolve())
+
+    declared = skill.manifest_config.get("runtime_environment") if isinstance(skill.manifest_config, dict) else None
+    if not isinstance(declared, dict):
+        return env
+
+    skill_root = Path(skill.source_path).resolve()
+    workspace = (workspace_root or skill_root).resolve()
+    for key, value in declared.items():
+        name = str(key or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if not isinstance(value, str) or "\x00" in value:
+            continue
+        expanded = (
+            value.replace("{skill_root}", str(skill_root))
+            .replace("{workspace_root}", str(workspace))
+        )
+        env[name] = expanded
+    return env
+
+
+def _skill_failure_payload(
+    params: dict[str, Any],
+    error: Any,
+    *,
+    partial_stdout: str = "",
+) -> dict[str, Any]:
+    """Classify runner failures without turning remote writes into successes."""
+    manifest = params.get("manifest") if isinstance(params, dict) else None
+    manifest = manifest if isinstance(manifest, dict) else {}
+    operation = str(manifest.get("operation") or "").strip().lower()
+    if operation == "read":
+        status = "verification_failed"
+        category = "readback_failed"
+    elif bool(manifest.get("mutating")) or operation in {"append", "edit", "replace", "create", "delete"}:
+        status = "write_failed"
+        category = "remote_write_failed"
+    else:
+        status = "skill_execution_failed"
+        category = "runner_failed"
+    payload: dict[str, Any] = {
+        "status": status,
+        "error_category": category,
+        "error": str(error or "Skill runner failed.")[:1200],
+        "operation": operation,
+        "verified": False,
+    }
+    if partial_stdout.strip():
+        payload["partial_output"] = partial_stdout[:4000]
+    return payload
+
+
 def _execute_skill_runner_sync(
     skill: SkillDefinition,
     params: dict[str, Any],
@@ -329,10 +432,7 @@ def _execute_skill_runner_sync(
     if runner is None:
         raise FileNotFoundError(f"No skill runner found for skill '{skill.name}'.")
 
-    env = dict(os.environ)
-    env["CHAT_AGENT_SKILL_ROOT"] = str(Path(skill.source_path).resolve())
-    if workspace_root is not None:
-        env["CHAT_AGENT_WORKSPACE_ROOT"] = str(workspace_root.resolve())
+    env = _skill_runtime_environment(skill, workspace_root)
     process = subprocess.run(
         [sys.executable, str(runner)],
         input=json.dumps(params, ensure_ascii=False).encode("utf-8"),
@@ -344,7 +444,15 @@ def _execute_skill_runner_sync(
     )
     if process.returncode != 0:
         stderr_text = process.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(stderr_text or f"Skill runner failed with exit code {process.returncode}.")
+        stdout_text = process.stdout.decode("utf-8", errors="replace").strip()
+        return json.dumps(
+            _skill_failure_payload(
+                params,
+                stderr_text or f"Skill runner failed with exit code {process.returncode}.",
+                partial_stdout=stdout_text,
+            ),
+            ensure_ascii=False,
+        )
     stdout_text = process.stdout.decode("utf-8", errors="replace").strip()
     if not stdout_text:
         return ""
@@ -355,6 +463,33 @@ def _execute_skill_runner_sync(
     if isinstance(parsed, dict) and "result" in parsed:
         return str(parsed["result"])
     return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+
+def _skill_result_indicates_failure(result: Any) -> bool:
+    """Recognize structured runner failures before recording mutation success."""
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False or payload.get("error"):
+        return True
+    return str(payload.get("status") or "").strip().lower() in {
+        "invalid_input",
+        "permission_denied",
+        "policy_denied",
+        "budget_denied",
+        "runtime_unavailable",
+        "timed_out",
+        "output_truncated",
+        "command_failed",
+        "verification_failed",
+        "write_failed",
+        "skill_execution_failed",
+    }
 
 
 async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> str:
@@ -424,6 +559,8 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
         return str(existing.result)
 
     result = await dispatch()
+    if _skill_result_indicates_failure(result):
+        return result
     try:
         audit = json.loads(result)
     except (TypeError, json.JSONDecodeError):
