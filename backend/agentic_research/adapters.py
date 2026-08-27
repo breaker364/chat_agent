@@ -109,16 +109,85 @@ class WorkspaceEvidenceAdapter:
         read_file: Callable[..., Any],
         list_directory: Callable[..., Any] | None = None,
         get_file_info: Callable[..., Any] | None = None,
+        glob: Callable[..., Any] | None = None,
+        grep: Callable[..., Any] | None = None,
         excerpt_char_limit: int = 1200,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.read_file = read_file
         self.list_directory = list_directory
         self.get_file_info = get_file_info
+        self.glob = glob
+        self.grep = grep
         self.excerpt_char_limit = max(128, min(int(excerpt_char_limit), 4000))
 
+    def _collect_search(self, operation: str, value: str) -> EvidenceObservation:
+        callback = self.glob if operation == "glob" else self.grep
+        if callback is None:
+            return EvidenceObservation(
+                source_kind=self.source_kind,
+                status="provider_unavailable",
+                error_category=f"{operation}_unavailable",
+                query=value,
+            )
+        try:
+            data = _payload(_invoke(callback, {"pattern": value}, value))
+            raw_matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+            citations: list[dict[str, Any]] = []
+            excerpts: list[str] = []
+            if operation == "glob":
+                for item in raw_matches[:32]:
+                    path = str(item or "")[:400]
+                    if not path:
+                        continue
+                    citations.append({"id": path, "title": path.rsplit("/", 1)[-1], "uri": f"workspace://{path}"})
+                if raw_matches:
+                    excerpts.append("\n".join(str(item or "")[:400] for item in raw_matches[:32]))
+            else:
+                for item in raw_matches[:32]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    path = str(item.get("path") or "")[:400]
+                    line_number = int(item.get("line_number") or 0)
+                    line = str(item.get("line") or "")[: self.excerpt_char_limit]
+                    if not path:
+                        continue
+                    citations.append(
+                        {
+                            "id": f"{path}:{line_number}",
+                            "title": path.rsplit("/", 1)[-1],
+                            "uri": f"workspace://{path}#L{line_number}",
+                        }
+                    )
+                    excerpts.append(f"{path}:{line_number}: {line}")
+            status = str(data.get("status") or "ok").strip().lower()
+            return EvidenceObservation(
+                source_kind=self.source_kind,
+                status=status if status else ("ok" if raw_matches else "no_results"),
+                citations=citations,
+                excerpts=excerpts,
+                query=value,
+                metadata={
+                    "operation": operation,
+                    "returned_count": len(raw_matches[:32]),
+                    "files_scanned": data.get("files_scanned"),
+                    "truncated": bool(data.get("truncated")),
+                },
+                error_category=str(data.get("error_category") or "")[:80],
+                citation_limit=32,
+                excerpt_limit=self.excerpt_char_limit,
+                raw_payload=data,
+            )
+        except Exception as exc:
+            return _error_observation(self.source_kind, exc)
+
     def collect(self, query_or_scope: str) -> EvidenceObservation:
-        requested = Path(str(query_or_scope or "").strip()).expanduser()
+        request = str(query_or_scope or "").strip()
+        if request.lower().startswith("glob:") and self.glob is not None:
+            return self._collect_search("glob", request[5:].strip())
+        if request.lower().startswith("grep:") and self.grep is not None:
+            return self._collect_search("grep", request[5:])
+        requested = Path(request).expanduser()
         candidate = requested.resolve() if requested.is_absolute() else (self.workspace_root / requested).resolve()
         try:
             candidate.relative_to(self.workspace_root)

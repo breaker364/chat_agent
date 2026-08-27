@@ -51,6 +51,7 @@ class SkillDefinition:
     resource_hints: list[str] = field(default_factory=list)
     script_hints: list[str] = field(default_factory=list)
     source_path: str = ""
+    manifest_config: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SkillDefinition":
@@ -66,6 +67,7 @@ class SkillDefinition:
             resource_hints=data.get("resource_hints", []),
             script_hints=data.get("script_hints", []),
             source_path=data.get("source_path", ""),
+            manifest_config=data.get("manifest_config", {}) or {},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,6 +124,37 @@ def _build_prompt_from_skill_md(markdown_body: str) -> str:
     )
 
 
+def _load_manifest_config(path: Path) -> dict[str, Any]:
+    config_path = path / "command_manifest.json"
+    if not config_path.exists():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid command manifest at {config_path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid command manifest at {config_path}: expected an object")
+
+    subcommand_operations = data.get("subcommand_operations", {})
+    if not isinstance(subcommand_operations, dict):
+        raise ValueError(
+            f"Invalid command manifest at {config_path}: subcommand_operations must be an object"
+        )
+    for family, operations in subcommand_operations.items():
+        if not isinstance(family, str) or not isinstance(operations, dict):
+            raise ValueError(
+                f"Invalid command manifest at {config_path}: command families must map to objects"
+            )
+        if any(
+            not isinstance(name, str) or not isinstance(operation, str)
+            for name, operation in operations.items()
+        ):
+            raise ValueError(
+                f"Invalid command manifest at {config_path}: subcommands and operations must be strings"
+            )
+    return data
+
+
 def _load_skill_from_markdown_dir(path: Path) -> SkillDefinition | None:
     skill_md = path / "SKILL.md"
     if not skill_md.exists():
@@ -138,6 +171,7 @@ def _load_skill_from_markdown_dir(path: Path) -> SkillDefinition | None:
     if scripts_dir.exists():
         for item in sorted(scripts_dir.iterdir()):
             script_hints.append(str(item))
+    manifest_config = _load_manifest_config(path)
     return SkillDefinition(
         name=meta.get("name", path.name),
         description=meta.get("description", ""),
@@ -150,6 +184,7 @@ def _load_skill_from_markdown_dir(path: Path) -> SkillDefinition | None:
         resource_hints=resource_hints,
         script_hints=script_hints,
         source_path=str(path),
+        manifest_config=manifest_config,
     )
 
 
@@ -334,7 +369,13 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
     manifest: CommandManifest | None = None
     if is_standardized:
         try:
-            request_manifest = normalize_command_manifest(request)
+            subcommand_operations = None
+            if isinstance(skill.manifest_config, dict):
+                subcommand_operations = skill.manifest_config.get("subcommand_operations")
+            request_manifest = normalize_command_manifest(
+                request,
+                subcommand_operations=subcommand_operations,
+            )
         except ValueError as exc:
             raise ValueError("Unclassified standardized remote command was blocked before dispatch.") from exc
         supplied_manifest = params.get("manifest")

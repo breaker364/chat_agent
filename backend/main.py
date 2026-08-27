@@ -40,6 +40,7 @@ from .run_append import (
     finalize_pending_append_commands,
 )
 from .tools import clear_tool_dedupe_cache
+from .workspace_shell_tools import get_shell_tools_diagnostics
 from .feishu_web_login import (
     FeishuWebSessionStore,
     bootstrap_feishu_session,
@@ -75,6 +76,13 @@ async def bootstrap_feishu_auth_on_startup() -> None:
         "[feishu] startup session status: "
         f"logged_in={status.get('logged_in')} reason={status.get('reason')} "
         f"source={status.get('source')} path={status.get('path')}"
+    )
+    shell_tools = get_shell_tools_diagnostics()
+    print(
+        "[shell_tools] "
+        f"enabled={shell_tools.get('enabled')} "
+        f"bash_status={shell_tools.get('bash_status')} "
+        f"executable_policy={shell_tools.get('executable_policy')}"
     )
 
 # ---------------------------------------------------------------------------

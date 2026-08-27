@@ -25,6 +25,21 @@
     "max_candidates": 8,
     "extraction_timeout_seconds": 30
   },
+  "shell_tools": {
+    "enabled": true,
+    "bash_enabled": false,
+    "bash_executable": "",
+    "environment_allowlist": [],
+    "default_timeout_seconds": 30,
+    "max_timeout_seconds": 120,
+    "max_output_chars": 12000,
+    "max_glob_matches": 200,
+    "max_grep_matches": 200,
+    "max_file_bytes": 1048576,
+    "max_pattern_chars": 4096,
+    "max_scope_chars": 2048,
+    "max_command_chars": 8192
+  },
   "tavily_api_key": "",
   "tavily_base_url": "",
   "mcd_mcp_url": "",

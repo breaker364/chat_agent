@@ -2,14 +2,118 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_CONFIG_PATH = PROJECT_ROOT / "runtime_config.json"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
 DEFAULT_TAVILY_BASE_URL = "https://api.tavily.com"
 DEFAULT_MCD_MCP_URL = "https://mcp.mcd.cn"
+
+
+DEFAULT_SHELL_TOOLS_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "bash_enabled": False,
+    "bash_executable": "",
+    "environment_allowlist": [],
+    "default_timeout_seconds": 30,
+    "max_timeout_seconds": 120,
+    "max_output_chars": 12_000,
+    "max_glob_matches": 200,
+    "max_grep_matches": 200,
+    "max_file_bytes": 1 * 1024 * 1024,
+    "max_pattern_chars": 4096,
+    "max_scope_chars": 2048,
+    "max_command_chars": 8192,
+}
+
+
+class ShellToolsConfigError(ValueError):
+    """Raised when shell-tool configuration is unsafe or unsupported."""
+
+
+_SHELL_TOOLS_ALLOWED_KEYS = frozenset(DEFAULT_SHELL_TOOLS_CONFIG)
+_SHELL_TOOLS_SENSITIVE_MARKERS = (
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "authorization",
+    "cookie",
+    "api_key",
+    "access_key",
+)
+
+
+def load_shell_tools_config(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Load validated, bounded settings for the generic workspace shell tools."""
+    if raw is None:
+        runtime = load_runtime_config()
+        section = runtime.get("shell_tools") if isinstance(runtime, Mapping) else None
+        raw = section if isinstance(section, Mapping) else {}
+    elif isinstance(raw, Mapping) and isinstance(raw.get("shell_tools"), Mapping):
+        raw = raw["shell_tools"]
+    if not isinstance(raw, Mapping):
+        raise ShellToolsConfigError("shell_tools configuration must be an object")
+
+    for key in raw:
+        normalized = str(key).strip().lower()
+        if any(marker in normalized for marker in _SHELL_TOOLS_SENSITIVE_MARKERS):
+            raise ShellToolsConfigError("shell_tools configuration cannot contain credentials")
+        if key not in _SHELL_TOOLS_ALLOWED_KEYS:
+            raise ShellToolsConfigError(f"unsupported shell_tools configuration key: {key}")
+
+    def bounded_int(key: str, minimum: int, maximum: int) -> int:
+        value = raw.get(key, DEFAULT_SHELL_TOOLS_CONFIG[key])
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ShellToolsConfigError(f"{key} must be an integer between {minimum} and {maximum}")
+        return value
+
+    enabled = raw.get("enabled", DEFAULT_SHELL_TOOLS_CONFIG["enabled"])
+    bash_enabled = raw.get("bash_enabled", DEFAULT_SHELL_TOOLS_CONFIG["bash_enabled"])
+    if not isinstance(enabled, bool) or not isinstance(bash_enabled, bool):
+        raise ShellToolsConfigError("enabled and bash_enabled must be booleans")
+
+    executable = str(raw.get("bash_executable", DEFAULT_SHELL_TOOLS_CONFIG["bash_executable"]) or "").strip()
+    if len(executable) > 4096 or "\x00" in executable:
+        raise ShellToolsConfigError("bash_executable is invalid or too long")
+
+    raw_environment = raw.get("environment_allowlist", DEFAULT_SHELL_TOOLS_CONFIG["environment_allowlist"])
+    if not isinstance(raw_environment, (list, tuple, set)):
+        raise ShellToolsConfigError("environment_allowlist must be a list")
+    environment_allowlist: list[str] = []
+    for item in raw_environment:
+        name = str(item or "").strip()
+        lowered = name.lower()
+        if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or len(name) > 80:
+            raise ShellToolsConfigError("environment_allowlist contains an invalid variable name")
+        if any(marker in lowered for marker in _SHELL_TOOLS_SENSITIVE_MARKERS):
+            raise ShellToolsConfigError("environment_allowlist cannot include credential-like variables")
+        if name not in environment_allowlist:
+            environment_allowlist.append(name)
+
+    default_timeout = bounded_int("default_timeout_seconds", 1, 120)
+    max_timeout = bounded_int("max_timeout_seconds", 1, 300)
+    if default_timeout > max_timeout:
+        raise ShellToolsConfigError("default_timeout_seconds cannot exceed max_timeout_seconds")
+
+    return {
+        "enabled": enabled,
+        "bash_enabled": bash_enabled,
+        "bash_executable": executable,
+        "environment_allowlist": environment_allowlist,
+        "default_timeout_seconds": default_timeout,
+        "max_timeout_seconds": max_timeout,
+        "max_output_chars": bounded_int("max_output_chars", 256, 100_000),
+        "max_glob_matches": bounded_int("max_glob_matches", 1, 10_000),
+        "max_grep_matches": bounded_int("max_grep_matches", 1, 10_000),
+        "max_file_bytes": bounded_int("max_file_bytes", 1, 100 * 1024 * 1024),
+        "max_pattern_chars": bounded_int("max_pattern_chars", 1, 16_384),
+        "max_scope_chars": bounded_int("max_scope_chars", 1, 16_384),
+        "max_command_chars": bounded_int("max_command_chars", 1, 32_768),
+    }
 
 
 def load_runtime_config(config_path: str | Path | None = None) -> dict[str, Any]:

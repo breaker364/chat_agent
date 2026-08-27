@@ -46,6 +46,65 @@ def test_rejects_mutating_command_that_cannot_be_normalized():
         normalizer("lark doc publish doc-token")
 
 
+@pytest.mark.parametrize(
+    ("command", "operation", "mutating"),
+    [
+        ("lark bitable tables base-token", "read", False),
+        ("lark bitable schema base-token tbl-token", "read", False),
+        ("lark bitable records base-token tbl-token --all", "read", False),
+        ("lark bitable views base-token tbl-token", "read", False),
+        ("lark bitable download base-token tbl-token --out export.json", "read", False),
+        ("lark bitable create TestBase", "create", True),
+        ("lark bitable add-record base-token tbl-token Name=one", "append", True),
+        ("lark bitable add-records-batch base-token tbl-token []", "append", True),
+        ("lark bitable set-record base-token tbl-token rec-token Name=two", "edit", True),
+        ("lark bitable add-field base-token tbl-token Amount --type number", "edit", True),
+        ("lark bitable add-fields-batch base-token tbl-token []", "edit", True),
+        ("lark bitable set-field-format base-token tbl-token Amount 0.###", "edit", True),
+        ("lark bitable rename-field base-token tbl-token fld-token Amount", "edit", True),
+        ("lark bitable delete-record base-token tbl-token rec-token", "delete", True),
+        ("lark bitable delete-records base-token tbl-token rec-token", "delete", True),
+        ("lark bitable add-table base-token NewTable", "create", True),
+    ],
+)
+def test_normalizes_configured_bitable_subcommands_to_safe_operations(command, operation, mutating):
+    manifest = mutation_guard.normalize_command_manifest(
+        command,
+        subcommand_operations={
+            "lark bitable": {
+                "tables": "read",
+                "schema": "read",
+                "records": "read",
+                "views": "read",
+                "download": "read",
+                "create": "create",
+                "add-record": "append",
+                "add-records-batch": "append",
+                "set-record": "edit",
+                "add-field": "edit",
+                "add-fields-batch": "edit",
+                "set-field-format": "edit",
+                "rename-field": "edit",
+                "delete-record": "delete",
+                "delete-records": "delete",
+                "add-table": "create",
+            },
+        },
+    )
+
+    assert manifest.operation == operation
+    assert manifest.mutating is mutating
+    assert manifest.arguments["command"] == command
+
+
+def test_rejects_unclassified_bitable_subcommand():
+    with pytest.raises(ValueError, match="operation"):
+        mutation_guard.normalize_command_manifest(
+            "lark bitable publish base-token",
+            subcommand_operations={"lark bitable": {"tables": "read"}},
+        )
+
+
 def test_routes_repair_workflows_to_replace_and_explicit_add_content_to_append():
     route = getattr(mutation_guard, "operation_for_document_workflow", None)
     assert callable(route), "Mutation guard must expose document workflow routing"

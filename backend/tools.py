@@ -51,6 +51,15 @@ from .runtime_context import (
     source_call_allowed,
 )
 from .vision import analyze_image_file, analyze_image_files
+from .workspace_shell_tools import (
+    BashInput,
+    GlobInput,
+    GrepInput,
+    bash,
+    get_shell_tools_diagnostics,
+    glob,
+    grep,
+)
 from .feishu_web_login import (
     FeishuWebSessionStore,
     build_feishu_cookies,
@@ -91,12 +100,15 @@ _TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
     "list_directory": 300,
     "read_file": 3600,
     "get_file_info": 300,
+    "glob": 300,
+    "grep": 300,
     "web_search": 900,
     "web_fetch": 900,
     "fetch_webpage": 900,
     "feishu_login_status": 60,
     "analyze_image": 3600,
 }
+_TOOL_AUDIT_ONLY_NAMES = frozenset({"bash"})
 _TOOL_SIDE_EFFECT_NAMES = {
     "Agent",
     "copy_file",
@@ -127,6 +139,8 @@ _EVIDENCE_TOOL_NAMES = frozenset({
     "list_directory",
     "get_file_info",
     "read_file",
+    "glob",
+    "grep",
     "web_search",
     "web_fetch",
 })
@@ -136,7 +150,7 @@ _DEFAULT_SOURCE_CALL_LIMITS = {"personal_knowledge": 1, "workspace": 2, "web": 2
 def _source_kind_for_tool(tool_name: str) -> str | None:
     if tool_name == "knowledge_search":
         return "personal_knowledge"
-    if tool_name in {"read_file", "list_directory", "get_file_info"}:
+    if tool_name in {"read_file", "list_directory", "get_file_info", "glob", "grep"}:
         return "workspace"
     if tool_name in {"web_search", "web_fetch"}:
         return "web"
@@ -410,6 +424,7 @@ def _tool_policy(tool_name: str) -> dict[str, Any]:
         "cacheable": ttl_seconds > 0 and not side_effect,
         "ttl_seconds": ttl_seconds,
         "side_effect": side_effect,
+        "audit_only": tool_name in _TOOL_AUDIT_ONLY_NAMES,
     }
 
 
@@ -471,6 +486,18 @@ def _append_tool_audit(
         "error": error,
         "content_preview": content[:500],
     }
+    if tool_name == "bash":
+        command = arguments.get("command") if isinstance(arguments, dict) else ""
+        payload["command_hash"] = "sha256:" + hashlib.sha256(str(command or "").encode("utf-8")).hexdigest()
+        try:
+            result_payload = json.loads(content or "{}")
+        except Exception:
+            result_payload = {}
+        if isinstance(result_payload, dict):
+            payload["status"] = str(result_payload.get("status") or "")[:40]
+            payload["cwd"] = str(result_payload.get("cwd") or "")[:1000]
+            payload["duration_seconds"] = result_payload.get("duration_seconds")
+            payload["truncated"] = bool(result_payload.get("truncated"))
     try:
         store.append_tool_event(
             session_id,
@@ -539,6 +566,8 @@ def _save_conversation_cache_result(
     status: str,
     error_type: str = "",
 ) -> None:
+    if policy.get("audit_only"):
+        return
     if not policy.get("cacheable") and not policy.get("side_effect") and status == "success":
         return
     session_id = _current_session_id()
@@ -2945,6 +2974,9 @@ def query_recent_mcd_orders(last_id: int = 0, size: int = 10) -> str:
 _FILE_TOOLS: list[Any] = [
     list_directory,
     read_file,
+    glob,
+    grep,
+    bash,
     copy_file,
     analyze_image,
     analyze_images,

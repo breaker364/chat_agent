@@ -1,4 +1,9 @@
+import json
 from pathlib import Path
+
+import pytest
+
+from backend.skills import get_installed_skill
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -49,3 +54,54 @@ def test_rag_code_does_not_encode_entity_specific_routing_maps():
                 offenders.append(f"{path.relative_to(BACKEND_ROOT)}:{pattern}")
 
     assert offenders == []
+
+
+def test_markdown_skill_loads_optional_command_manifest(tmp_path):
+    skill_dir = tmp_path / "skills" / "remote-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: remote-skill\n---\nRun it.", encoding="utf-8")
+    (skill_dir / "command_manifest.json").write_text(
+        json.dumps(
+            {"subcommand_operations": {"lark bitable": {"tables": "read"}}}
+        ),
+        encoding="utf-8",
+    )
+
+    skill = get_installed_skill(tmp_path, "remote-skill")
+
+    assert skill is not None
+    assert skill.manifest_config["subcommand_operations"]["lark bitable"]["tables"] == "read"
+
+
+def test_markdown_skill_rejects_invalid_command_manifest(tmp_path):
+    skill_dir = tmp_path / "skills" / "remote-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: remote-skill\n---\nRun it.", encoding="utf-8")
+    (skill_dir / "command_manifest.json").write_text("{invalid", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="command manifest"):
+        get_installed_skill(tmp_path, "remote-skill")
+
+
+def test_feishu_skill_declares_bitable_command_operations():
+    skill = get_installed_skill(BACKEND_ROOT.parent, "feishu-personal")
+
+    assert skill is not None
+    assert skill.manifest_config["subcommand_operations"]["lark bitable"] == {
+        "tables": "read",
+        "schema": "read",
+        "views": "read",
+        "records": "read",
+        "download": "read",
+        "create": "create",
+        "add-record": "append",
+        "add-records-batch": "append",
+        "set-record": "edit",
+        "add-field": "edit",
+        "add-fields-batch": "edit",
+        "set-field-format": "edit",
+        "rename-field": "edit",
+        "delete-record": "delete",
+        "delete-records": "delete",
+        "add-table": "create",
+    }

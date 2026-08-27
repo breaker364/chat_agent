@@ -202,6 +202,12 @@ npm run dev
 
 记录保存在工作区内受控的 `agent_memory/` 目录。`MEMORY.md` 只保存有界索引，后续 Agent 会把索引作为可能过时的数据参考，并在需要时通过现有读文件能力读取单条 `.md` 记录；完整正文不会自动进入 system prompt。可通过 `DELETE /memories/{memory_id}` 遗忘记录，删除不影响聊天历史、工具 transcript 或知识库。
 
+### 工作区 Shell 工具
+
+Agent 提供三个受控的本地工具：`glob` 用于发现工作区内的文件和目录，`grep` 用于有界的正则逐行搜索，`bash` 用于明确的非交互式项目命令。`glob` 和 `grep` 只返回工作区相对路径及有界结果；绝对路径、目录穿越、受保护索引和越界 symlink 会被拒绝。
+
+`bash` 默认关闭，启用时必须在 `runtime_config.json` 的 `shell_tools` 中配置 Bash 可执行文件和资源限制。执行使用工作区 cwd、关闭 stdin、环境白名单、超时、输出上限和进程树清理；未找到已批准的 Bash 时返回 `runtime_unavailable`，不会回退到其他宿主 Shell。结果状态包括 `ok`、`permission_denied`、`invalid_input`、`command_failed`、`timed_out`、`output_truncated` 和 `runtime_unavailable`。部署诊断只报告启用状态、执行策略和限制，不输出环境变量值。
+
 ## API 接口
 
 ### 对话接口

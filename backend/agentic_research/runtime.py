@@ -25,6 +25,8 @@ EVIDENCE_TOOL_NAMES = frozenset({
     "list_directory",
     "get_file_info",
     "read_file",
+    "glob",
+    "grep",
     "web_search",
     "web_fetch",
 })
@@ -116,6 +118,8 @@ def build_agentic_research_runtime(
             read_file=tool_map["read_file"],
             list_directory=tool_map.get("list_directory"),
             get_file_info=tool_map.get("get_file_info"),
+            glob=tool_map.get("glob"),
+            grep=tool_map.get("grep"),
             excerpt_char_limit=config.excerpt_char_limit,
         )
     if "web_search" in tool_map:

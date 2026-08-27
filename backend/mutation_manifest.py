@@ -76,7 +76,11 @@ def _split_command(command: str | Sequence[str]) -> list[str]:
     return [str(part) for part in command]
 
 
-def normalize_command_manifest(command: str | Sequence[str] | Mapping[str, Any] | CommandManifest) -> CommandManifest:
+def normalize_command_manifest(
+    command: str | Sequence[str] | Mapping[str, Any] | CommandManifest,
+    *,
+    subcommand_operations: Mapping[str, Mapping[str, str]] | None = None,
+) -> CommandManifest:
     """Normalize a standardized command or existing serialized manifest.
 
     The parser deliberately handles command shape only. It does not select
@@ -110,8 +114,12 @@ def normalize_command_manifest(command: str | Sequence[str] | Mapping[str, Any] 
     resource = "document" if raw_resource in _DOCUMENT_RESOURCE_ALIASES else raw_resource
     operation = _DOCUMENT_OPERATION_ALIASES.get(raw_operation, raw_operation)
     if operation not in _RECOGNIZED_OPERATIONS:
+        command_family = f"{provider} {raw_resource}"
+        configured_operations = (subcommand_operations or {}).get(command_family, {})
+        operation = str(configured_operations.get(raw_operation) or "")
+    if operation not in _RECOGNIZED_OPERATIONS:
         raise ValueError(f"Command manifest cannot normalize operation: {raw_operation}")
-    target = "" if operation == "create" else (parts[3] if len(parts) > 3 and not parts[3].startswith("-") else "")
+    target = "" if raw_operation == "create" else (parts[3] if len(parts) > 3 and not parts[3].startswith("-") else "")
     arguments = _canonical_arguments(parts)
     return CommandManifest(
         provider=provider,

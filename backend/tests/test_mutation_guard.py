@@ -177,6 +177,68 @@ class RemoteMutationCommandTests(unittest.TestCase):
         assert calls[0]["manifest"]["operation"] == "replace"
         assert calls[0]["manifest"]["resource"] == "document"
 
+    def test_skill_boundary_dispatches_configured_bitable_read_command(self):
+        skill = SkillDefinition(
+            name="remote-command-runner",
+            description="",
+            prompt_template="",
+            source_path=".",
+            manifest_config={
+                "subcommand_operations": {"lark bitable": {"tables": "read"}},
+            },
+        )
+        calls = []
+
+        def fake_runner(_skill, params, _root):
+            calls.append(dict(params))
+            return '{"verified":true}'
+
+        async def invoke():
+            with patch("backend.skills.get_installed_skill", return_value=skill), patch(
+                "backend.skills._skill_runner_path", return_value=Path("runner.py")
+            ), patch("backend.skills._execute_skill_runner_sync", side_effect=fake_runner):
+                return await execute_skill(
+                    Path.cwd(),
+                    skill.name,
+                    {"request": "lark bitable tables base-token"},
+                )
+
+        asyncio.run(invoke())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["manifest"]["operation"], "read")
+        self.assertEqual(calls[0]["manifest"]["resource"], "bitable")
+        self.assertEqual(calls[0]["manifest"]["target"], "base-token")
+
+    def test_skill_boundary_rejects_unconfigured_bitable_command_before_dispatch(self):
+        skill = SkillDefinition(
+            name="remote-command-runner",
+            description="",
+            prompt_template="",
+            source_path=".",
+            manifest_config={
+                "subcommand_operations": {"lark bitable": {"tables": "read"}},
+            },
+        )
+        calls = []
+
+        def fake_runner(_skill, params, _root):
+            calls.append(dict(params))
+            return "should not run"
+
+        async def invoke():
+            with patch("backend.skills.get_installed_skill", return_value=skill), patch(
+                "backend.skills._skill_runner_path", return_value=Path("runner.py")
+            ), patch("backend.skills._execute_skill_runner_sync", side_effect=fake_runner):
+                await execute_skill(
+                    Path.cwd(),
+                    skill.name,
+                    {"request": "lark bitable publish base-token"},
+                )
+
+        with self.assertRaisesRegex(ValueError, "Unclassified"):
+            asyncio.run(invoke())
+        self.assertEqual(calls, [])
+
     def test_skill_boundary_rejects_manifest_that_disagrees_with_request(self):
         skill = SkillDefinition(
             name="remote-command-runner",
