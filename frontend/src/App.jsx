@@ -2012,6 +2012,13 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior });
   }, []);
 
+  const handleChatScroll = useCallback(() => {
+    const node = chatAreaRef.current;
+    if (!node) return;
+    const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+    setShouldAutoScroll(nearBottom);
+  }, []);
+
   const resizeComposer = useCallback(() => {
     const node = textareaRef.current;
     if (!node) return;
@@ -3283,7 +3290,7 @@ export default function App() {
         />
       ) : null}
 
-      <div className="app-container">
+      <div className="app-container" ref={chatAreaRef} onScroll={handleChatScroll}>
         <header className="app-header">
           <div className="header-left">
             <Bot size={22} />
@@ -3349,16 +3356,7 @@ export default function App() {
           />
         </div>
 
-        <main
-          className="chat-area"
-          ref={chatAreaRef}
-          onScroll={() => {
-            const node = chatAreaRef.current;
-            if (!node) return;
-            const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
-            setShouldAutoScroll(nearBottom);
-          }}
-        >
+        <main className="chat-area">
           <div className="messages-container">
             {messages.map((msg, i) => (
               <div key={i} className="message-group">

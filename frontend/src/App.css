@@ -60,10 +60,10 @@
   --font-mono: "JetBrains Mono", "Consolas", "Monaco", "Cascadia Code", monospace;
 
   /* Radii */
-  --radius-sm: 6px;
-  --radius: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 18px;
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
   --radius-full: 999px;
 
   /* Shadows — soft and airy */
@@ -422,6 +422,18 @@ body.is-resizing-columns * {
   min-width: 0;
   position: relative;
   background: var(--bg-root);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+.app-container::-webkit-scrollbar {
+  width: 10px;
+}
+
+.app-container::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: var(--radius-full);
 }
 
 /* Light Blade — signature accent line */
@@ -456,14 +468,17 @@ body.is-resizing-columns * {
 
 /* Header */
 .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 24px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--glass-border);
   background: var(--glass-bg);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
   flex-shrink: 0;
 }
 
@@ -1416,8 +1431,7 @@ body.is-resizing-columns * {
    Chat Area
    ============================================================ */
 .chat-area {
-  flex: 1;
-  overflow-y: auto;
+  flex: 1 0 auto;
   padding: 20px 24px;
   scroll-behavior: smooth;
 }
@@ -1933,11 +1947,15 @@ body.is-resizing-columns * {
    Input Area
    ============================================================ */
 .input-area {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
   flex-shrink: 0;
   padding: 14px 24px 22px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--glass-border);
   background: var(--glass-bg);
-  position: relative;
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
   transition: background var(--duration-fast) var(--ease-out);
 }
 
@@ -2027,7 +2045,7 @@ body.is-resizing-columns * {
   align-items: flex-end;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-full);
   padding: 6px 6px 6px 16px;
   transition: border-color var(--duration-fast) var(--ease-out), box-shadow var(--duration-fast) var(--ease-out);
   box-shadow: var(--shadow-sm);
@@ -3244,4 +3262,209 @@ input:focus-visible {
 .theme-toggle-option input:focus-visible + span {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+
+/* ============================================================
+   Motion System
+   ============================================================ */
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes working-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.messages-container > .message-group {
+  animation: message-in var(--duration) var(--ease-out);
+}
+
+.knowledge-center-overlay,
+.feishu-import-overlay,
+.skill-overlay {
+  animation: overlay-in var(--duration) var(--ease-out);
+}
+
+.feishu-import-dialog,
+.skill-popup,
+.knowledge-center {
+  animation: dialog-in var(--duration-slow) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .messages-container > .message-group,
+  .knowledge-center-overlay,
+  .feishu-import-overlay,
+  .skill-overlay,
+  .feishu-import-dialog,
+  .skill-popup,
+  .knowledge-center,
+  .toast-item {
+    animation: none;
+  }
+}
+
+/* ============================================================
+   Glass fallback
+   ============================================================ */
+@supports not (backdrop-filter: blur(1px)) {
+  .app-header,
+  .input-area {
+    background: var(--bg-surface);
+  }
+
+  .knowledge-center-overlay,
+  .feishu-import-overlay,
+  .skill-overlay {
+    background: var(--scrim-strong);
+  }
+}
+
+/* ============================================================
+   Hover micro-interactions
+   ============================================================ */
+.send-btn,
+.stop-btn,
+.attach-btn,
+.skill-slash-btn,
+.session-create-btn,
+.session-collapse-btn,
+.knowledge-action-btn,
+.session-toolbar-btn {
+  transition:
+    transform var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.send-btn:hover:not(:disabled),
+.stop-btn:hover:not(:disabled),
+.attach-btn:hover:not(:disabled),
+.skill-slash-btn:hover:not(:disabled),
+.session-create-btn:hover:not(:disabled),
+.knowledge-action-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.send-btn:hover:not(:disabled) {
+  box-shadow: var(--shadow-accent-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .send-btn:hover:not(:disabled),
+  .stop-btn:hover:not(:disabled),
+  .attach-btn:hover:not(:disabled),
+  .skill-slash-btn:hover:not(:disabled),
+  .session-create-btn:hover:not(:disabled),
+  .knowledge-action-btn:hover:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* ============================================================
+   Toast Host
+   ============================================================ */
+.toast-host {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 360px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  color: var(--text);
+  box-shadow: var(--shadow-float);
+  font-size: 13px;
+  pointer-events: auto;
+  animation: toast-in var(--duration) var(--ease-out);
+}
+
+.toast-success svg {
+  color: var(--success);
+}
+
+.toast-error svg {
+  color: var(--danger);
+}
+
+.toast-info svg {
+  color: var(--accent);
+}
+
+.toast-message {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-close {
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.toast-close:hover {
+  color: var(--text);
 }
