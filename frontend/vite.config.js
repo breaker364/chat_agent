@@ -27,6 +27,8 @@ export default defineConfig({
       "/feishu": backendTarget,
       "/uploads": backendTarget,
       "/knowledge": backendTarget,
+      "/feedback": backendTarget,
+      "/ui-config": backendTarget,
     },
   },
 });

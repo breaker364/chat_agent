@@ -5,6 +5,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -1097,6 +1098,59 @@ def _finalize_agent_response(
 # ---------------------------------------------------------------------------
 # REST endpoints
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# UI support endpoints (message feedback / frontend configuration)
+# ---------------------------------------------------------------------------
+FEEDBACK_RATINGS = {"up", "down"}
+
+
+def _feedback_store_path() -> Path:
+    relative = str(
+        get_runtime_value("paths", "feedback_file", "output/feedback/feedback.jsonl")
+        or "output/feedback/feedback.jsonl"
+    )
+    return PROJECT_ROOT / relative
+
+
+@app.post("/feedback")
+async def submit_feedback(request: Request) -> JSONResponse:
+    body = (
+        await request.json()
+        if request.headers.get("content-type", "").startswith("application/json")
+        else {}
+    )
+    rating = str(body.get("rating") or "").strip().lower()
+    if rating not in FEEDBACK_RATINGS:
+        return JSONResponse({"error": "rating must be up or down"}, status_code=400)
+    try:
+        message_index = int(body.get("message_index") or 0)
+    except (TypeError, ValueError):
+        message_index = 0
+    entry = {
+        "session_id": str(body.get("session_id") or "").strip() or "unknown",
+        "message_index": message_index,
+        "rating": rating,
+        "content_snippet": _compact_summary_text(body.get("content_snippet"), 200),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = _feedback_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return JSONResponse({"ok": True})
+
+
+@app.get("/ui-config")
+async def get_ui_config() -> JSONResponse:
+    suggestions = get_runtime_value("ui", "welcome_suggestions", None)
+    if not isinstance(suggestions, list):
+        return JSONResponse({})
+    cleaned = [str(item).strip() for item in suggestions if str(item).strip()][:8]
+    if not cleaned:
+        return JSONResponse({})
+    return JSONResponse({"welcome_suggestions": cleaned})
 
 
 @app.get("/health")
