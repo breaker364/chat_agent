@@ -28,6 +28,9 @@ class _ScriptedModel:
 
 
 class _RouteModel:
+    def __init__(self, capabilities=("read",)):
+        self.capabilities = list(capabilities)
+
     def invoke(self, _messages):
         return {
             "mode": "planned",
@@ -35,7 +38,7 @@ class _RouteModel:
             "needs_research": False,
             "risk_level": "low",
             "confidence": 0.95,
-            "required_capabilities": ["read"],
+            "required_capabilities": list(self.capabilities),
         }
 
 
@@ -467,6 +470,76 @@ class PlanGuardCapabilityTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["response"], "subset answer")
+
+
+class PlanRiskReevaluationTests(unittest.TestCase):
+    def test_plan_requires_approval_matches_namespaced_hint(self):
+        from backend.workflow_policy import plan_requires_approval, validate_plan
+
+        tasks = validate_plan(
+            [{"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["write:file"]}],
+            capabilities={"write:file"},
+        )
+
+        self.assertTrue(plan_requires_approval(tasks, {"write"}))
+        self.assertFalse(plan_requires_approval(tasks, set()))
+
+    def test_plan_hitting_high_risk_hint_interrupts_for_approval(self):
+        from unittest.mock import patch
+
+        from langchain_core.messages import AIMessage
+        from langgraph.types import Command
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        model = _ScriptedModel([AIMessage(content="approved result")])
+        executor = build_executor_graph(model=model, tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(capabilities=["write"]),
+            planner=lambda _request, _route: [
+                {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["write"]},
+            ],
+            executor=executor,
+            capabilities={"read", "write"},
+        )
+        config = {"configurable": {"thread_id": "session-1:plan-risk-run"}}
+
+        with patch("backend.workflow_policy.HIGH_RISK_CAPABILITY_HINTS", frozenset({"write"})):
+            interrupted = graph.invoke(initial_workflow_state("session-1", "plan-risk-run", "protected"), config=config)
+
+        self.assertIn("__interrupt__", interrupted)
+        self.assertEqual(model.calls, [])
+
+        with patch("backend.workflow_policy.HIGH_RISK_CAPABILITY_HINTS", frozenset({"write"})):
+            resumed = graph.invoke(Command(resume={"approved": True}), config=config)
+
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual(resumed["response"], "approved result")
+
+    def test_empty_high_risk_hints_keep_route_only_approval(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="unapproved result")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(capabilities=["write"]),
+            planner=lambda _request, _route: [
+                {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["write"]},
+            ],
+            executor=executor,
+            capabilities={"read", "write"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "plan-no-risk-run", "normal action"),
+            config={"configurable": {"thread_id": "session-1:plan-no-risk-run"}},
+        ))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["response"], "unapproved result")
 
 
 class TopLevelWorkflowTests(unittest.TestCase):

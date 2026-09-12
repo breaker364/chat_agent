@@ -12,6 +12,12 @@ ROUTE_MODES = frozenset({"direct", "planned", "research", "clarify"})
 TASK_KINDS = frozenset({"execute", "research"})
 RISK_LEVELS = frozenset({"low", "medium", "high"})
 
+# Capability identifier patterns that require human approval when a validated
+# plan requests them. A capability hits a hint when it equals the hint or is
+# namespaced below it (`hint:suffix`). Empty by default: deployment enables
+# re-evaluation by declaring capability ownership in workflow configuration.
+HIGH_RISK_CAPABILITY_HINTS: frozenset[str] = frozenset()
+
 
 class RoutePolicyError(ValueError):
     """Raised when a route cannot be safely enforced."""
@@ -163,6 +169,25 @@ def assert_route_scoped_capabilities(
                 + "` requests capabilities outside the route approval: "
                 + ", ".join(outside)
             )
+
+
+def plan_requires_approval(
+    tasks: Sequence[TaskSpec],
+    hints: Sequence[str] | set[str] | frozenset[str] | None = None,
+) -> bool:
+    """Return True when any planned task capability hits a high-risk hint."""
+    active = (
+        {str(item or "").strip().lower() for item in hints if str(item or "").strip()}
+        if hints is not None
+        else set(HIGH_RISK_CAPABILITY_HINTS)
+    )
+    if not active:
+        return False
+    for task in tasks:
+        for capability in task.capabilities:
+            if any(capability == hint or capability.startswith(f"{hint}:") for hint in active):
+                return True
+    return False
 
 
 def validate_plan(

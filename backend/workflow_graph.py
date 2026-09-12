@@ -13,6 +13,7 @@ from .workflow_policy import (
     assert_route_scoped_capabilities,
     enforce_route,
     parse_route_proposal,
+    plan_requires_approval,
     validate_plan,
 )
 from .workflow_state import WorkflowState, merge_task_results
@@ -262,6 +263,10 @@ def build_workflow_graph(
             }
         return {
             "plan": {**plan, "tasks": [task.model_dump() for task in validated], "validated": True},
+            "route": {
+                **route_decision,
+                "approval_required": bool(route_decision.get("approval_required")) or plan_requires_approval(validated),
+            },
             "events": [_event("plan_guard", state, status="completed")],
         }
 
