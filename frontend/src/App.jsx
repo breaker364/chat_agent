@@ -49,6 +49,8 @@ import { AssistantMessageActions, UserMessageActions } from "./MessageActions";
 import { extractEditableText, isErrorMessage, pairToolEvents } from "./messageMeta";
 import { formatFullTime, formatRelativeTime } from "./relativeTime";
 import { readFeedbackStore, reportFeedback, toggleFeedback } from "./messageFeedback";
+import { ConfirmDialog, PromptDialog } from "./Dialog";
+import { groupSessionsByDate } from "./sessionGroups";
 import {
   appendRunText,
   applyRunAttribution,
@@ -710,6 +712,15 @@ function SessionSidebar({
   onRename,
   onDelete,
 }) {
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredSessions = normalizedQuery
+    ? sessions.filter((session) =>
+        `${session.title || ""} ${session.session_id || ""}`.toLowerCase().includes(normalizedQuery)
+      )
+    : sessions;
+  const groups = groupSessionsByDate(filteredSessions);
+
   return (
     <aside className={`session-sidebar ${collapsed ? "collapsed" : ""}`}>
       <div className="session-sidebar-header">
@@ -727,32 +738,55 @@ function SessionSidebar({
         </div>
       </div>
       {!collapsed ? (
-        <div className="session-sidebar-body">
-          {sessions.map((session) => (
-            <div
-              key={session.session_id}
-              className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
-            >
-              <button className="session-item-main" onClick={() => onSelect(session.session_id)}>
-                <MessageSquare size={16} />
-                <div className="session-item-content">
-                  <div className="session-item-title">{session.title || session.session_id}</div>
-                  <div className="session-item-meta">
-                    {session.task_progress?.status === "running" ? "运行中" : "空闲"}
-                  </div>
+        <>
+          <div className="session-search">
+            <Search size={14} />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索会话"
+              aria-label="搜索会话"
+            />
+          </div>
+          <div className="session-sidebar-body">
+            {groups.length ? (
+              groups.map((group) => (
+                <div key={group.label} className="session-group">
+                  <div className="session-group-label">{group.label}</div>
+                  {group.items.map((session) => (
+                    <div
+                      key={session.session_id}
+                      className={`session-item ${session.session_id === activeSessionId ? "active" : ""}`}
+                    >
+                      <button className="session-item-main" onClick={() => onSelect(session.session_id)}>
+                        <MessageSquare size={16} />
+                        <div className="session-item-content">
+                          <div className="session-item-title">{session.title || session.session_id}</div>
+                          <div className="session-item-meta">
+                            {session.task_progress?.status === "running" ? "运行中" : "空闲"}
+                            {session.updated_at || session.created_at
+                              ? ` · ${formatRelativeTime(session.updated_at || session.created_at)}`
+                              : ""}
+                          </div>
+                        </div>
+                      </button>
+                      <div className="session-item-toolbar">
+                        <button className="session-toolbar-btn" onClick={(e) => onRename(e, session)} title="重命名会话">
+                          <Pencil size={14} />
+                        </button>
+                        <button className="session-toolbar-btn danger" onClick={(e) => onDelete(e, session)} title="删除会话">
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              </button>
-              <div className="session-item-toolbar">
-                <button className="session-toolbar-btn" onClick={(e) => onRename(e, session)} title="重命名会话">
-                  <Pencil size={14} />
-                </button>
-                <button className="session-toolbar-btn danger" onClick={(e) => onDelete(e, session)} title="删除会话">
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
+              ))
+            ) : (
+              <div className="session-empty">没有匹配的会话。</div>
+            )}
+          </div>
+        </>
       ) : null}
     </aside>
   );
@@ -2004,6 +2038,9 @@ export default function App() {
   const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
   const [messageFeedback, setMessageFeedback] = useState(readFeedbackStore);
+  const [renameDialogSession, setRenameDialogSession] = useState(null);
+  const [deleteDialogSession, setDeleteDialogSession] = useState(null);
+  const [sessionDialogBusy, setSessionDialogBusy] = useState(false);
   const [themePreference, setThemePreferenceState] = useState(readThemePreference);
   const activeRun = getSessionRun(sessionRuns, activeSessionId);
   const loading = isSessionRunning(sessionRuns, activeSessionId);
@@ -2491,50 +2528,76 @@ export default function App() {
     setAttachmentError("");
   }, [defaultAssistantMessage]);
 
-  const handleRenameSession = useCallback(async (event, session) => {
+  const handleRenameSession = useCallback((event, session) => {
     event.preventDefault();
     event.stopPropagation();
-    const currentTitle = session.title || session.session_id;
-    const nextTitle = window.prompt("重命名会话", currentTitle);
-    if (!nextTitle || nextTitle.trim() === currentTitle) return;
-    const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ title: nextTitle.trim() }),
-    });
-    if (!resp.ok) return;
-    await refreshSessions();
-  }, [refreshSessions]);
+    setRenameDialogSession(session);
+  }, []);
 
-  const handleDeleteSession = useCallback(async (event, session) => {
+  const handleRenameSubmit = useCallback(
+    async (title) => {
+      const session = renameDialogSession;
+      if (!session) return;
+      const currentTitle = session.title || session.session_id;
+      if (!title || title === currentTitle) {
+        setRenameDialogSession(null);
+        return;
+      }
+      setSessionDialogBusy(true);
+      try {
+        const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({ title }),
+        });
+        if (resp.ok) await refreshSessions();
+      } finally {
+        setSessionDialogBusy(false);
+        setRenameDialogSession(null);
+      }
+    },
+    [refreshSessions, renameDialogSession]
+  );
+
+  const handleDeleteSession = useCallback((event, session) => {
     event.preventDefault();
     event.stopPropagation();
-    const confirmed = window.confirm(`确认删除会话"${session.title || session.session_id}"?`);
-    if (!confirmed) return;
-    const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
-      method: "DELETE",
-    });
-    if (!resp.ok) return;
+    setDeleteDialogSession(session);
+  }, []);
 
-    const nextSessions = sessions.filter((item) => item.session_id !== session.session_id);
-    setSessions(nextSessions);
-    if (session.session_id === activeSessionId) {
-      const rememberedSessionId = nextSessions[0]?.session_id || makeSessionId();
-      if (nextSessions.length) {
-        await loadSession(rememberedSessionId, { scrollToBottom: true });
-      } else {
-        setActiveSessionId(rememberedSessionId);
-        activeSessionIdRef.current = rememberedSessionId;
-        writeLastSessionId(rememberedSessionId);
-        setMessages([defaultAssistantMessage]);
+  const handleDeleteConfirm = useCallback(async () => {
+    const session = deleteDialogSession;
+    if (!session) return;
+    setSessionDialogBusy(true);
+    try {
+      const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
+        method: "DELETE",
+      });
+      if (!resp.ok) return;
+
+      const nextSessions = sessions.filter((item) => item.session_id !== session.session_id);
+      setSessions(nextSessions);
+      if (session.session_id === activeSessionId) {
+        const rememberedSessionId = nextSessions[0]?.session_id || makeSessionId();
+        if (nextSessions.length) {
+          await loadSession(rememberedSessionId, { scrollToBottom: true });
+        } else {
+          setActiveSessionId(rememberedSessionId);
+          activeSessionIdRef.current = rememberedSessionId;
+          writeLastSessionId(rememberedSessionId);
+          setMessages([defaultAssistantMessage]);
+        }
+      } else if (readLastSessionId() === session.session_id) {
+        if (nextSessions[0]?.session_id) {
+          writeLastSessionId(nextSessions[0].session_id);
+        }
       }
-    } else if (readLastSessionId() === session.session_id) {
-      if (nextSessions[0]?.session_id) {
-        writeLastSessionId(nextSessions[0].session_id);
-      }
+      await refreshSessions();
+    } finally {
+      setSessionDialogBusy(false);
+      setDeleteDialogSession(null);
     }
-    await refreshSessions();
-  }, [activeSessionId, defaultAssistantMessage, loadSession, refreshSessions, sessions]);
+  }, [activeSessionId, defaultAssistantMessage, deleteDialogSession, loadSession, refreshSessions, sessions]);
 
   const handleStop = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
@@ -3675,6 +3738,27 @@ export default function App() {
           onTabChange={setSkillTab}
         />
       )}
+
+      <PromptDialog
+        open={Boolean(renameDialogSession)}
+        title="重命名会话"
+        label="会话标题"
+        initialValue={renameDialogSession?.title || renameDialogSession?.session_id || ""}
+        submitLabel="保存"
+        loading={sessionDialogBusy}
+        onSubmit={handleRenameSubmit}
+        onClose={() => setRenameDialogSession(null)}
+      />
+      <ConfirmDialog
+        open={Boolean(deleteDialogSession)}
+        title="删除会话"
+        message={`确认删除会话"${deleteDialogSession?.title || deleteDialogSession?.session_id}"?该操作不可撤销。`}
+        confirmLabel="删除"
+        danger
+        loading={sessionDialogBusy}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setDeleteDialogSession(null)}
+      />
 
       <ToastHost />
     </div>

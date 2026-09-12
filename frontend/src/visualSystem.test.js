@@ -60,7 +60,7 @@ describe("visual system tokens and surfaces", () => {
     const persistent = blocks.filter((b) => /\.app-header|\.input-area/.test(b));
     expect(persistent.length).toBe(2);
     const transient = blocks.filter((b) => /overlay|\.skill-popup/.test(b));
-    expect(transient.length).toBeLessThanOrEqual(3);
+    expect(transient.length).toBeLessThanOrEqual(4);
   });
 
   it("animates overlays and dialogs on open", () => {
