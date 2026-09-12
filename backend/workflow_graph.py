@@ -10,6 +10,7 @@ from .workflow_policy import (
     PlanPolicyError,
     RoutePolicyError,
     RouteProposal,
+    assert_route_scoped_capabilities,
     enforce_route,
     parse_route_proposal,
     validate_plan,
@@ -245,17 +246,19 @@ def build_workflow_graph(
 
     def plan_guard(state: WorkflowState) -> dict[str, Any]:
         plan = state.get("plan") or {}
+        route_decision = state.get("route") or {}
         try:
             validated = validate_plan(
                 plan.get("tasks") or [],
                 capabilities=available_capabilities,
                 max_tasks=max(1, int((state.get("control") or {}).get("max_tasks", 12))),
             )
+            assert_route_scoped_capabilities(validated, route_decision.get("required_capabilities") or [])
         except PlanPolicyError as exc:
             return {
                 "status": "blocked",
                 "errors": [{"category": "invalid_plan", "message": str(exc)}],
-                "events": [_event("plan_guard", state, status="failed")],
+                "events": [_event("plan_guard", state, status="failed", reason=str(exc))],
             }
         return {
             "plan": {**plan, "tasks": [task.model_dump() for task in validated], "validated": True},

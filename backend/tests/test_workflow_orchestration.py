@@ -395,6 +395,80 @@ class PlannerFallbackTests(unittest.TestCase):
         self.assertTrue(any(error.get("category") == "invalid_plan" for error in result["errors"]))
 
 
+class PlanGuardCapabilityTests(unittest.TestCase):
+    def test_route_scoped_check_rejects_capabilities_outside_route_approval(self):
+        from backend.workflow_policy import PlanPolicyError, assert_route_scoped_capabilities, validate_plan
+
+        tasks = validate_plan([
+            {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["write"]},
+        ], capabilities={"read", "write"})
+
+        with self.assertRaises(PlanPolicyError) as raised:
+            assert_route_scoped_capabilities(tasks, ["read"])
+
+        self.assertIn("capability_outside_route", str(raised.exception))
+
+    def test_route_scoped_check_allows_subset(self):
+        from backend.workflow_policy import assert_route_scoped_capabilities, validate_plan
+
+        tasks = validate_plan([
+            {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["read"]},
+        ], capabilities={"read", "write"})
+
+        assert_route_scoped_capabilities(tasks, ["read"])
+
+    def test_plan_guard_blocks_plan_requesting_unapproved_registered_capability(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="unused")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=lambda _request, _route: [
+                {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["write"]},
+            ],
+            executor=executor,
+            capabilities={"read", "write"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "capability-overreach-run", "do the thing"),
+            config={"configurable": {"thread_id": "session-1:capability-overreach-run"}},
+        ))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(
+            error.get("category") == "invalid_plan" and "capability_outside_route" in str(error.get("message"))
+            for error in result["errors"]
+        ))
+
+    def test_plan_guard_allows_plan_within_route_approval_with_wider_registry(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="subset answer")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=lambda _request, _route: [
+                {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["read"]},
+            ],
+            executor=executor,
+            capabilities={"read", "write"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "capability-subset-run", "do the thing"),
+            config={"configurable": {"thread_id": "session-1:capability-subset-run"}},
+        ))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["response"], "subset answer")
+
+
 class TopLevelWorkflowTests(unittest.TestCase):
     def test_planned_workflow_dispatches_tasks_and_joins_results(self):
         from langchain_core.messages import AIMessage

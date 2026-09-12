@@ -148,6 +148,23 @@ def _assert_acyclic(tasks: dict[str, TaskSpec]) -> None:
         visit(task_id)
 
 
+def assert_route_scoped_capabilities(
+    tasks: Sequence[TaskSpec],
+    route_required: Sequence[str] | set[str] | frozenset[str],
+) -> None:
+    """Ensure every task capability stays inside the route-approved set."""
+    approved = {str(item or "").strip().lower() for item in (route_required or ()) if str(item or "").strip()}
+    for task in tasks:
+        outside = sorted(set(task.capabilities) - approved)
+        if outside:
+            raise PlanPolicyError(
+                "capability_outside_route: task `"
+                + task.task_id
+                + "` requests capabilities outside the route approval: "
+                + ", ".join(outside)
+            )
+
+
 def validate_plan(
     tasks: Sequence[TaskSpec | Mapping[str, Any]],
     *,
