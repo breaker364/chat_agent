@@ -51,6 +51,7 @@ import { formatFullTime, formatRelativeTime } from "./relativeTime";
 import { readFeedbackStore, reportFeedback, toggleFeedback } from "./messageFeedback";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import { groupSessionsByDate } from "./sessionGroups";
+import { initialDebugSidebarOpen } from "./layoutPrefs";
 import Welcome from "./Welcome";
 import { buildWelcomeSuggestions } from "./welcomeSuggestions";
 import {
@@ -2003,7 +2004,7 @@ export default function App() {
   const [subagentTasks, setSubagentTasks] = useState([]);
   const [subagentNotifications, setSubagentNotifications] = useState([]);
   const [taskProgress, setTaskProgress] = useState(null);
-  const [debugOpen, setDebugOpen] = useState(!readDebugCollapsed());
+  const [debugOpen, setDebugOpen] = useState(() => initialDebugSidebarOpen(window.innerWidth, readDebugCollapsed()));
   const [sessionSidebarCollapsed, setSessionSidebarCollapsed] = useState(readSidebarCollapsed);
   const [knowledgePanelCollapsed, setKnowledgePanelCollapsed] = useState(readKnowledgeCollapsed);
   const [sessionSidebarWidth, setSessionSidebarWidth] = useState(() =>

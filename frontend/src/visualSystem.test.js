@@ -63,6 +63,30 @@ describe("visual system tokens and surfaces", () => {
     expect(transient.length).toBeLessThanOrEqual(4);
   });
 
+  it("wraps panel headers and composer meta inside narrow columns", () => {
+    const panelHeader = css.match(/\.knowledge-panel-header,\s*\.feishu-panel-header \{[^}]*\}/);
+    expect(panelHeader[0]).toMatch(/flex-wrap:\s*wrap/);
+
+    const headerRight = css.match(/\.knowledge-panel-header-right,\s*\.feishu-panel-header-right \{[^}]*\}/);
+    expect(headerRight[0]).toMatch(/flex-wrap:\s*wrap/);
+
+    const composerMeta = css.match(/\.composer-meta \{[^}]*\}/);
+    expect(composerMeta[0]).toMatch(/flex-wrap:\s*wrap/);
+
+    expect(css).toMatch(/\.header-left h1 \{[^}]*white-space:\s*nowrap/);
+  });
+
+  it("compacts the header and scrolls wide tables inside narrow columns", () => {
+    expect(css).toMatch(/\.app-container \{[^}]*container-type:\s*inline-size/);
+    const narrowRule = css.match(/@container \(max-width: 560px\) \{[\s\S]*?\n\}/);
+    expect(narrowRule).toBeTruthy();
+    expect(narrowRule[0]).toMatch(/\.header-badges/);
+    expect(narrowRule[0]).toMatch(/display:\s*none/);
+
+    const tableRule = css.match(/\.message-content table \{[^}]*\}/);
+    expect(tableRule[0]).toMatch(/overflow-x:\s*auto/);
+  });
+
   it("animates overlays and dialogs on open", () => {
     expect(css).toMatch(/\.feishu-import-dialog[^{]*\{[^}]*animation:\s*dialog-in/);
     expect(css).toMatch(/\.skill-popup[^{]*\{[^}]*animation:\s*dialog-in/);

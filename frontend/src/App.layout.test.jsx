@@ -26,6 +26,7 @@ describe("App responsive column layout", () => {
   });
 
   it("lets users resize visible desktop columns with drag handles", async () => {
+    Object.defineProperty(window, "innerWidth", { value: 1500, configurable: true, writable: true });
     renderWithFetch(async (url) => {
       if (url === "/feishu/session") {
         return jsonResponse({ logged_in: false, has_session: false, issued_at: null, metadata: {} });

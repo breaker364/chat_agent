@@ -424,6 +424,7 @@ body.is-resizing-columns * {
   background: var(--bg-root);
   overflow-y: auto;
   overflow-x: hidden;
+  container-type: inline-size;
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) transparent;
 }
@@ -514,6 +515,8 @@ body.is-resizing-columns * {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 8px;
   gap: 12px;
   min-width: 0;
 }
@@ -582,8 +585,10 @@ body.is-resizing-columns * {
 .feishu-panel-header-right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  row-gap: 6px;
   gap: 10px;
-  flex-shrink: 0;
+  min-width: 0;
 }
 
 .knowledge-collapse-btn,
@@ -2129,6 +2134,8 @@ body.is-resizing-columns * {
 .composer-meta {
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 2px;
   gap: 16px;
   padding: 6px 5px 0;
   color: var(--text-tertiary);
@@ -3916,4 +3923,63 @@ input:focus-visible {
 .app-header {
   flex-wrap: wrap;
   gap: 10px;
+}
+
+
+/* ============================================================
+   Narrow-column guards
+   ============================================================ */
+.header-left {
+  min-width: 0;
+}
+
+.header-left h1 {
+  white-space: nowrap;
+}
+
+.input-wrapper textarea {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ============================================================
+   Narrow center column (container query)
+   ============================================================ */
+@container (max-width: 560px) {
+  .app-header {
+    padding: 10px 16px;
+  }
+
+  .header-badges {
+    display: none;
+  }
+
+  .chat-area {
+    padding: 14px 14px;
+  }
+
+  .message-actions {
+    margin-left: 34px;
+  }
+
+  .input-area {
+    padding: 10px 14px 14px;
+  }
+}
+
+/* Wide content scrolls inside its own block instead of stretching the column */
+.message-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.message-content table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.message-content pre {
+  overflow-x: auto;
 }
