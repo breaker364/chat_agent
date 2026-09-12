@@ -191,6 +191,210 @@ class ExecutorSubgraphTests(unittest.TestCase):
         self.assertEqual(len(reader.calls), 1)
 
 
+class ReplanFailureContextTests(unittest.TestCase):
+    def test_replan_injects_failure_context_into_planner(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        requests: list[str] = []
+        plans = [
+            [
+                {"task_id": "alpha", "kind": "execute", "depends_on": [], "capabilities": [], "max_attempts": 1},
+                {"task_id": "beta", "kind": "execute", "depends_on": [], "capabilities": [], "max_attempts": 1},
+            ],
+            [{"task_id": "gamma", "kind": "execute", "depends_on": [], "capabilities": [], "max_attempts": 1}],
+        ]
+
+        def capturing_planner(request, _route):
+            requests.append(str(request))
+            return plans.pop(0)
+
+        executor = build_executor_graph(
+            model=_ScriptedModel([
+                AIMessage(content="alpha answer"),
+                AIMessage(content=""),
+                AIMessage(content="gamma answer"),
+            ]),
+            tools={},
+        )
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=capturing_planner,
+            executor=executor,
+            capabilities={"read"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "replan-context-run", "recover", control={"max_replans": 1}),
+            config={"configurable": {"thread_id": "session-1:replan-context-run"}},
+        ))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("gamma answer", result["response"])
+        self.assertEqual(len(requests), 2)
+        self.assertNotIn("invalid_output", requests[0])
+        self.assertIn("beta", requests[1])
+        self.assertIn("invalid_output", requests[1])
+        self.assertIn("alpha", requests[1])
+        self.assertNotIn("alpha answer", requests[1])
+
+    def test_failure_summary_is_bounded_and_covers_failed_and_completed_tasks(self):
+        from backend.workflow_graph import _plan_failure_summary
+
+        tasks = [
+            {"task_id": "done", "kind": "execute", "depends_on": [], "capabilities": [], "context": "x" * 500},
+            {"task_id": "broken", "kind": "execute", "depends_on": [], "capabilities": [], "context": "x" * 500},
+        ]
+        results = {
+            "done": {"task_id": "done", "attempt_id": "done:1", "status": "succeeded", "output": "y" * 5000},
+            "broken": {
+                "task_id": "broken",
+                "attempt_id": "broken:1",
+                "status": "failed",
+                "errors": [{"category": "tool_error", "task_id": "broken"}],
+            },
+        }
+
+        summary = _plan_failure_summary({"tasks": tasks}, results, [])
+
+        self.assertLessEqual(len(summary), 4000)
+        self.assertIn("done", summary)
+        self.assertIn("broken", summary)
+        self.assertIn("tool_error", summary)
+        self.assertNotIn("y" * 5000, summary)
+
+    def test_failure_summary_truncates_under_many_failures(self):
+        from backend.workflow_graph import _plan_failure_summary
+
+        tasks = [
+            {"task_id": f"t{index}", "kind": "execute", "depends_on": [], "capabilities": [], "context": "x" * 500}
+            for index in range(30)
+        ]
+        results = {
+            f"t{index}": {
+                "task_id": f"t{index}",
+                "attempt_id": f"t{index}:1",
+                "status": "failed",
+                "errors": [{"category": "tool_error", "task_id": f"t{index}"}],
+            }
+            for index in range(30)
+        }
+
+        summary = _plan_failure_summary({"tasks": tasks}, results, [])
+
+        self.assertLessEqual(len(summary), 4000)
+        self.assertIn("tool_error", summary)
+
+    def test_failure_summary_is_empty_without_failure_evidence(self):
+        from backend.workflow_graph import _plan_failure_summary
+
+        plan = {"tasks": [{"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": []}]}
+        results = {"a": {"task_id": "a", "attempt_id": "a:1", "status": "succeeded"}}
+
+        summary = _plan_failure_summary(plan, results, [])
+
+        self.assertEqual(summary, "")
+
+
+class PlannerFallbackTests(unittest.TestCase):
+    def test_planner_failure_falls_back_to_deterministic_single_task_plan(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        def broken_planner(_request, _route):
+            raise RuntimeError("planner down")
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="fallback answer")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=broken_planner,
+            executor=executor,
+            capabilities={"read"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "fallback-run", "do the thing"),
+            config={"configurable": {"thread_id": "session-1:fallback-run"}},
+        ))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["response"], "fallback answer")
+        task = result["plan"]["tasks"][0]
+        self.assertEqual(task["kind"], "execute")
+        self.assertEqual(task["capabilities"], ["read"])
+        planner_events = [event for event in result["events"] if event.get("node") == "planner"]
+        self.assertTrue(planner_events and planner_events[-1].get("planner_fallback_used") is True)
+
+    def test_planner_blocked_when_fallback_also_fails(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        def broken_planner(_request, _route):
+            raise RuntimeError("planner down")
+
+        def broken_fallback(_request, _route):
+            raise RuntimeError("fallback down")
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="unused")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=broken_planner,
+            planner_fallback=broken_fallback,
+            executor=executor,
+            capabilities={"read"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "fallback-blocked-run", "do the thing"),
+            config={"configurable": {"thread_id": "session-1:fallback-blocked-run"}},
+        ))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(error.get("category") == "planner_error" for error in result["errors"]))
+
+    def test_fallback_plan_is_still_validated_by_plan_guard(self):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+        from backend.workflow_state import initial_workflow_state
+
+        def broken_planner(_request, _route):
+            raise RuntimeError("planner down")
+
+        def overreaching_fallback(_request, _route):
+            return [{
+                "task_id": "primary",
+                "kind": "execute",
+                "depends_on": [],
+                "capabilities": ["write"],
+                "context": "do the thing",
+                "max_attempts": 1,
+            }]
+
+        executor = build_executor_graph(model=_ScriptedModel([AIMessage(content="unused")]), tools={})
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=broken_planner,
+            planner_fallback=overreaching_fallback,
+            executor=executor,
+            capabilities={"read"},
+        )
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "fallback-invalid-run", "do the thing"),
+            config={"configurable": {"thread_id": "session-1:fallback-invalid-run"}},
+        ))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(error.get("category") == "invalid_plan" for error in result["errors"]))
+
+
 class TopLevelWorkflowTests(unittest.TestCase):
     def test_planned_workflow_dispatches_tasks_and_joins_results(self):
         from langchain_core.messages import AIMessage

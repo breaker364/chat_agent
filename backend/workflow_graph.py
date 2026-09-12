@@ -37,6 +37,19 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     return {"content": str(getattr(value, "content", value) or "")}
 
 
+def deterministic_fallback_planner(request: str, route: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Deterministic single-task plan used when the model planner fails."""
+    mode = str(route.get("mode") or "planned")
+    return [{
+        "task_id": "primary",
+        "kind": "research" if mode == "research" else "execute",
+        "depends_on": [],
+        "capabilities": list(route.get("required_capabilities") or []),
+        "context": str(request or ""),
+        "max_attempts": 1,
+    }]
+
+
 def _task_attempt(task: Mapping[str, Any], results: Mapping[str, Any]) -> tuple[int, str]:
     task_id = str(task.get("task_id") or "")
     current = results.get(task_id) if isinstance(results, Mapping) else None
@@ -46,6 +59,55 @@ def _task_attempt(task: Mapping[str, Any], results: Mapping[str, Any]) -> tuple[
     except ValueError:
         next_attempt = 1
     return next_attempt, f"{task_id}:{next_attempt}"
+
+
+PLANNER_INPUT_BUDGET = 4000
+_FAILURE_CONTEXT_BUDGET = 200
+
+
+def _plan_failure_summary(
+    plan: Mapping[str, Any],
+    task_results: Mapping[str, Any],
+    errors: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Bounded failure digest injected into the planner input on the replan path."""
+    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+    failed_lines: list[str] = []
+    completed_ids: list[str] = []
+    for task in tasks:
+        if not isinstance(task, Mapping):
+            continue
+        task_id = str(task.get("task_id") or "")
+        result = task_results.get(task_id) if isinstance(task_results, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        status = str(result.get("status") or "")
+        if status == "succeeded":
+            completed_ids.append(task_id)
+            continue
+        if status != "failed":
+            continue
+        related_errors = [
+            error
+            for error in [*list(result.get("errors") or []), *list(errors or [])]
+            if isinstance(error, Mapping) and (not error.get("task_id") or str(error.get("task_id")) == task_id)
+        ]
+        categories = sorted({str(error.get("category") or "unknown") for error in related_errors}) or ["unknown"]
+        context = str(task.get("context") or "").strip()[:_FAILURE_CONTEXT_BUDGET]
+        failed_lines.append(
+            f"Failed task `{task_id}` (kind={task.get('kind')}, attempt_id={result.get('attempt_id')}) "
+            f"errors={','.join(categories)} context={context}"
+        )
+    if not failed_lines:
+        return ""
+    lines = [
+        "Previous plan execution evidence. Completed tasks must not be repeated; "
+        "produce a different plan that addresses the failed tasks.",
+        *failed_lines,
+    ]
+    if completed_ids:
+        lines.append("Completed tasks (do not repeat): " + ", ".join(f"`{task_id}`" for task_id in completed_ids if task_id))
+    return ("\n".join(lines))[:PLANNER_INPUT_BUDGET]
 
 
 def _ready_tasks(state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -83,9 +145,11 @@ def build_workflow_graph(
     research: Any | None = None,
     capabilities: set[str] | frozenset[str],
     checkpointer: Any | None = None,
+    planner_fallback: Callable[[str, Mapping[str, Any]], Sequence[Mapping[str, Any]]] | None = None,
 ):
     """Compile the only parent topology permitted for a workflow invocation."""
     available_capabilities = {str(item or "").strip().lower() for item in capabilities if str(item or "").strip()}
+    fallback_planner = planner_fallback or deterministic_fallback_planner
 
     def intake(state: WorkflowState) -> dict[str, Any]:
         return {"events": [_event("intake", state, status="completed")]}
@@ -132,14 +196,33 @@ def build_workflow_graph(
     def planner_node(state: WorkflowState) -> dict[str, Any]:
         request = state.get("request") or {}
         route_decision = state.get("route") or {}
+        failure_context = _plan_failure_summary(
+            state.get("plan") or {},
+            state.get("task_results") or {},
+            state.get("errors") or [],
+        )
+        planner_request = str(request.get("message") or "")
+        context_chars = 0
+        if failure_context:
+            context_chars = len(failure_context)
+            remaining = max(0, PLANNER_INPUT_BUDGET - context_chars - 2)
+            planner_request = planner_request[:remaining] + "\n\n" + failure_context
         try:
-            tasks = [dict(item) for item in planner(str(request.get("message") or ""), route_decision)]
-        except Exception as exc:
-            return {
-                "status": "blocked",
-                "errors": [{"category": "planner_error", "message": type(exc).__name__}],
-                "events": [_event("planner", state, status="failed")],
-            }
+            tasks = [dict(item) for item in planner(planner_request, route_decision)]
+            fallback_used = False
+        except Exception as planner_exc:
+            try:
+                tasks = [dict(item) for item in fallback_planner(planner_request, route_decision)]
+                fallback_used = True
+            except Exception as fallback_exc:
+                return {
+                    "status": "blocked",
+                    "errors": [
+                        {"category": "planner_error", "message": type(planner_exc).__name__},
+                        {"category": "planner_fallback_error", "message": type(fallback_exc).__name__},
+                    ],
+                    "events": [_event("planner", state, status="failed")],
+                }
         current_plan = state.get("plan") or {}
         return {
             "plan": {
@@ -148,7 +231,16 @@ def build_workflow_graph(
                 "validated": False,
                 "batch_id": int(current_plan.get("batch_id") or 0),
             },
-            "events": [_event("planner", state, status="completed", task_count=len(tasks))],
+            "events": [
+                _event(
+                    "planner",
+                    state,
+                    status="completed",
+                    task_count=len(tasks),
+                    failure_context_chars=context_chars,
+                    planner_fallback_used=fallback_used,
+                )
+            ],
         }
 
     def plan_guard(state: WorkflowState) -> dict[str, Any]:

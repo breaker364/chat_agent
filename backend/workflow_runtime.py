@@ -15,7 +15,7 @@ from .executor_graph import build_executor_graph
 from .research_graph import build_research_graph
 from .session_store import SessionStore
 from .workflow_compat import Command
-from .workflow_graph import build_workflow_graph
+from .workflow_graph import build_workflow_graph, deterministic_fallback_planner
 from .workflow_observability import WORKFLOW_METRICS
 from .workflow_persistence import load_workflow_state, persist_workflow_result
 from .workflow_state import initial_workflow_state, workflow_thread_id
@@ -130,18 +130,6 @@ def _tool_metadata(
         metadata[name] = {"capabilities": normalized}
         capabilities.update(normalized)
     return by_name, metadata, capabilities
-
-
-def _default_planner(request: str, route: Mapping[str, Any]) -> list[dict[str, Any]]:
-    mode = str(route.get("mode") or "planned")
-    return [{
-        "task_id": "primary",
-        "kind": "research" if mode == "research" else "execute",
-        "depends_on": [],
-        "capabilities": list(route.get("required_capabilities") or []),
-        "context": str(request or ""),
-        "max_attempts": 1,
-    }]
 
 
 def map_workflow_event(event: Mapping[str, Any]) -> dict[str, str]:
