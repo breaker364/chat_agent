@@ -1890,10 +1890,19 @@ class SessionStore:
                 existing_value = str(existing.get(field) or "").strip()
                 if incoming_value and incoming_value != existing_value:
                     warnings.append(f"Ignored `{field}` change for `{task_id}` because task identity is locked.")
-            for field in ("status", "details", "result_ref"):
-                incoming_value = str(incoming_item.get(field) or "").strip()
-                if incoming_value != str(existing.get(field) or "").strip():
-                    merged[field] = incoming_value
+            existing_status = str(existing.get("status") or "")
+            incoming_status = str(incoming_item.get("status") or "")
+            if existing_status == "completed" and incoming_status != "completed":
+                warnings.append(f"Refused status downgrade for completed task `{task_id}`; keeping completed.")
+                for field in ("details", "result_ref"):
+                    incoming_value = str(incoming_item.get(field) or "").strip()
+                    if incoming_value != str(existing.get(field) or "").strip():
+                        merged[field] = incoming_value
+            else:
+                for field in ("status", "details", "result_ref"):
+                    incoming_value = str(incoming_item.get(field) or "").strip()
+                    if incoming_value != str(existing.get(field) or "").strip():
+                        merged[field] = incoming_value
             merged["updated_at"] = now
             final_todos.append(merged)
 
@@ -1939,6 +1948,18 @@ class SessionStore:
             if str(todo.get("task_id") or "") != normalized_id:
                 continue
             found = True
+            next_status = str(status).strip() if status is not None else None
+            if next_status is not None and str(todo.get("status") or "") == "completed" and next_status != "completed":
+                self.append_task_journal(
+                    session_id,
+                    {
+                        "event": "task_plan_todo_update_refused",
+                        "task_id": normalized_id,
+                        "status": status,
+                        "reason": "completed tasks cannot be downgraded",
+                    },
+                )
+                return self.create_or_get_session(session_id)
             if status is not None:
                 todo["status"] = str(status).strip()
             if details is not None:

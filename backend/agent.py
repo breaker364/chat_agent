@@ -72,9 +72,9 @@ def _append_marker(sequence: int) -> str:
     return f"用户追加指令（运行中补充，第 {sequence} 条）："
 
 
-def _record_append_command_injected(session_id: str, command_payload: dict[str, Any]) -> None:
+def _record_append_command_injected(session_id: str, command_payload: dict[str, Any], workspace_root: Path | None = None) -> None:
     try:
-        SessionStore(Path.cwd()).record_append_command_event(session_id, command_payload)
+        SessionStore(Path(workspace_root) if workspace_root else Path.cwd()).record_append_command_event(session_id, command_payload)
     except Exception:
         pass
     try:
@@ -98,6 +98,7 @@ def _inject_pending_append_commands_into_messages(
     session_id: str,
     run_id: str,
     messages: list[BaseMessage],
+    workspace_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     normalized_session_id = str(session_id or "default").strip() or "default"
     normalized_run_id = str(run_id or "").strip()
@@ -110,7 +111,7 @@ def _inject_pending_append_commands_into_messages(
     for command in commands:
         payload = command.to_dict()
         messages.append(HumanMessage(content=f"{_append_marker(command.sequence)}\n{command.content}"))
-        _record_append_command_injected(normalized_session_id, payload)
+        _record_append_command_injected(normalized_session_id, payload, workspace_root)
         injected.append(payload)
     return injected
 
@@ -128,7 +129,7 @@ def _copy_input_with_appendable_messages(input_value: Any) -> tuple[Any, list[Ba
     return input_value, None
 
 
-def _inject_pending_append_commands_into_model_input(input_value: Any) -> Any:
+def _inject_pending_append_commands_into_model_input(input_value: Any, workspace_root: Path | None = None) -> Any:
     rewritten_input, messages = _copy_input_with_appendable_messages(input_value)
     if messages is None:
         return input_value
@@ -136,42 +137,43 @@ def _inject_pending_append_commands_into_model_input(input_value: Any) -> Any:
     run_id = current_run_id()
     if not session_id or not run_id:
         return input_value
-    _inject_pending_append_commands_into_messages(session_id, run_id, messages)
+    _inject_pending_append_commands_into_messages(session_id, run_id, messages, workspace_root)
     return rewritten_input
 
 
 class AppendAwareChatModel(Runnable[Any, Any]):
     """Runnable proxy that checks run-scoped append commands before model calls."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, workspace_root: Path | None = None) -> None:
         self._model = model
+        self._workspace_root = workspace_root
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._model, name)
 
     def bind_tools(self, *args: Any, **kwargs: Any) -> "AppendAwareChatModel":
-        return AppendAwareChatModel(self._model.bind_tools(*args, **kwargs))
+        return AppendAwareChatModel(self._model.bind_tools(*args, **kwargs), self._workspace_root)
 
     def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        injected_input = _inject_pending_append_commands_into_model_input(input)
+        injected_input = _inject_pending_append_commands_into_model_input(input, self._workspace_root)
         if config is None:
             return self._model.invoke(injected_input, **kwargs)
         return self._model.invoke(injected_input, config, **kwargs)
 
     async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        injected_input = _inject_pending_append_commands_into_model_input(input)
+        injected_input = _inject_pending_append_commands_into_model_input(input, self._workspace_root)
         if config is None:
             return await self._model.ainvoke(injected_input, **kwargs)
         return await self._model.ainvoke(injected_input, config, **kwargs)
 
     def stream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        injected_input = _inject_pending_append_commands_into_model_input(input)
+        injected_input = _inject_pending_append_commands_into_model_input(input, self._workspace_root)
         if config is None:
             return self._model.stream(injected_input, **kwargs)
         return self._model.stream(injected_input, config, **kwargs)
 
     async def astream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        injected_input = _inject_pending_append_commands_into_model_input(input)
+        injected_input = _inject_pending_append_commands_into_model_input(input, self._workspace_root)
         if config is None:
             async for chunk in self._model.astream(injected_input, **kwargs):
                 yield chunk
@@ -180,8 +182,8 @@ class AppendAwareChatModel(Runnable[Any, Any]):
                 yield chunk
 
 
-def wrap_chat_model_with_append_injection(model: Any) -> AppendAwareChatModel:
-    return AppendAwareChatModel(model)
+def wrap_chat_model_with_append_injection(model: Any, workspace_root: Path | None = None) -> AppendAwareChatModel:
+    return AppendAwareChatModel(model, workspace_root)
 
 
 def estimate_tokens_from_text(text: str) -> int:
@@ -319,6 +321,7 @@ async def _compact_history_if_needed(
     model_context_window: int | None,
     context_token_estimate: int,
     settings: dict[str, Any],
+    workspace_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     source_history = [dict(item) for item in (history or []) if isinstance(item, dict)]
     retain_recent_turns = int(settings.get("retain_recent_turns", 3))
@@ -357,7 +360,7 @@ async def _compact_history_if_needed(
         return source_history, details
 
     model_name = str(model_config.get("model") or "")
-    store = SessionStore(Path.cwd())
+    store = SessionStore(workspace_root or Path.cwd())
     current_fingerprint = canonical_history_fingerprint(partition.eligible_items)
     async with get_context_compaction_lock(session_id):
         cache = store.get_context_compaction(session_id)
@@ -874,9 +877,9 @@ async def build_agent(
 ) -> Any:
     """Build and return a compiled LangGraph react agent."""
     cfg = load_llm_config(config_path)
-    llm = wrap_chat_model_with_append_injection(create_chat_deepseek(cfg))
-    tools = await get_all_tools(workspace_dir=workspace_dir)
     workspace = Path(workspace_dir or Path.cwd()).resolve()
+    llm = wrap_chat_model_with_append_injection(create_chat_deepseek(cfg), workspace_root=workspace)
+    tools = await get_all_tools(workspace_dir=workspace_dir)
     research_runtime = build_agentic_research_runtime(
         model=llm,
         tools=tools,
@@ -901,6 +904,7 @@ async def build_agent(
         state_schema=None,
     )
     agent.name = "chat_agent"
+    agent.workspace_root = workspace
     agent.agentic_research_runtime = research_runtime
     return agent
 
@@ -952,6 +956,7 @@ async def stream_agent_events(
             yield event
         return
     config = {"recursion_limit": MAX_AGENT_STEPS}
+    driver_workspace = Path(getattr(agent, "workspace_root", None) or Path.cwd())
     collected_text = ""
     active_tool: str | None = None
     progress_count = 0
@@ -1394,7 +1399,7 @@ async def stream_agent_events(
         if not current_run_recorded_primary:
             return None
         try:
-            context = SessionStore(Path.cwd()).get_resume_context(session_id)
+            context = SessionStore(driver_workspace).get_resume_context(session_id)
         except Exception:
             return None
 
@@ -1664,7 +1669,7 @@ async def stream_agent_events(
         )
     resume_context = {}
     try:
-        resume_context = SessionStore(Path.cwd()).get_resume_context(session_id)
+        resume_context = SessionStore(driver_workspace).get_resume_context(session_id)
     except Exception:
         resume_context = {}
     resume_text = _format_resume_context(resume_context)
@@ -1885,6 +1890,7 @@ async def stream_agent_events(
             model_context_window=pre_capacity_info.get("input_token_budget", pre_capacity_info.get("model_context_window")),
             context_token_estimate=pre_compaction_metrics["context_token_estimate"],
             settings=compaction_settings,
+            workspace_root=driver_workspace,
         )
     except ContextCompactionError as exc:
         yield {
