@@ -1491,6 +1491,42 @@ async def append_to_current_run(session_id: str, request: Request) -> JSONRespon
 # ---------------------------------------------------------------------------
 
 
+@app.post("/sessions/{session_id}/runs/{run_id}/workflow/approval")
+async def workflow_approval(request: Request, session_id: str, run_id: str) -> JSONResponse:
+    """Resume only the checkpoint associated with the specified workflow run."""
+    body = await request.json()
+    approved = body.get("approved") if isinstance(body, dict) else None
+    if not isinstance(approved, bool):
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "approved must be a boolean"}},
+            status_code=400,
+        )
+    agent = await get_agent()
+    resume = getattr(agent, "approve", None)
+    if not callable(resume):
+        return JSONResponse(
+            {"error": {"code": "workflow_not_enabled", "message": "Workflow runtime is not enabled."}},
+            status_code=409,
+        )
+    result = await resume(session_id=session_id, run_id=run_id, approved=approved)
+    payload = result if isinstance(result, dict) else {"status": "blocked", "response": ""}
+    get_session_store().record_stage_result(
+        session_id,
+        "workflow_approval",
+        {
+            "status": str(payload.get("status") or "blocked"),
+            "summary": str(payload.get("response") or "")[:1200],
+            "verified": bool((payload.get("validation") or {}).get("passed")),
+            "source_tool": "workflow_approval",
+        },
+    )
+    return JSONResponse({
+        "status": str(payload.get("status") or "blocked"),
+        "response": str(payload.get("response") or ""),
+        "run_id": run_id,
+    })
+
+
 @app.post("/chat/stream")
 async def chat_stream(request: Request) -> EventSourceResponse:
     body = await request.json()

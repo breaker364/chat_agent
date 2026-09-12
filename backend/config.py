@@ -30,6 +30,79 @@ DEFAULT_SHELL_TOOLS_CONFIG: dict[str, Any] = {
 }
 
 
+DEFAULT_WORKFLOW_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "max_tasks": 12,
+    "max_parallel_tasks": 4,
+    "max_task_attempts": 2,
+    "max_replans": 1,
+    "checkpoint_backend": "memory",
+    "tool_capabilities": {},
+}
+
+
+class WorkflowConfigError(ValueError):
+    """Raised when workflow orchestration configuration is invalid."""
+
+
+class WorkflowConfig(dict[str, Any]):
+    """Mapping-compatible validated orchestration settings."""
+
+
+def load_workflow_config(raw: Mapping[str, Any] | None = None) -> WorkflowConfig:
+    """Load bounded, deployment-owned settings for the opt-in workflow runtime."""
+    if raw is None:
+        runtime = load_runtime_config()
+        raw = runtime.get("workflow") if isinstance(runtime, Mapping) else {}
+    elif isinstance(raw, Mapping) and isinstance(raw.get("workflow"), Mapping):
+        raw = raw["workflow"]
+    if not isinstance(raw, Mapping):
+        raise WorkflowConfigError("workflow configuration must be an object")
+    unknown = set(raw) - set(DEFAULT_WORKFLOW_CONFIG)
+    if unknown:
+        raise WorkflowConfigError("workflow configuration contains unsupported keys")
+    enabled = raw.get("enabled", DEFAULT_WORKFLOW_CONFIG["enabled"])
+    if not isinstance(enabled, bool):
+        raise WorkflowConfigError("workflow.enabled must be a boolean")
+
+    def bounded(key: str, minimum: int, maximum: int) -> int:
+        value = raw.get(key, DEFAULT_WORKFLOW_CONFIG[key])
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise WorkflowConfigError(f"workflow.{key} must be an integer between {minimum} and {maximum}")
+        return value
+
+    backend = str(raw.get("checkpoint_backend", DEFAULT_WORKFLOW_CONFIG["checkpoint_backend"]) or "").strip().lower()
+    if backend != "memory":
+        raise WorkflowConfigError("workflow.checkpoint_backend is unsupported")
+    raw_tool_capabilities = raw.get("tool_capabilities", DEFAULT_WORKFLOW_CONFIG["tool_capabilities"])
+    if not isinstance(raw_tool_capabilities, Mapping) or len(raw_tool_capabilities) > 256:
+        raise WorkflowConfigError("workflow.tool_capabilities must be a bounded object")
+    tool_capabilities: dict[str, list[str]] = {}
+    for raw_tool_name, raw_capabilities in raw_tool_capabilities.items():
+        tool_name = str(raw_tool_name or "").strip()
+        if not tool_name or len(tool_name) > 160:
+            raise WorkflowConfigError("workflow.tool_capabilities contains an invalid tool name")
+        if not isinstance(raw_capabilities, (list, tuple)) or len(raw_capabilities) > 16:
+            raise WorkflowConfigError("workflow.tool_capabilities values must be bounded lists")
+        normalized_capabilities: list[str] = []
+        for raw_capability in raw_capabilities:
+            capability = str(raw_capability or "").strip().lower()
+            if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", capability):
+                raise WorkflowConfigError("workflow.tool_capabilities contains an invalid capability")
+            if capability not in normalized_capabilities:
+                normalized_capabilities.append(capability)
+        tool_capabilities[tool_name] = normalized_capabilities
+    return WorkflowConfig(
+        enabled=enabled,
+        max_tasks=bounded("max_tasks", 1, 64),
+        max_parallel_tasks=bounded("max_parallel_tasks", 1, 16),
+        max_task_attempts=bounded("max_task_attempts", 1, 8),
+        max_replans=bounded("max_replans", 0, 8),
+        checkpoint_backend=backend,
+        tool_capabilities=tool_capabilities,
+    )
+
+
 class ShellToolsConfigError(ValueError):
     """Raised when shell-tool configuration is unsafe or unsupported."""
 

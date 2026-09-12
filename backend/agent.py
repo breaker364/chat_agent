@@ -18,6 +18,7 @@ from .config import (
     load_agent_memory_config,
     load_context_compaction_config,
     load_llm_config,
+    load_workflow_config,
 )
 from .agentic_research.config import load_agentic_research_config
 from .agentic_research.runtime import (
@@ -46,6 +47,7 @@ from .runtime_context import current_knowledge_policy, current_run_id, current_s
 from .run_append import consume_pending_append_commands
 from .tools import get_all_tools, _normalize_tool_payload_for_key
 from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
+from .workflow_runtime import WorkflowRuntime, build_workflow_runtime
 
 SYSTEM_PROMPT = load_system_prompt()
 AGENT_POLICY = load_agent_policy()
@@ -884,6 +886,15 @@ async def build_agent(
     visible_tools = list(tools)
     if research_runtime is not None:
         visible_tools.append(build_research_planner_tool(llm))
+    workflow_runtime = build_workflow_runtime(
+        model=llm,
+        tools=tools,
+        config=load_workflow_config(),
+        workspace_root=workspace,
+        research_runtime=research_runtime,
+    )
+    if workflow_runtime is not None:
+        return workflow_runtime
     agent = create_react_agent(
         model=llm,
         tools=_react_tools_for_runtime(visible_tools, research_runtime),
@@ -929,6 +940,17 @@ async def stream_agent_events(
       - ``event`` - event type label (``text``, ``tool_call``, ``tool_result``, ``done``)
       - ``data`` - JSON payload (token text, tool name + args, etc.)
     """
+    if isinstance(agent, WorkflowRuntime):
+        run_id = current_run_id() or f"{session_id}:adhoc"
+        async for event in agent.stream_events(
+            message=message,
+            session_id=session_id,
+            run_id=run_id,
+            history=history,
+            knowledge_policy=current_knowledge_policy(),
+        ):
+            yield event
+        return
     config = {"recursion_limit": MAX_AGENT_STEPS}
     collected_text = ""
     active_tool: str | None = None

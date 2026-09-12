@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -105,17 +106,19 @@ class AgentOwnedResearchRoutingTests(unittest.TestCase):
         original = _FakeTool("web_search")
         original.invoke = lambda _payload: calls.append(True) or '{"results":[]}'
         wrapped = runtime_tools._wrap_tool_with_run_dedupe(original)
-        tokens = bind_runtime_context(
-            "routing-test",
-            "run-budget",
-            knowledge_policy="auto",
-            source_call_limits={"web": 1},
-        )
-        try:
-            first = json.loads(wrapped.invoke({"query": "question"}))
-            second = json.loads(wrapped.invoke({"query": "different question"}))
-        finally:
-            reset_runtime_context(tokens)
+        with tempfile.TemporaryDirectory() as workspace:
+            with patch.object(runtime_tools, "_workspace_root", return_value=Path(workspace)):
+                tokens = bind_runtime_context(
+                    "routing-test",
+                    "run-budget",
+                    knowledge_policy="auto",
+                    source_call_limits={"web": 1},
+                )
+                try:
+                    first = json.loads(wrapped.invoke({"query": "question"}))
+                    second = json.loads(wrapped.invoke({"query": "different question"}))
+                finally:
+                    reset_runtime_context(tokens)
 
         self.assertEqual(first["results"], [])
         self.assertEqual(second["status"], "budget_denied")
