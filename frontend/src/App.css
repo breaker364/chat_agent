@@ -3468,3 +3468,130 @@ input:focus-visible {
 .toast-close:hover {
   color: var(--text);
 }
+
+/* ============================================================
+   Message interactions
+   ============================================================ */
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 2px 0 0 40px;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.message-actions-user {
+  margin-left: 0;
+}
+
+.message-group:hover .message-actions,
+.message-actions:focus-within {
+  opacity: 1;
+}
+
+.message-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out);
+}
+
+.message-action-btn:hover {
+  color: var(--text);
+  background: var(--bg-surface-3);
+}
+
+.message-action-btn.active {
+  color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.message-time {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.tool-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tool-status-running {
+  color: var(--debug-accent);
+  animation: working-pulse 1.6s var(--ease-in-out) infinite;
+}
+
+.tool-status-done {
+  color: var(--success);
+}
+
+.tool-status-failed {
+  color: var(--danger);
+}
+
+.retry-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0 40px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out);
+}
+
+.retry-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
+}
+
+.jump-bottom-btn {
+  position: absolute;
+  right: 32px;
+  bottom: 16px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-full);
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--text-secondary);
+  cursor: pointer;
+  box-shadow: var(--shadow-float);
+  animation: toast-in var(--duration) var(--ease-out);
+}
+
+.jump-bottom-btn:hover {
+  color: var(--accent);
+}
+
+.chat-area {
+  position: relative;
+}

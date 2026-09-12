@@ -17,6 +17,7 @@ import {
   MessageSquare,
   Pencil,
   Trash2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   RefreshCw,
@@ -44,6 +45,10 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import ToastHost from "./ToastHost";
 import { showToast } from "./toast";
+import { AssistantMessageActions, UserMessageActions } from "./MessageActions";
+import { extractEditableText, isErrorMessage, pairToolEvents } from "./messageMeta";
+import { formatFullTime, formatRelativeTime } from "./relativeTime";
+import { readFeedbackStore, reportFeedback, toggleFeedback } from "./messageFeedback";
 import {
   appendRunText,
   applyRunAttribution,
@@ -380,7 +385,9 @@ function MessageTokenUsage({ role, usage }) {
   );
 }
 
-function ToolCallBubble({ toolName, args }) {
+const TOOL_STATUS_LABELS = { running: "运行中", done: "完成", failed: "失败" };
+
+function ToolCallBubble({ toolName, args, status = "running" }) {
   const [expanded, setExpanded] = useState(false);
   const text = formatValue(args);
   const preview = text.length > 120 ? `${text.slice(0, 120)}...` : text;
@@ -389,8 +396,11 @@ function ToolCallBubble({ toolName, args }) {
     <div className="message tool-message">
       <button className="tool-result-toggle" onClick={() => setExpanded((value) => !value)}>
         {iconForTool(toolName)}
-        <span className="tool-name">{toolName || "tool"}</span>
-        <span className="tool-status">running</span>
+        <span className="tool-name">{toolName || "工具"}</span>
+        <span className={`tool-status tool-status-${status}`}>
+          {status === "running" ? <Loader2 className="spin" size={11} /> : status === "done" ? <Check size={11} /> : <X size={11} />}
+          {TOOL_STATUS_LABELS[status] || TOOL_STATUS_LABELS.running}
+        </span>
         <span className="toggle-arrow">{expanded ? "收起" : "展开"}</span>
       </button>
       {expanded ? <pre className="tool-args">{text}</pre> : <div className="tool-collapsed-preview">{preview}</div>}
@@ -398,7 +408,7 @@ function ToolCallBubble({ toolName, args }) {
   );
 }
 
-function ToolResultBubble({ toolName, content }) {
+function ToolResultBubble({ toolName, content, state = "done" }) {
   const [expanded, setExpanded] = useState(false);
   const [rawExpanded, setRawExpanded] = useState(false);
   const text = formatValue(content);
@@ -412,7 +422,11 @@ function ToolResultBubble({ toolName, content }) {
     <div className="message tool-result-message">
       <button className="tool-result-toggle" onClick={() => setExpanded((v) => !v)}>
         <FileText size={14} />
-        <span>{toolName || "tool result"}</span>
+        <span>{toolName || "工具结果"}</span>
+        <span className={`tool-status tool-status-${state}`}>
+          {state === "failed" ? <X size={11} /> : <Check size={11} />}
+          {TOOL_STATUS_LABELS[state] || TOOL_STATUS_LABELS.done}
+        </span>
         <span className="toggle-arrow">{expanded ? "收起" : "展开"}</span>
       </button>
       {isWebFetch && parsed ? (
@@ -495,6 +509,7 @@ function ToolEvents({ events }) {
   const progressItems = events.length - toolCalls - toolResults;
   const latest = events[events.length - 1];
   const latestLabel = latest?.name || latest?.message || latest?.type || "tool activity";
+  const statuses = pairToolEvents(events);
 
   return (
     <div className="tool-events">
@@ -513,10 +528,10 @@ function ToolEvents({ events }) {
           <div className="tool-group-body">
             {events.map((evt, i) => {
               if (evt.type === "tool_call") {
-                return <ToolCallBubble key={`tc-${i}`} toolName={evt.name} args={evt.arguments} />;
+                return <ToolCallBubble key={`tc-${i}`} toolName={evt.name} args={evt.arguments} status={statuses[i]?.state || "running"} />;
               }
               if (evt.type === "tool_result") {
-                return <ToolResultBubble key={`tr-${i}`} toolName={evt.name} content={evt.content} />;
+                return <ToolResultBubble key={`tr-${i}`} toolName={evt.name} content={evt.content} state={statuses[i]?.state || "done"} />;
               }
               return <ProgressBubble key={`pg-${i}`} message={evt.message} elapsedSeconds={evt.elapsed_seconds} />;
             })}
@@ -1988,6 +2003,7 @@ export default function App() {
   const [feishuPolling, setFeishuPolling] = useState(false);
   const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
+  const [messageFeedback, setMessageFeedback] = useState(readFeedbackStore);
   const [themePreference, setThemePreferenceState] = useState(readThemePreference);
   const activeRun = getSessionRun(sessionRuns, activeSessionId);
   const loading = isSessionRunning(sessionRuns, activeSessionId);
@@ -2546,6 +2562,24 @@ export default function App() {
     }));
   }, []);
 
+  const handleEditMessage = useCallback((message) => {
+    setInput(extractEditableText(message?.content));
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  const handleFeedback = useCallback(
+    (messageIndex, rating, message) => {
+      setMessageFeedback((prev) => toggleFeedback(prev, activeSessionId, messageIndex, rating));
+      reportFeedback(API_BASE, {
+        session_id: activeSessionId,
+        message_index: messageIndex,
+        rating,
+        content_snippet: String(message?.content || "").slice(0, 200),
+      }).catch(() => {});
+    },
+    [activeSessionId]
+  );
+
   // --- Skill system helpers ---
 
   const fetchInstalledSkills = useCallback(async () => {
@@ -2829,9 +2863,10 @@ export default function App() {
     };
   }, [feishuPolling, feishuLoginState, handleFeishuPoll]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    const filesToUpload = [...pendingFiles];
+  const handleSend = useCallback(async (overrideText) => {
+    const useOverride = typeof overrideText === "string";
+    const text = (useOverride ? overrideText : input).trim();
+    const filesToUpload = useOverride ? [] : [...pendingFiles];
     const mode = getSubmitMode(sessionRuns, activeSessionId);
     const isAppendMode = mode === "append";
     if (isAppendMode && !text) return;
@@ -3078,8 +3113,10 @@ export default function App() {
         controller.signal
       );
       const requestText = buildAttachmentMessage(text, uploadedFiles);
-      const userMsg = { role: "user", content: requestText, tools: [] };
-      setInput("");
+      const userMsg = { role: "user", content: requestText, tools: [], created_at: new Date().toISOString() };
+      if (!useOverride) {
+        setInput("");
+      }
       setPendingFiles([]);
       setAttachmentError("");
       appendVisibleMessage(userMsg);
@@ -3117,6 +3154,7 @@ export default function App() {
 
       appendVisibleMessage({
         role: "assistant",
+        created_at: new Date().toISOString(),
         content: runState.assistantContent || (runState.error ? `请求失败: ${runState.error}` : "(无文本回复)"),
         tools: runState.tools,
         activities: runState.activities,
@@ -3181,6 +3219,13 @@ export default function App() {
     uploadPendingFiles,
   ]);
 
+  const handleRegenerate = useCallback(() => {
+    if (loading) return;
+    const lastUser = [...messages].reverse().find((message) => message.role === "user");
+    if (!lastUser) return;
+    handleSend(lastUser.content);
+  }, [handleSend, loading, messages]);
+
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       // Detect /skill command — open popup instead of sending
@@ -3193,6 +3238,11 @@ export default function App() {
       handleSend();
     }
   };
+
+  const lastAssistantIndex = useMemo(
+    () => messages.reduce((last, msg, index) => (msg.role === "assistant" ? index : last), -1),
+    [messages]
+  );
 
   const visibleSessions = useMemo(
     () =>
@@ -3358,23 +3408,48 @@ export default function App() {
 
         <main className="chat-area">
           <div className="messages-container">
-            {messages.map((msg, i) => (
-              <div key={i} className="message-group">
-                <div className={`message ${msg.role === "user" ? "user-message" : "assistant-message"}`}>
-                  <div className="message-avatar">
-                    {msg.role === "user" ? <User size={16} /> : <Bot size={16} />}
+            {messages.map((msg, i) => {
+              const feedbackRating = (messageFeedback[activeSessionId] || {})[i] || "";
+              return (
+                <div key={i} className="message-group">
+                  <div className={`message ${msg.role === "user" ? "user-message" : "assistant-message"}`}>
+                    <div className="message-avatar">
+                      {msg.role === "user" ? <User size={16} /> : <Bot size={16} />}
+                    </div>
+                    <div className="message-body">
+                      <ChatMessageContent content={msg.content} />
+                      <MessageTokenUsage role={msg.role} usage={msg.usage} />
+                      {msg.role === "assistant" ? <KnowledgeCitations tools={msg.tools} /> : null}
+                      {msg.role === "assistant" ? <ResearchProvenance research={msg.research} /> : null}
+                      {msg.created_at ? (
+                        <span className="message-time" title={formatFullTime(msg.created_at)}>
+                          {formatRelativeTime(msg.created_at)}
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
-                  <div className="message-body">
-                    <ChatMessageContent content={msg.content} />
-                    <MessageTokenUsage role={msg.role} usage={msg.usage} />
-                    {msg.role === "assistant" ? <KnowledgeCitations tools={msg.tools} /> : null}
-                    {msg.role === "assistant" ? <ResearchProvenance research={msg.research} /> : null}
-                  </div>
+                  {msg.role === "assistant" ? (
+                    <AssistantMessageActions
+                      content={msg.content}
+                      canRegenerate={i === lastAssistantIndex && !loading}
+                      onRegenerate={handleRegenerate}
+                      feedback={feedbackRating}
+                      onFeedback={(rating) => handleFeedback(i, rating, msg)}
+                    />
+                  ) : (
+                    <UserMessageActions onEdit={() => handleEditMessage(msg)} />
+                  )}
+                  {msg.role === "assistant" && isErrorMessage(msg) && !loading ? (
+                    <button type="button" className="retry-btn" onClick={handleRegenerate}>
+                      <RefreshCw size={13} />
+                      重试
+                    </button>
+                  ) : null}
+                  {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
+                  {msg.role === "assistant" && <AgentActivityTimeline items={msg.activities} />}
                 </div>
-                {msg.role === "assistant" && <ToolEvents events={msg.tools} />}
-                {msg.role === "assistant" && <AgentActivityTimeline items={msg.activities} />}
-              </div>
-            ))}
+              );
+            })}
 
             <ToolEvents events={toolEvents} />
             <AgentActivityTimeline items={activityItems} />
@@ -3402,6 +3477,20 @@ export default function App() {
 
             <div ref={chatEndRef} />
           </div>
+          {!shouldAutoScroll ? (
+            <button
+              type="button"
+              className="jump-bottom-btn"
+              aria-label="回到底部"
+              title="回到底部"
+              onClick={() => {
+                setShouldAutoScroll(true);
+                scrollDown("smooth");
+              }}
+            >
+              <ChevronDown size={16} />
+            </button>
+          ) : null}
         </main>
 
         <footer
@@ -3486,7 +3575,7 @@ export default function App() {
                 className="send-btn"
                 title={appendMode ? "追加指令" : "发送消息"}
                 aria-label={appendMode ? "追加指令" : "发送消息"}
-                onClick={handleSend}
+                onClick={() => handleSend()}
                 disabled={appendMode ? !input.trim() : (!input.trim() && !pendingFiles.length)}
               >
                 {appendMode ? <Send size={18} /> : loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
