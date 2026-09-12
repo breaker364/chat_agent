@@ -25,7 +25,7 @@ async function renderApp() {
   }));
 
   render(<App />);
-  return screen.findByPlaceholderText(/send a message/i);
+  return screen.findByPlaceholderText(/发送消息/);
 }
 
 function imageTransfer(file) {
@@ -59,7 +59,7 @@ describe("App image upload input", () => {
 
     fireEvent.dragEnter(composer, { dataTransfer: imageTransfer(imageFile) });
 
-    expect(screen.getByText("Drop images to upload")).toBeTruthy();
+    expect(screen.getByText("松开以粘贴图片")).toBeTruthy();
 
     fireEvent.drop(composer, { dataTransfer: imageTransfer(imageFile) });
 

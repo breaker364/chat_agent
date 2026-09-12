@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Chat Agent</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      (function () {
+        var theme = "light";
+        try {
+          var stored = localStorage.getItem("chat-agent:theme") || "system";
+          var dark =
+            stored === "dark" ||
+            (stored === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          theme = dark ? "dark" : "light";
+        } catch (error) {
+          theme = "light";
+        }
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

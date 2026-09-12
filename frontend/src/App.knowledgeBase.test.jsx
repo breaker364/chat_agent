@@ -71,15 +71,15 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    const panel = await screen.findByLabelText("Knowledge base");
+    const panel = await screen.findByLabelText("知识库");
     const file = new File(["knowledge body"], "kb.md", { type: "text/markdown", lastModified: 1 });
 
     fireEvent.drop(panel, { dataTransfer: textTransfer(file) });
     await waitFor(() => expect(calls.some((call) => call.url === "/knowledge/import" && call.method === "POST")).toBe(true));
 
-    fireEvent.click(screen.getByRole("button", { name: /sync knowledge/i }));
+    fireEvent.click(screen.getByRole("button", { name: "同步知识库" }));
     await waitFor(() => expect(calls.some((call) => call.url === "/knowledge/sync" && call.method === "POST")).toBe(true));
-    expect(screen.getByText(/indexed 1/i)).toBeTruthy();
+    expect(screen.getByText(/已索引 1/)).toBeTruthy();
   });
 
   it("imports a Feishu document by connection and refreshes the knowledge center", async () => {
@@ -114,15 +114,15 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /import feishu document/i }));
-    fireEvent.change(screen.getByLabelText(/feishu document url or token/i), {
+    fireEvent.click(await screen.findByRole("button", { name: /导入飞书文档/ }));
+    fireEvent.change(screen.getByLabelText(/飞书文档链接或 Token/i), {
       target: { value: "https://docs.example.test/docx/remote-token" },
     });
-    fireEvent.change(screen.getByLabelText(/knowledge collection/i), {
+    fireEvent.change(screen.getByLabelText(/知识集合/), {
       target: { value: "project-notes" },
     });
-    fireEvent.click(screen.getByLabelText(/force refresh/i));
-    fireEvent.click(screen.getByRole("button", { name: /add to knowledge base/i }));
+    fireEvent.click(screen.getByLabelText(/强制刷新远程内容/));
+    fireEvent.click(screen.getByRole("button", { name: /加入知识库/ }));
 
     await waitFor(() => {
       expect(calls.some((call) => call.url === "/knowledge/import/feishu" && call.method === "POST")).toBe(true);
@@ -133,10 +133,10 @@ describe("App knowledge base controls", () => {
       collection: "project-notes",
       refresh: true,
     });
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: /import feishu document/i })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /导入飞书文档/ })).toBeNull());
     expect(documentListCalls).toBeGreaterThan(1);
     expect(sourceListCalls).toBeGreaterThan(1);
-    expect(screen.getByText(/indexed \/ project notes/i)).toBeTruthy();
+    expect(screen.getByText(/已索引 \/ project notes/i)).toBeTruthy();
   });
 
   it("blocks Feishu import until the web session is logged in", async () => {
@@ -152,14 +152,14 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /import feishu document/i }));
-    expect(screen.getByText(/sign in to Feishu before importing/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /add to knowledge base/i }).disabled).toBe(true);
+    fireEvent.click(await screen.findByRole("button", { name: /导入飞书文档/ }));
+    expect(screen.getByText(/导入前请先登录飞书/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /加入知识库/ }).disabled).toBe(true);
     expect(calls.some((call) => call.url === "/knowledge/import/feishu")).toBe(false);
 
-    fireEvent.click(screen.getByRole("button", { name: /open login panel/i }));
-    expect(screen.queryByRole("dialog", { name: /import feishu document/i })).toBeNull();
-    expect(screen.getByRole("button", { name: /init qr/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /打开登录面板/ }));
+    expect(screen.queryByRole("dialog", { name: /导入飞书文档/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /生成二维码/ })).toBeTruthy();
   });
 
   it("sends the default auto knowledge policy on chat requests", async () => {
@@ -175,9 +175,9 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    const textarea = await screen.findByPlaceholderText(/send a message/i);
+    const textarea = await screen.findByPlaceholderText(/发送消息/);
     fireEvent.change(textarea, { target: { value: "What does my knowledge base say?" } });
-    fireEvent.click(screen.getByTitle("Send message"));
+    fireEvent.click(screen.getByTitle("发送消息"));
 
     await waitFor(() => expect(calls.some((call) => call.url === "/chat/stream")).toBe(true));
     const chatCall = calls.find((call) => call.url === "/chat/stream");
@@ -193,11 +193,11 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    expect((await screen.findByRole("radio", { name: /auto/i })).checked).toBe(true);
-    fireEvent.click(screen.getByRole("radio", { name: /required/i }));
-    expect(screen.getByRole("radio", { name: /required/i }).checked).toBe(true);
-    fireEvent.click(screen.getByRole("radio", { name: /disabled/i }));
-    expect(screen.getByRole("radio", { name: /disabled/i }).checked).toBe(true);
+    expect((await screen.findByRole("radio", { name: "自动" })).checked).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "必须" }));
+    expect(screen.getByRole("radio", { name: "必须" }).checked).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "关闭" }));
+    expect(screen.getByRole("radio", { name: "关闭" }).checked).toBe(true);
   });
 
   it("renders bounded research provenance and validation errors from SSE", async () => {
@@ -231,13 +231,13 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    const textarea = await screen.findByPlaceholderText(/send a message/i);
+    const textarea = await screen.findByPlaceholderText(/发送消息/);
     fireEvent.change(textarea, { target: { value: "Question" } });
-    fireEvent.click(screen.getByTitle("Send message"));
+    fireEvent.click(screen.getByTitle("发送消息"));
 
-    await waitFor(() => expect(screen.getByText(/evidence gap/i)).toBeTruthy());
-    expect(screen.getByText(/personal knowledge/i)).toBeTruthy();
-    expect(screen.getByText(/workspace/i)).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/证据缺口/)).toBeTruthy());
+    expect(screen.getByText(/个人知识库/)).toBeTruthy();
+    expect(screen.getByText(/工作区/)).toBeTruthy();
     expect(screen.queryByText(/must not be rendered/i)).toBeNull();
     expect(screen.getAllByText(/choose a valid policy/i).length).toBeGreaterThan(0);
     expect(calls.some((call) => call.url === "/chat/stream")).toBe(true);
@@ -281,7 +281,7 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    expect(await screen.findByText("Knowledge citations")).toBeTruthy();
+    expect(await screen.findByText("知识引用")).toBeTruthy();
     expect(screen.getByText(/Guide\.md/)).toBeTruthy();
     expect(screen.getByText(/chunk-1/)).toBeTruthy();
     expect(screen.getByText(/Alpha setup requires/)).toBeTruthy();
@@ -360,14 +360,14 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /open knowledge center/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /打开知识中心/ }));
 
-    expect(await screen.findByText("Knowledge Center")).toBeTruthy();
+    expect(await screen.findByText("知识中心")).toBeTruthy();
     expect(screen.getByText("notes")).toBeTruthy();
     expect(screen.getByText("policy.md")).toBeTruthy();
     expect(screen.getByText("draft.md")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: /inspect policy\.md/i }));
+    fireEvent.click(screen.getByRole("button", { name: /查看 policy\.md/ }));
 
     expect(await screen.findByText(/Policy chunk text/)).toBeTruthy();
     expect(screen.getByText(/chunk-1/)).toBeTruthy();
@@ -404,8 +404,8 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /open knowledge center/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /delete draft\.md/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /打开知识中心/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /删除 draft\.md/ }));
 
     await waitFor(() => {
       expect(calls).toContainEqual({
@@ -439,7 +439,7 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /sync knowledge/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "同步知识库" }));
 
     expect(await screen.findByText(/bad\.pdf/)).toBeTruthy();
     expect(screen.getByText(/PDF text extraction produced no text/)).toBeTruthy();
@@ -461,14 +461,14 @@ describe("App knowledge base controls", () => {
       return jsonResponse({ error: "unexpected request" }, { status: 404 });
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: /hide knowledge base panel/i }));
-    expect(screen.queryByRole("button", { name: /sync knowledge/i })).toBeNull();
-    expect(screen.getByRole("button", { name: /show knowledge base panel/i })).toBeTruthy();
-    expect(screen.getByText(/1 documents \/ ready/i)).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /隐藏知识库面板/ }));
+    expect(screen.queryByRole("button", { name: "同步知识库" })).toBeNull();
+    expect(screen.getByRole("button", { name: /显示知识库面板/ })).toBeTruthy();
+    expect(screen.getByText(/1 个文档 \/ 就绪/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: /hide web login panel/i }));
-    expect(screen.queryByRole("button", { name: /init qr/i })).toBeNull();
-    expect(screen.getByRole("button", { name: /show web login panel/i })).toBeTruthy();
-    expect(screen.getByText(/connected/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /隐藏飞书登录面板/ }));
+    expect(screen.queryByRole("button", { name: /生成二维码/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /显示飞书登录面板/ })).toBeTruthy();
+    expect(screen.getByText(/已连接/)).toBeTruthy();
   });
 });

@@ -6,7 +6,6 @@ import {
   User,
   Search,
   FileText,
-  Train,
   Globe,
   Clock,
   TerminalSquare,
@@ -36,9 +35,15 @@ import {
   Paperclip,
   Link2,
   AlertCircle,
+  Wrench,
+  Check,
+  Copy,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import ToastHost from "./ToastHost";
+import { showToast } from "./toast";
 import {
   appendRunText,
   applyRunAttribution,
@@ -56,6 +61,7 @@ import {
   updateSessionRun,
 } from "./sessionRunState";
 import "./App.css";
+import { applyTheme, readThemePreference, setThemePreference, subscribeSystemTheme, THEME_OPTIONS, updateDocumentTitle } from "./theme";
 
 const API_BASE = "";
 const LAST_SESSION_STORAGE_KEY = "chat-agent:last-session-id";
@@ -156,7 +162,7 @@ function makeSessionId() {
 function makeDraftSession(sessionId) {
   return {
     session_id: sessionId,
-    title: "New Session",
+    title: "新会话",
     message_count: 0,
     is_draft: true,
     task_progress: { status: "idle" },
@@ -300,12 +306,20 @@ function formatTurn(value) {
   return `${Math.min(1, Math.max(0, value))}turn`;
 }
 
-function iconForTool(toolName) {
+function toolIconCategory(toolName) {
   const label = (toolName || "").toLowerCase();
-  if (label.includes("search")) return <Globe size={14} />;
-  if (label.includes("file") || label.includes("list") || label.includes("read")) return <FileText size={14} />;
-  if (label.includes("train") || label.includes("ticket") || label.includes("station")) return <Train size={14} />;
-  return <Search size={14} />;
+  if (/(search|web|fetch|browse|http|url|net)/.test(label)) return "network";
+  if (/(file|list|read|write|edit|glob|grep|doc|dir)/.test(label)) return "file";
+  if (/(shell|bash|terminal|command|exec|skill|python|script)/.test(label)) return "shell";
+  return "generic";
+}
+
+export function iconForTool(toolName) {
+  const category = toolIconCategory(toolName);
+  if (category === "network") return <Globe size={14} />;
+  if (category === "file") return <FileText size={14} />;
+  if (category === "shell") return <TerminalSquare size={14} />;
+  return <Wrench size={14} />;
 }
 
 function formatValue(value) {
@@ -334,7 +348,7 @@ function MessageTokenUsage({ role, usage }) {
     const contentTokens = usage.content_tokens;
     if (typeof contentTokens !== "number" || !Number.isFinite(contentTokens)) return null;
     return (
-      <div className="message-token-usage" title="DeepSeek tokenizer content token count">
+      <div className="message-token-usage" title="消息内容 token 统计">
         tokens {formatTokenCount(contentTokens)}
       </div>
     );
@@ -377,7 +391,7 @@ function ToolCallBubble({ toolName, args }) {
         {iconForTool(toolName)}
         <span className="tool-name">{toolName || "tool"}</span>
         <span className="tool-status">running</span>
-        <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
+        <span className="toggle-arrow">{expanded ? "收起" : "展开"}</span>
       </button>
       {expanded ? <pre className="tool-args">{text}</pre> : <div className="tool-collapsed-preview">{preview}</div>}
     </div>
@@ -399,7 +413,7 @@ function ToolResultBubble({ toolName, content }) {
       <button className="tool-result-toggle" onClick={() => setExpanded((v) => !v)}>
         <FileText size={14} />
         <span>{toolName || "tool result"}</span>
-        <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
+        <span className="toggle-arrow">{expanded ? "收起" : "展开"}</span>
       </button>
       {isWebFetch && parsed ? (
         <div className="tool-result-block">
@@ -423,7 +437,7 @@ function ToolResultBubble({ toolName, content }) {
           )}
           {expanded ? (
             <button className="tool-raw-toggle" onClick={() => setRawExpanded((v) => !v)}>
-              {rawExpanded ? "hide raw json" : "show raw json"}
+              {rawExpanded ? "隐藏原始 JSON" : "显示原始 JSON"}
             </button>
           ) : null}
           {expanded && rawExpanded ? <pre className="tool-result-content tool-result-raw">{text}</pre> : null}
@@ -440,7 +454,7 @@ function ProgressBubble({ message, elapsedSeconds }) {
     <div className="message progress-message">
       <div className="tool-header">
         <Clock size={14} />
-        <span className="tool-name">{message || "Still working..."}</span>
+        <span className="tool-name">{message || "仍在工作中..."}</span>
         {elapsedSeconds != null ? <span className="tool-status">{elapsedSeconds}s</span> : null}
       </div>
     </div>
@@ -487,14 +501,14 @@ function ToolEvents({ events }) {
       <div className="message tool-group-message">
         <button className="tool-result-toggle tool-group-toggle" onClick={() => setExpanded((value) => !value)}>
           <TerminalSquare size={14} />
-          <span className="tool-name">Tool calls</span>
+          <span className="tool-name">工具调用</span>
           <span className="tool-group-summary">
-            {events.length} events · {toolCalls} calls · {toolResults} results
-            {progressItems ? ` · ${progressItems} progress` : ""}
+            {events.length} 个事件 · {toolCalls} 次调用 · {toolResults} 个结果
+            {progressItems ? ` · ${progressItems} 个进度` : ""}
           </span>
-          <span className="toggle-arrow">{expanded ? "collapse" : "expand"}</span>
+          <span className="toggle-arrow">{expanded ? "收起" : "展开"}</span>
         </button>
-        <div className="tool-collapsed-preview">latest: {latestLabel}</div>
+        <div className="tool-collapsed-preview">最近: {latestLabel}</div>
         {expanded ? (
           <div className="tool-group-body">
             {events.map((evt, i) => {
@@ -532,7 +546,7 @@ function DebugEventCard({ event }) {
       {hasDetails ? (
         <>
           <button className="debug-toggle" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? "hide details" : "show details"}
+            {expanded ? "收起详情" : "展开详情"}
           </button>
           {expanded ? <pre className="tool-args">{formatValue(event.details)}</pre> : null}
         </>
@@ -545,23 +559,23 @@ function DebugSidebar({ open, events, loading, onToggle, onClear }) {
   return (
     <aside className={`debug-sidebar ${open ? "open" : "collapsed"}`}>
       <div className="debug-sidebar-header">
-        <button className="sidebar-toggle" onClick={onToggle} title={open ? "Collapse debug panel" : "Expand debug panel"}>
+        <button className="sidebar-toggle" onClick={onToggle} title={open ? "折叠调试面板" : "展开调试面板"}>
           {open ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
         </button>
         {open ? (
           <>
             <div>
-              <div className="debug-sidebar-title">Debug stream</div>
-              <div className="debug-sidebar-subtitle">{loading ? "live events" : "idle"}</div>
+              <div className="debug-sidebar-title">调试流</div>
+              <div className="debug-sidebar-subtitle">{loading ? "实时事件" : "空闲"}</div>
             </div>
-            <button className="clear-btn" onClick={onClear}>clear</button>
+            <button className="clear-btn" onClick={onClear}>清空</button>
           </>
         ) : null}
       </div>
       {open ? (
         <div className="debug-sidebar-body">
           {events.length ? events.map((event, index) => <DebugEventCard key={`debug-${index}`} event={event} />) : (
-            <div className="debug-empty">No debug events yet.</div>
+            <div className="debug-empty">暂无调试事件。</div>
           )}
         </div>
       ) : null}
@@ -582,7 +596,7 @@ function SubagentTaskCard({ task }) {
       {(task.result || task.error) ? (
         <>
           <button className="debug-toggle" onClick={() => setExpanded((value) => !value)}>
-            {expanded ? "hide result" : "show result"}
+            {expanded ? "收起结果" : "展开结果"}
           </button>
           {expanded ? <pre className="tool-args">{task.result || task.error}</pre> : null}
         </>
@@ -601,19 +615,19 @@ function TaskProgressPanel({ progress, onRefresh }) {
     <div className="task-progress-panel">
       <div className="task-progress-header">
         <div>
-          <div className="debug-sidebar-title">Task Progress</div>
+          <div className="debug-sidebar-title">任务进度</div>
           <div className="debug-sidebar-subtitle">
-            {tasks.length} todos / {pitfalls.length} pitfalls / {stages.length} stages
+            {tasks.length} 项待办 / {pitfalls.length} 个坑点 / {stages.length} 个阶段
           </div>
         </div>
-        <button className="session-toolbar-btn" onClick={onRefresh} title="Refresh task progress">
+        <button className="session-toolbar-btn" onClick={onRefresh} title="刷新任务进度">
           <RefreshCw size={14} />
         </button>
       </div>
       <div className="task-progress-body">
         {tasks.length ? (
           <div className="progress-section">
-            <div className="progress-section-title">{planTodos.length ? "Task Plan" : "Todos"}</div>
+            <div className="progress-section-title">{planTodos.length ? "任务计划" : "待办"}</div>
             {tasks.slice().reverse().map((task) => (
               <div className="progress-card" key={task.task_id || task.content}>
                 <div className="progress-card-header">
@@ -631,7 +645,7 @@ function TaskProgressPanel({ progress, onRefresh }) {
 
         {pitfalls.length ? (
           <div className="progress-section">
-            <div className="progress-section-title">Pitfalls</div>
+            <div className="progress-section-title">坑点</div>
             {pitfalls.slice().reverse().map((pitfall, index) => (
               <div className="progress-card pitfall-card" key={`${pitfall.created_at || "pitfall"}-${index}`}>
                 <div className="progress-card-header">
@@ -647,7 +661,7 @@ function TaskProgressPanel({ progress, onRefresh }) {
 
         {stages.length ? (
           <div className="progress-section">
-            <div className="progress-section-title">Script Stages</div>
+            <div className="progress-section-title">脚本阶段</div>
             {stages.slice(-8).reverse().map((stage, index) => (
               <div className="progress-card" key={`${stage.created_at || "stage"}-${index}`}>
                 <div className="progress-card-header">
@@ -664,7 +678,7 @@ function TaskProgressPanel({ progress, onRefresh }) {
         ) : null}
 
         {!tasks.length && !pitfalls.length && !stages.length ? (
-          <div className="debug-empty">No saved task progress yet.</div>
+          <div className="debug-empty">暂无任务进度。</div>
         ) : null}
       </div>
     </div>
@@ -689,10 +703,10 @@ function SessionSidebar({
           {!collapsed ? <span>Chat Agent</span> : null}
         </div>
         <div className="session-sidebar-actions">
-          <button className="session-create-btn" onClick={onCreate} title="New session">
+          <button className="session-create-btn" onClick={onCreate} title="新建会话">
             <Plus size={16} />
           </button>
-          <button className="session-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? "Expand sessions" : "Collapse sessions"}>
+          <button className="session-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? "展开会话" : "折叠会话"}>
             {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           </button>
         </div>
@@ -709,15 +723,15 @@ function SessionSidebar({
                 <div className="session-item-content">
                   <div className="session-item-title">{session.title || session.session_id}</div>
                   <div className="session-item-meta">
-                    {session.task_progress?.status === "running" ? "running" : "idle"}
+                    {session.task_progress?.status === "running" ? "运行中" : "空闲"}
                   </div>
                 </div>
               </button>
               <div className="session-item-toolbar">
-                <button className="session-toolbar-btn" onClick={(e) => onRename(e, session)} title="Rename session">
+                <button className="session-toolbar-btn" onClick={(e) => onRename(e, session)} title="重命名会话">
                   <Pencil size={14} />
                 </button>
-                <button className="session-toolbar-btn danger" onClick={(e) => onDelete(e, session)} title="Delete session">
+                <button className="session-toolbar-btn danger" onClick={(e) => onDelete(e, session)} title="删除会话">
                   <Trash2 size={14} />
                 </button>
               </div>
@@ -745,19 +759,19 @@ function FeishuLoginPanel({
       <div className="feishu-panel-header">
         <div className="feishu-panel-title">
           <QrCode size={16} />
-          <span>Feishu Web Login</span>
+          <span>飞书网页登录</span>
         </div>
         <div className="feishu-panel-header-right">
           <button
             className="feishu-collapse-btn"
             onClick={onToggleCollapsed}
-            title={collapsed ? "Show web login panel" : "Hide web login panel"}
-            aria-label={collapsed ? "Show web login panel" : "Hide web login panel"}
+            title={collapsed ? "显示飞书登录面板" : "隐藏飞书登录面板"}
+            aria-label={collapsed ? "显示飞书登录面板" : "隐藏飞书登录面板"}
           >
             {collapsed ? <Expand size={14} /> : <Minimize size={14} />}
           </button>
           <div className={`feishu-status ${status?.logged_in ? "connected" : "disconnected"}`}>
-            {status?.logged_in ? "connected" : "not logged in"}
+            {status?.logged_in ? "已连接" : "未登录"}
           </div>
         </div>
       </div>
@@ -766,15 +780,15 @@ function FeishuLoginPanel({
           <div className="feishu-panel-actions">
             <button className="feishu-btn" onClick={onInit} disabled={loading || polling}>
               <LogIn size={14} />
-              <span>{loading ? "loading..." : polling ? "waiting scan..." : "init qr"}</span>
+              <span>{loading ? "加载中..." : polling ? "等待扫码..." : "生成二维码"}</span>
             </button>
             <button className="feishu-btn" onClick={onRefresh}>
               <RefreshCw size={14} />
-              <span>status</span>
+              <span>状态</span>
             </button>
             <button className="feishu-btn danger" onClick={onLogout}>
               <LogOut size={14} />
-              <span>logout</span>
+              <span>退出登录</span>
             </button>
           </div>
           {loginState?.qr_png_base64 ? (
@@ -782,15 +796,15 @@ function FeishuLoginPanel({
               <img
                 className="feishu-qr-image"
                 src={`data:image/png;base64,${loginState.qr_png_base64}`}
-                alt="Feishu login QR code"
+                alt="飞书登录二维码"
               />
-              <div className="feishu-qr-hint">Scan in Feishu. Backend is polling automatically.</div>
+              <div className="feishu-qr-hint">在飞书中扫码,后端正在自动轮询。</div>
             </div>
           ) : null}
           {loginState?.message ? <div className="feishu-panel-note">{loginState.message}</div> : null}
           {status?.issued_at ? (
             <div className="feishu-panel-note">
-              session issued at: {new Date(status.issued_at * 1000).toLocaleString()}
+              会话签发时间: {new Date(status.issued_at * 1000).toLocaleString()}
             </div>
           ) : null}
         </>
@@ -848,12 +862,12 @@ function DiagramIframe({ htmlContent, title }) {
   return (
     <div className={`diagram-container ${expanded ? "diagram-expanded" : ""}`}>
       <div className="diagram-toolbar">
-        <span className="diagram-title">{title || "Architecture Diagram"}</span>
+        <span className="diagram-title">{title || "架构图"}</span>
         <div className="diagram-actions">
           <button
             className="diagram-action-btn"
             onClick={() => setExpanded((v) => !v)}
-            title={expanded ? "Collapse" : "Expand"}
+            title={expanded ? "收起" : "展开"}
           >
             {expanded ? <Minimize size={14} /> : <Expand size={14} />}
           </button>
@@ -861,7 +875,7 @@ function DiagramIframe({ htmlContent, title }) {
             className="diagram-action-btn"
             href={url}
             download="architecture-diagram.html"
-            title="Download HTML"
+            title="下载 HTML"
           >
             <Download size={14} />
           </a>
@@ -871,7 +885,7 @@ function DiagramIframe({ htmlContent, title }) {
         <iframe
           className="diagram-frame"
           src={url}
-          title={title || "Architecture Diagram"}
+          title={title || "架构图"}
           sandbox="allow-scripts"
           loading="lazy"
           onLoad={(e) => {
@@ -915,9 +929,9 @@ function SkillPopup({
         <div className="skill-popup-header">
           <div className="skill-popup-title">
             <Zap size={18} />
-            <span>Skills</span>
+            <span>技能</span>
           </div>
-          <button className="skill-popup-close" onClick={onClose} title="Close">
+          <button className="skill-popup-close" onClick={onClose} title="关闭">
             <X size={18} />
           </button>
         </div>
@@ -929,14 +943,14 @@ function SkillPopup({
             onClick={() => onTabChange("installed")}
           >
             <Download size={14} />
-            Installed ({installedSkills.length})
+            已安装 ({installedSkills.length})
           </button>
           <button
             className={`skill-tab ${skillTab === "available" ? "active" : ""}`}
             onClick={() => onTabChange("available")}
           >
             <PlusCircle size={14} />
-            Available ({availableSkills.length})
+            可用 ({availableSkills.length})
           </button>
         </div>
 
@@ -945,7 +959,7 @@ function SkillPopup({
           {skillTab === "installed" && (
             <div className="skill-list">
               {installedSkills.length === 0 ? (
-                <div className="skill-empty">No installed skills. Switch to "Available" to install one.</div>
+                <div className="skill-empty">暂无已安装技能。切换到「可用」页签安装。</div>
               ) : (
                 installedSkills.map((skill) => (
                   <div
@@ -966,7 +980,7 @@ function SkillPopup({
                         e.stopPropagation();
                         onUninstall(skill.name);
                       }}
-                      title="Uninstall"
+                      title="卸载"
                     >
                       <Trash2 size={14} />
                     </button>
@@ -979,7 +993,7 @@ function SkillPopup({
           {skillTab === "available" && (
             <div className="skill-list">
               {availableSkills.length === 0 ? (
-                <div className="skill-empty">No additional skills available in the registry.</div>
+                <div className="skill-empty">注册表中暂无其他可用技能。</div>
               ) : (
                 availableSkills.map((skill) => (
                   <div
@@ -1000,7 +1014,7 @@ function SkillPopup({
                         e.stopPropagation();
                         onInstall(skill.name);
                       }}
-                      title="Install"
+                      title="安装"
                     >
                       <PlusCircle size={14} />
                     </button>
@@ -1014,7 +1028,7 @@ function SkillPopup({
           {selectedSkill && (
             <div className="skill-params-section">
               <div className="skill-params-header">
-                <span>Execute: <strong>{selectedSkill.name}</strong></span>
+                <span>执行: <strong>{selectedSkill.name}</strong></span>
               </div>
               {selectedSkill.params_schema?.properties &&
                 Object.entries(selectedSkill.params_schema.properties).map(([key, prop]) => {
@@ -1061,7 +1075,7 @@ function SkillPopup({
                 disabled={skillLoading}
               >
                 {skillLoading ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-                {skillLoading ? "Executing..." : "Execute"}
+                {skillLoading ? "执行中..." : "执行"}
               </button>
 
               {/* Result display — show rendered diagram if HTML, otherwise show text */}
@@ -1069,9 +1083,9 @@ function SkillPopup({
                 <div className={`skill-result ${skillResult.type}`}>
                   <div className="skill-result-header">
                     {skillResult.type === "success" ? (
-                      <><Sparkles size={14} /> Result</>
+                      <><Sparkles size={14} /> 结果</>
                     ) : (
-                      <><X size={14} /> Error</>
+                      <><X size={14} /> 错误</>
                     )}
                   </div>
                   {htmlContent ? (
@@ -1138,7 +1152,49 @@ async function readResponsePayload(resp) {
 // ============================================================
 // Custom Markdown renderer with diagram support
 // ============================================================
-function ChatMessageContent({ content }) {
+function nodeToText(node) {
+  if (node == null) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeToText).join("");
+  if (node?.props?.children !== undefined) return nodeToText(node.props.children);
+  return "";
+}
+
+function CodeBlock({ children }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    const text = nodeToText(children);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      showToast("代码已复制", "success");
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      showToast("代码复制失败", "error");
+    }
+  };
+
+  return (
+    <div className="code-block">
+      <button
+        type="button"
+        className="code-copy-btn"
+        onClick={handleCopy}
+        aria-label="复制代码"
+        title="复制代码"
+      >
+        {copied ? <Check size={13} /> : <Copy size={13} />}
+      </button>
+      <pre>{children}</pre>
+    </div>
+  );
+}
+
+const MARKDOWN_COMPONENTS = { pre: CodeBlock };
+
+export function ChatMessageContent({ content }) {
   const htmlContent = useMemo(() => extractHtmlContent(content), [content]);
 
   // If the content is primarily an HTML diagram, render the diagram and the text
@@ -1150,16 +1206,26 @@ function ChatMessageContent({ content }) {
 
     return (
       <div className="message-content">
-        {textBefore && <ReactMarkdown remarkPlugins={[remarkGfm]}>{textBefore}</ReactMarkdown>}
-        <DiagramIframe htmlContent={htmlContent} title="Architecture Diagram" />
-        {textAfter && <ReactMarkdown remarkPlugins={[remarkGfm]}>{textAfter}</ReactMarkdown>}
+        {textBefore && (
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={MARKDOWN_COMPONENTS}>
+            {textBefore}
+          </ReactMarkdown>
+        )}
+        <DiagramIframe htmlContent={htmlContent} title="架构图" />
+        {textAfter && (
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={MARKDOWN_COMPONENTS}>
+            {textAfter}
+          </ReactMarkdown>
+        )}
       </div>
     );
   }
 
   return (
     <div className="message-content">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={MARKDOWN_COMPONENTS}>
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -1198,7 +1264,7 @@ function KnowledgeCitations({ tools }) {
   if (!citations.length) return null;
   return (
     <div className="knowledge-citations">
-      <div className="knowledge-citations-title">Knowledge citations</div>
+      <div className="knowledge-citations-title">知识引用</div>
       {citations.map((citation, index) => (
         <div className="knowledge-citation" key={`${citation.id}-${index}`}>
           <div className="knowledge-citation-source">
@@ -1216,10 +1282,36 @@ function KnowledgeCitations({ tools }) {
   );
 }
 
+const RESEARCH_OUTCOME_LABELS = {
+  answer_ready: "回答就绪",
+  evidence_gap: "证据缺口",
+  failed: "受阻",
+};
+
+const RESEARCH_SOURCE_LABELS = {
+  web: "网络",
+  web_search: "网络检索",
+  web_fetch: "网页读取",
+  personal_knowledge: "个人知识库",
+  workspace: "工作区",
+  feishu_docs: "飞书文档",
+};
+
+function researchOutcomeLabel(value) {
+  const raw = String(value || "evidence_gap");
+  return RESEARCH_OUTCOME_LABELS[raw] || raw.replaceAll("_", " ");
+}
+
+function researchSourceLabel(value) {
+  const raw = String(value || "");
+  return RESEARCH_SOURCE_LABELS[raw] || raw.replaceAll("_", " ");
+}
+
 function ResearchProvenance({ research }) {
   if (!research || typeof research !== "object") return null;
   const routeClass = String(research.route_class || "").trim();
-  const outcome = String(research.outcome || routeClass || "evidence_gap").replaceAll("_", " ");
+  const outcomeRaw = String(research.outcome || routeClass || "evidence_gap");
+  const outcome = researchOutcomeLabel(outcomeRaw);
   const sources = Array.isArray(research.sources_attempted) ? research.sources_attempted : [];
   const attempts = research.attempts && typeof research.attempts === "object" ? research.attempts : {};
   const budget = research.budget && typeof research.budget === "object" ? research.budget : {};
@@ -1231,46 +1323,55 @@ function ResearchProvenance({ research }) {
     0
   );
   return (
-    <section className={`research-provenance research-${outcome.replace(/[^a-z0-9]+/gi, "-")}`} aria-label="Research provenance">
+    <section className={`research-provenance research-${outcomeRaw.replace(/[^a-z0-9]+/gi, "-")}`} aria-label="研究溯源">
       <div className="research-provenance-header">
         <Search size={13} />
-        <span>Research</span>
+        <span>研究溯源</span>
         <strong>{outcome}</strong>
       </div>
       {sources.length ? (
         <div className="research-source-list">
           {sources.map((source) => (
             <span className="research-source-tag" key={source}>
-              {String(source).replaceAll("_", " ")}
+              {researchSourceLabel(source)}
               {attempts[source] != null ? ` · ${attempts[source]}` : ""}
             </span>
           ))}
         </div>
       ) : null}
       <div className="research-provenance-meta">
-        <span>{citationTotal} citations</span>
+        <span>{citationTotal} 条引用</span>
         {budget.route_transitions_limit != null ? (
-          <span>route {budget.route_transitions_used || 0}/{budget.route_transitions_limit}</span>
+          <span>路由 {budget.route_transitions_used || 0}/{budget.route_transitions_limit}</span>
         ) : null}
       </div>
-      {research.outcome && research.outcome !== "answer_ready" || routeClass === "failed" ? (
+      {outcomeRaw !== "answer_ready" || routeClass === "failed" ? (
         <div className="research-provenance-limit">
           <AlertCircle size={13} />
-          <span>Available evidence is insufficient for a fully grounded answer.</span>
+          <span>可用证据不足以形成完全有据的回答。</span>
         </div>
       ) : null}
     </section>
   );
 }
 
+const KNOWLEDGE_COUNT_LABELS = {
+  indexed: "已索引",
+  refreshed: "已刷新",
+  unchanged: "无变化",
+  skipped: "已跳过",
+  failed: "失败",
+  deleted: "已删除",
+};
+
 function formatKnowledgeCounts(status) {
   const counts = status?.counts || {};
-  const parts = ["indexed", "refreshed", "unchanged", "skipped", "failed", "deleted"]
+  const parts = Object.keys(KNOWLEDGE_COUNT_LABELS)
     .filter((key) => counts[key])
-    .map((key) => `${key} ${counts[key]}`);
+    .map((key) => `${KNOWLEDGE_COUNT_LABELS[key]} ${counts[key]}`);
   if (parts.length) return parts.join(" / ");
   if (status?.message) return status.message;
-  return "ready";
+  return "就绪";
 }
 
 function knowledgeFileName(value) {
@@ -1283,29 +1384,35 @@ function knowledgeStatusClass(status) {
 }
 
 const REMOTE_KNOWLEDGE_ERROR_MESSAGES = {
-  invalid_reference: "The document connection is not a supported URL or token.",
-  content_invalid: "The document content is empty, too large, or could not be normalized.",
-  auth_required: "The Feishu session is missing or expired. Sign in again before importing.",
-  permission_denied: "The current account cannot access this document.",
-  not_found: "The document could not be found.",
-  rate_limited: "The remote service is rate-limiting requests. Try again later.",
-  provider_unavailable: "The remote document service is temporarily unavailable.",
+  invalid_reference: "文档链接不是受支持的链接或 Token。",
+  content_invalid: "文档内容为空、过大或无法规范化。",
+  auth_required: "飞书会话缺失或已过期,请重新登录后再导入。",
+  permission_denied: "当前账号无权访问该文档。",
+  not_found: "未找到该文档。",
+  rate_limited: "远程服务正在限流,请稍后再试。",
+  provider_unavailable: "远程文档服务暂时不可用。",
+};
+
+const KNOWLEDGE_STATUS_LABELS = {
+  indexed: "已索引",
+  refreshed: "已刷新",
+  unchanged: "无变化",
 };
 
 function remoteKnowledgeStatusMessage(payload) {
   const status = String(payload?.status || "").toLowerCase();
-  const title = payload?.title || payload?.source_uri || "document";
-  if (["indexed", "refreshed", "unchanged"].includes(status)) {
-    return `${status} / ${title}`;
+  const title = payload?.title || payload?.source_uri || "文档";
+  if (KNOWLEDGE_STATUS_LABELS[status]) {
+    return `${KNOWLEDGE_STATUS_LABELS[status]} / ${title}`;
   }
-  return payload?.message || "Knowledge operation completed.";
+  return payload?.message || "知识库操作完成。";
 }
 
 function remoteKnowledgeErrorMessage(payload, httpStatus) {
   const code = String(payload?.error?.code || "").toLowerCase();
   return REMOTE_KNOWLEDGE_ERROR_MESSAGES[code]
     || payload?.error?.message
-    || `Knowledge import failed${httpStatus ? ` (HTTP ${httpStatus})` : ""}.`;
+    || `知识库导入失败${httpStatus ? `(HTTP ${httpStatus})` : ""}。`;
 }
 
 function knowledgeSyncDetails(status) {
@@ -1367,11 +1474,11 @@ function FeishuImportDialog({
     const nextReference = reference.trim();
     const nextCollection = collection.trim();
     if (!nextReference) {
-      setError("Enter a document URL or token.");
+      setError("请输入文档链接或 Token。");
       return;
     }
     if (!nextCollection) {
-      setError("Enter a knowledge collection.");
+      setError("请输入知识集合。");
       return;
     }
     if (!loggedIn) {
@@ -1387,9 +1494,9 @@ function FeishuImportDialog({
         refresh,
       });
       if (result?.ok) onClose();
-      else setError(result?.message || "The document could not be imported.");
+      else setError(result?.message || "文档导入失败。");
     } catch (submitError) {
-      setError(submitError?.message || "The document could not be imported.");
+      setError(submitError?.message || "文档导入失败。");
     }
   };
 
@@ -1403,7 +1510,7 @@ function FeishuImportDialog({
       className="feishu-import-overlay"
       role="dialog"
       aria-modal="true"
-      aria-label="Import Feishu document"
+      aria-label="导入飞书文档"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !loading) onClose();
       }}
@@ -1412,7 +1519,7 @@ function FeishuImportDialog({
         <header className="feishu-import-header">
           <div className="feishu-import-title">
             <Link2 size={17} />
-            <span>Import Feishu document</span>
+            <span>导入飞书文档</span>
           </div>
           <button
             type="button"
@@ -1427,17 +1534,17 @@ function FeishuImportDialog({
 
         <form className="feishu-import-form" onSubmit={handleSubmit}>
           <label className="feishu-import-field">
-            <span>Feishu document URL or token</span>
+            <span>飞书文档链接或 Token</span>
             <input
               value={reference}
               onChange={(event) => setReference(event.target.value)}
-              placeholder="Paste a document URL or token"
+              placeholder="粘贴文档链接或 Token"
               autoFocus
               disabled={loading}
             />
           </label>
           <label className="feishu-import-field">
-            <span>Knowledge collection</span>
+            <span>知识集合</span>
             <input
               value={collection}
               onChange={(event) => setCollection(event.target.value)}
@@ -1452,15 +1559,15 @@ function FeishuImportDialog({
               onChange={(event) => setRefresh(event.target.checked)}
               disabled={loading}
             />
-            <span>Force refresh the remote content</span>
+            <span>强制刷新远程内容</span>
           </label>
 
           {!loggedIn ? (
             <div className="feishu-import-alert" role="status">
               <AlertCircle size={15} />
-              <span>Sign in to Feishu before importing a document.</span>
+              <span>导入前请先登录飞书。</span>
               <button type="button" className="feishu-import-login" onClick={handleOpenLogin} disabled={loading}>
-                Open login panel
+                打开登录面板
               </button>
             </div>
           ) : null}
@@ -1473,7 +1580,7 @@ function FeishuImportDialog({
 
           <footer className="feishu-import-footer">
             <button type="button" className="feishu-import-cancel" onClick={onClose} disabled={loading}>
-              Cancel
+              取消
             </button>
             <button
               type="submit"
@@ -1481,7 +1588,7 @@ function FeishuImportDialog({
               disabled={loading || !loggedIn || !reference.trim() || !collection.trim()}
             >
               {loading ? <Loader2 className="spin" size={14} /> : <Link2 size={14} />}
-              Add to knowledge base
+              加入知识库
             </button>
           </footer>
         </form>
@@ -1528,19 +1635,19 @@ function KnowledgeCenter({
   const selectedDocument = detail?.document || null;
 
   return (
-    <div className="knowledge-center-overlay" role="dialog" aria-modal="true" aria-label="Knowledge Center">
+    <div className="knowledge-center-overlay" role="dialog" aria-modal="true" aria-label="知识中心">
       <section className="knowledge-center">
         <header className="knowledge-center-header">
           <div>
-            <div className="knowledge-center-title">Knowledge Center</div>
-            <div className="knowledge-center-subtitle">{sourceRows.length} source files / {documents.length} indexed documents</div>
+            <div className="knowledge-center-title">知识中心</div>
+            <div className="knowledge-center-subtitle">{sourceRows.length} 个源文件 / {documents.length} 个已索引文档</div>
           </div>
           <div className="knowledge-center-actions">
             <button type="button" className="knowledge-action-btn" onClick={onRefresh} disabled={loading}>
               {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
-              Refresh
+              刷新
             </button>
-            <button type="button" className="knowledge-center-close" onClick={onClose} aria-label="Close knowledge center">
+            <button type="button" className="knowledge-center-close" onClick={onClose} aria-label="关闭知识中心">
               <X size={17} />
             </button>
           </div>
@@ -1552,20 +1659,20 @@ function KnowledgeCenter({
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search knowledge files"
-              aria-label="Search knowledge files"
+              placeholder="搜索知识文件"
+              aria-label="搜索知识文件"
             />
           </div>
         </div>
 
         <div className="knowledge-center-body">
-          <aside className="knowledge-center-sidebar" aria-label="Knowledge collections">
+          <aside className="knowledge-center-sidebar" aria-label="知识集合">
             <button
               type="button"
               className={`knowledge-collection-btn ${collection === "all" ? "active" : ""}`}
               onClick={() => setCollection("all")}
             >
-              All
+              全部
             </button>
             {collections.map((item) => (
               <button
@@ -1579,11 +1686,11 @@ function KnowledgeCenter({
             ))}
           </aside>
 
-          <section className="knowledge-source-list" aria-label="Knowledge source files">
+          <section className="knowledge-source-list" aria-label="知识源文件">
             <div className="knowledge-source-header">
-              <span>File</span>
-              <span>Status</span>
-              <span>Chunks</span>
+              <span>文件</span>
+              <span>状态</span>
+              <span>分块</span>
             </div>
             {visibleRows.length ? (
               visibleRows.map((item) => {
@@ -1594,7 +1701,7 @@ function KnowledgeCenter({
                       type="button"
                       className="knowledge-source-title"
                       onClick={() => onInspect(item)}
-                      aria-label={`Inspect ${title}`}
+                      aria-label={`查看 ${title}`}
                       disabled={!item.doc_id}
                     >
                       <FileText size={15} />
@@ -1610,7 +1717,7 @@ function KnowledgeCenter({
                         type="button"
                         className="knowledge-source-delete"
                         onClick={() => onDeleteDocument(item)}
-                        aria-label={`Delete ${title}`}
+                        aria-label={`删除 ${title}`}
                         disabled={loading}
                       >
                         <Trash2 size={13} />
@@ -1620,13 +1727,13 @@ function KnowledgeCenter({
                 );
               })
             ) : (
-              <div className="knowledge-center-empty">No matching knowledge files.</div>
+              <div className="knowledge-center-empty">没有匹配的知识文件。</div>
             )}
           </section>
 
-          <aside className="knowledge-detail-panel" aria-label="Knowledge document detail">
+          <aside className="knowledge-detail-panel" aria-label="知识文档详情">
             {detailLoading ? (
-              <div className="knowledge-center-empty"><Loader2 className="spin" size={16} /> Loading document...</div>
+              <div className="knowledge-center-empty"><Loader2 className="spin" size={16} /> 正在加载文档...</div>
             ) : selectedDocument ? (
               <>
                 <div className="knowledge-detail-title">{selectedDocument.title || selectedDocument.doc_id}</div>
@@ -1649,7 +1756,7 @@ function KnowledgeCenter({
                 </div>
               </>
             ) : (
-              <div className="knowledge-center-empty">Select an indexed document.</div>
+              <div className="knowledge-center-empty">选择一个文档查看分块。</div>
             )}
           </aside>
         </div>
@@ -1690,18 +1797,18 @@ function KnowledgePanel({
   return (
     <section
       className={`knowledge-panel ${collapsed ? "collapsed" : ""}`}
-      aria-label="Knowledge base"
+      aria-label="知识库"
       onDrop={handleDrop}
       onDragOver={handleDragOver}
     >
       <div className="knowledge-panel-header">
         <div>
-          <div className="knowledge-panel-title">Knowledge Base</div>
-          <div className="knowledge-panel-subtitle">{documents.length} documents / {formatKnowledgeCounts(status)}</div>
+          <div className="knowledge-panel-title">知识库</div>
+          <div className="knowledge-panel-subtitle">{documents.length} 个文档 / {formatKnowledgeCounts(status)}</div>
         </div>
         <div className="knowledge-panel-header-right">
-          <div className="knowledge-policy-control" role="radiogroup" aria-label="Knowledge policy">
-            {["auto", "required", "disabled"].map((policy) => (
+          <div className="knowledge-policy-control" role="radiogroup" aria-label="知识检索策略">
+            {[["auto", "自动"], ["required", "必须"], ["disabled", "关闭"]].map(([policy, policyLabel]) => (
               <label className={`knowledge-policy-option ${knowledgePolicy === policy ? "active" : ""}`} key={policy}>
                 <input
                   type="radio"
@@ -1711,7 +1818,7 @@ function KnowledgePanel({
                   onChange={() => onKnowledgePolicyChange(policy)}
                   disabled={loading}
                 />
-                <span>{policy}</span>
+                <span>{policyLabel}</span>
               </label>
             ))}
           </div>
@@ -1719,8 +1826,8 @@ function KnowledgePanel({
             type="button"
             className="knowledge-collapse-btn"
             onClick={onToggleCollapsed}
-            title={collapsed ? "Show knowledge base panel" : "Hide knowledge base panel"}
-            aria-label={collapsed ? "Show knowledge base panel" : "Hide knowledge base panel"}
+            title={collapsed ? "显示知识库面板" : "隐藏知识库面板"}
+            aria-label={collapsed ? "显示知识库面板" : "隐藏知识库面板"}
           >
             {collapsed ? <Expand size={14} /> : <Minimize size={14} />}
           </button>
@@ -1736,14 +1843,14 @@ function KnowledgePanel({
               disabled={loading}
             >
               <Paperclip size={14} />
-              Import
+              导入
             </button>
             <input
               ref={importInputRef}
               className="file-input"
               type="file"
               multiple
-              aria-label="Import knowledge files"
+              aria-label="导入知识文件"
               onChange={(event) => {
                 onImportFiles(event.target.files);
                 event.target.value = "";
@@ -1755,38 +1862,38 @@ function KnowledgePanel({
               className="knowledge-action-btn"
               onClick={() => setFeishuImportOpen(true)}
               disabled={loading}
-              aria-label="Import Feishu document"
-              title="Import Feishu document"
+              aria-label="导入飞书文档"
+              title="导入飞书文档"
             >
               <Link2 size={14} />
-              Feishu doc
+              飞书文档
             </button>
             <button
               type="button"
               className="knowledge-action-btn"
               onClick={onOpenCenter}
               disabled={loading}
-              aria-label="Open knowledge center"
+              aria-label="打开知识中心"
             >
               <FileText size={14} />
-              Browse
+              浏览
             </button>
             <button
               type="button"
               className="knowledge-action-btn"
               onClick={onSync}
               disabled={loading}
-              aria-label="Sync knowledge"
+              aria-label="同步知识库"
             >
               {loading ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
-              Sync
+              同步
             </button>
           </div>
           <div className="knowledge-documents">
             {documents.length ? (
-              <div className="knowledge-empty">{documents.length} indexed documents. Open the center to inspect files and chunks.</div>
+              <div className="knowledge-empty">{documents.length} 个文档已索引。打开知识中心查看文件与分块。</div>
             ) : (
-              <div className="knowledge-empty">Drop files here or import documents.</div>
+              <div className="knowledge-empty">拖入文件或导入文档。</div>
             )}
           </div>
           <KnowledgeSyncDetails status={status} />
@@ -1804,6 +1911,26 @@ function KnowledgePanel({
   );
 }
 
+function ThemeToggle({ value, onChange }) {
+  const labels = { light: "浅色", dark: "暗色", system: "跟随系统" };
+  return (
+    <div className="theme-toggle" role="radiogroup" aria-label="主题">
+      {THEME_OPTIONS.map((option) => (
+        <label key={option} className={`theme-toggle-option ${value === option ? "active" : ""}`}>
+          <input
+            type="radio"
+            name="theme-preference"
+            value={option}
+            checked={value === option}
+            onChange={() => onChange(option)}
+          />
+          <span>{labels[option]}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -1816,7 +1943,7 @@ export default function App() {
   const [knowledgePolicy, setKnowledgePolicy] = useState("auto");
   const [knowledgeDocuments, setKnowledgeDocuments] = useState([]);
   const [knowledgeSources, setKnowledgeSources] = useState([]);
-  const [knowledgeStatus, setKnowledgeStatus] = useState({ message: "ready" });
+  const [knowledgeStatus, setKnowledgeStatus] = useState({ message: "就绪" });
   const [knowledgeLoading, setKnowledgeLoading] = useState(false);
   const [knowledgeCenterOpen, setKnowledgeCenterOpen] = useState(false);
   const [knowledgeDetail, setKnowledgeDetail] = useState(null);
@@ -1861,6 +1988,7 @@ export default function App() {
   const [feishuPolling, setFeishuPolling] = useState(false);
   const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
+  const [themePreference, setThemePreferenceState] = useState(readThemePreference);
   const activeRun = getSessionRun(sessionRuns, activeSessionId);
   const loading = isSessionRunning(sessionRuns, activeSessionId);
   const submitMode = getSubmitMode(sessionRuns, activeSessionId);
@@ -1874,7 +2002,7 @@ export default function App() {
     () => ({
       role: "assistant",
       content:
-        "Chat Agent is ready. I can search the web, read files, and work with tools — just describe what you need.",
+        "Chat Agent 已就绪。我可以联网检索、读取文件、使用工具——描述你的需求即可。",
       tools: [],
     }),
     []
@@ -1905,7 +2033,7 @@ export default function App() {
       const next = [...current];
       for (const file of incoming) {
         if (file.size > MAX_ATTACHMENT_BYTES) {
-          setAttachmentError(`${file.name} exceeds the 25 MB limit.`);
+          setAttachmentError(`文件 ${file.name} 超过 25 MB 限制。`);
           continue;
         }
         const duplicate = next.some(
@@ -1917,7 +2045,7 @@ export default function App() {
         if (!duplicate && next.length < MAX_ATTACHMENTS) next.push(file);
       }
       if (incoming.length + current.length > MAX_ATTACHMENTS) {
-        setAttachmentError(`A maximum of ${MAX_ATTACHMENTS} files can be attached.`);
+        setAttachmentError(`最多附加 ${MAX_ATTACHMENTS} 个文件。`);
       }
       return next;
     });
@@ -1940,7 +2068,7 @@ export default function App() {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.error || `Upload failed with HTTP ${response.status}`);
+      throw new Error(payload.error || `上传失败 (HTTP ${response.status})`);
     }
     return payload.files || [];
   }, []);
@@ -1991,11 +2119,13 @@ export default function App() {
         body: formData,
       });
       const payload = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(payload.error || `Import failed with HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(payload.error || `导入失败 (HTTP ${resp.status})`);
       setKnowledgeStatus(payload);
+      showToast(`已导入 ${files.length} 个文件到知识库`, "success");
       await refreshKnowledgeCenter();
     } catch (err) {
       setKnowledgeStatus({ message: err.message || "import failed", counts: { failed: files.length } });
+      showToast(err.message || "知识库导入失败", "error");
     } finally {
       setKnowledgeLoading(false);
     }
@@ -2010,11 +2140,13 @@ export default function App() {
         body: JSON.stringify({ collection: null }),
       });
       const payload = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(payload.error || `Sync failed with HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(payload.error || `同步失败 (HTTP ${resp.status})`);
       setKnowledgeStatus(payload);
+      showToast("知识库同步完成", "success");
       await refreshKnowledgeCenter();
     } catch (err) {
       setKnowledgeStatus({ message: err.message || "sync failed", counts: { failed: 1 } });
+      showToast(err.message || "知识库同步失败", "error");
     } finally {
       setKnowledgeLoading(false);
     }
@@ -2031,14 +2163,16 @@ export default function App() {
         method: "DELETE",
       });
       const payload = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(payload.error || `Delete failed with HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(payload.error || `删除失败 (HTTP ${resp.status})`);
       setKnowledgeStatus({ ...payload, message: "deleted" });
+      showToast("已删除知识文档", "success");
       setKnowledgeDetail((current) => (
         current?.document?.doc_id === doc.doc_id || current?.document?.source_uri === doc.source_uri ? null : current
       ));
       await refreshKnowledgeCenter();
     } catch (err) {
       setKnowledgeStatus({ message: err.message || "delete failed", counts: { failed: 1 } });
+      showToast(err.message || "知识文档删除失败", "error");
     } finally {
       setKnowledgeLoading(false);
     }
@@ -2051,7 +2185,7 @@ export default function App() {
     try {
       const resp = await fetch(`${API_BASE}/knowledge/documents/${encodeURIComponent(doc.doc_id)}`);
       const payload = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(payload.error || `Document load failed with HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(payload.error || `文档加载失败 (HTTP ${resp.status})`);
       setKnowledgeDetail(payload);
     } catch (err) {
       setKnowledgeDetail({
@@ -2204,6 +2338,22 @@ export default function App() {
   }, [feishuPanelCollapsed]);
 
   useEffect(() => {
+    applyTheme(themePreference);
+    return subscribeSystemTheme(() => {
+      applyTheme(readThemePreference());
+    });
+  }, [themePreference]);
+
+  useEffect(() => {
+    updateDocumentTitle(Boolean(loading));
+  }, [loading]);
+
+  const handleThemeChange = useCallback((preference) => {
+    setThemePreference(preference);
+    setThemePreferenceState(preference);
+  }, []);
+
+  useEffect(() => {
     writeStoredWidth(SESSION_SIDEBAR_WIDTH_KEY, sessionSidebarWidth);
   }, [sessionSidebarWidth]);
 
@@ -2322,7 +2472,7 @@ export default function App() {
     event.preventDefault();
     event.stopPropagation();
     const currentTitle = session.title || session.session_id;
-    const nextTitle = window.prompt("Rename session", currentTitle);
+    const nextTitle = window.prompt("重命名会话", currentTitle);
     if (!nextTitle || nextTitle.trim() === currentTitle) return;
     const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
       method: "PATCH",
@@ -2336,7 +2486,7 @@ export default function App() {
   const handleDeleteSession = useCallback(async (event, session) => {
     event.preventDefault();
     event.stopPropagation();
-    const confirmed = window.confirm(`Delete session "${session.title || session.session_id}"?`);
+    const confirmed = window.confirm(`确认删除会话"${session.title || session.session_id}"?`);
     if (!confirmed) return;
     const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
       method: "DELETE",
@@ -2374,7 +2524,7 @@ export default function App() {
       streamingText: "",
       toolEvents: [
         ...(getSessionRun(prev, sessionId).toolEvents || []),
-        { type: "progress", message: "Request stopped by user.", elapsed_seconds: null },
+        { type: "progress", message: "请求已被用户停止。", elapsed_seconds: null },
       ],
       debugEvents: [
         ...(getSessionRun(prev, sessionId).debugEvents || []),
@@ -2423,8 +2573,9 @@ export default function App() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       await fetchInstalledSkills();
       await fetchAvailableSkills();
+      showToast(`技能 ${name} 安装成功`, "success");
     } catch (err) {
-      console.error("Install skill failed:", err);
+      showToast(`技能安装失败: ${err.message}`, "error");
     }
   }, [fetchInstalledSkills, fetchAvailableSkills]);
 
@@ -2437,8 +2588,9 @@ export default function App() {
       await fetchInstalledSkills();
       await fetchAvailableSkills();
       setSelectedSkill((prev) => (prev?.name === name ? null : prev));
+      showToast(`技能 ${name} 已卸载`, "success");
     } catch (err) {
-      console.error("Uninstall skill failed:", err);
+      showToast(`技能卸载失败: ${err.message}`, "error");
     }
   }, [fetchInstalledSkills, fetchAvailableSkills]);
 
@@ -2478,6 +2630,7 @@ export default function App() {
       const data = await resp.json();
       if (!resp.ok) {
         setSkillResult({ type: "error", content: data.error || `HTTP ${resp.status}` });
+        showToast(`技能执行失败: ${data.error || `HTTP ${resp.status}`}`, "error");
       } else {
         setSkillResult({ type: "success", content: data.result });
         // Also add to chat as a skill execution message
@@ -2500,7 +2653,7 @@ export default function App() {
         setMessages((prev) => [...prev, skillMsg]);
       }
     } catch (err) {
-      setSkillResult({ type: "error", content: `Request failed: ${err.message}` });
+      setSkillResult({ type: "error", content: `请求失败: ${err.message}` });
     } finally {
       setSkillLoading(false);
     }
@@ -2522,6 +2675,10 @@ export default function App() {
     setSkillResult(null);
     setSkillLoading(false);
   }, []);
+
+  useEffect(() => {
+    fetchInstalledSkills();
+  }, [fetchInstalledSkills]);
 
   const handleFeishuInit = useCallback(async () => {
     setFeishuLoading(true);
@@ -2632,14 +2789,16 @@ export default function App() {
       if (!resp.ok || payload.status === "error" || payload.error) {
         const message = remoteKnowledgeErrorMessage(payload, resp.status);
         setKnowledgeStatus({ ...payload, message, counts: { failed: 1 } });
+        showToast(message, "error");
         return { ok: false, message, payload };
       }
 
       setKnowledgeStatus({ ...payload, message: remoteKnowledgeStatusMessage(payload) });
+      showToast("飞书文档已加入知识库", "success");
       await refreshKnowledgeCenter();
       return { ok: true, payload };
     } catch (err) {
-      const message = err?.message || "Knowledge import failed.";
+      const message = err?.message || "知识库导入失败。";
       setKnowledgeStatus({ message, counts: { failed: 1 } });
       return { ok: false, message };
     } finally {
@@ -2827,7 +2986,7 @@ export default function App() {
       } else if (eventType === "progress") {
         pushToolEvent({
           type: "progress",
-          message: parsed?.message || "Still working...",
+          message: parsed?.message || "仍在工作中...",
           elapsed_seconds: parsed?.elapsed_seconds,
           active_tool: parsed?.active_tool,
         });
@@ -2951,7 +3110,7 @@ export default function App() {
 
       appendVisibleMessage({
         role: "assistant",
-        content: runState.assistantContent || (runState.error ? `Request failed: ${runState.error}` : "(no text reply)"),
+        content: runState.assistantContent || (runState.error ? `请求失败: ${runState.error}` : "(无文本回复)"),
         tools: runState.tools,
         activities: runState.activities,
         usage: runState.usage || {},
@@ -2966,7 +3125,7 @@ export default function App() {
       if (err.name === "AbortError") {
         appendVisibleMessage({
           role: "assistant",
-          content: runState.assistantContent || (runState.error ? `Request failed: ${runState.error}` : "(stopped)"),
+          content: runState.assistantContent || (runState.error ? `请求失败: ${runState.error}` : "(stopped)"),
           tools: runState.tools,
           activities: runState.activities,
           usage: runState.usage || {},
@@ -2981,7 +3140,7 @@ export default function App() {
       } else {
         appendVisibleMessage({
           role: "assistant",
-          content: `Request failed: ${err.message}`,
+          content: `请求失败: ${err.message}`,
           tools: runState.tools,
           activities: runState.activities,
           usage: runState.usage || {},
@@ -2990,7 +3149,7 @@ export default function App() {
         pushDebugEvent({
           type: "debug",
           stage: "frontend_error",
-          message: `Frontend request failed: ${err.message}`,
+          message: `前端请求失败: ${err.message}`,
           elapsed_seconds: null,
           details: {},
         });
@@ -3131,11 +3290,12 @@ export default function App() {
             <h1>Chat Agent</h1>
           </div>
           <div className="header-badges">
-            <span className="badge"><Globe size={12} /> Search</span>
-            <span className="badge"><FileText size={12} /> Files</span>
-            <span className="badge"><Train size={12} /> 12306</span>
-            <span className="badge"><Zap size={12} /> Skills</span>
-            <span className="badge"><TerminalSquare size={12} /> Debug</span>
+            <span className="badge"><Globe size={12} /> 搜索</span>
+            <span className="badge"><FileText size={12} /> 文件</span>
+            {installedSkills.length ? (
+              <span className="badge"><Zap size={12} /> 技能 {installedSkills.length}</span>
+            ) : null}
+            <span className="badge"><TerminalSquare size={12} /> 调试</span>
             {contextStats ? (
               <span className="badge">
                 <Code size={12} />
@@ -3146,13 +3306,14 @@ export default function App() {
               <span
                 className="cache-ring"
                 style={{ "--cache-hit-turn": formatTurn(contextStats.usage.prompt_cache_hit_rate) }}
-                title={`Cache hit rate: ${formatPercent(contextStats.usage.prompt_cache_hit_rate)} | hit ${contextStats.usage.prompt_cache_hit_tokens || 0} / miss ${contextStats.usage.prompt_cache_miss_tokens || 0}`}
-                aria-label={`Cache hit rate ${formatPercent(contextStats.usage.prompt_cache_hit_rate)}`}
+                title={`缓存命中率: ${formatPercent(contextStats.usage.prompt_cache_hit_rate)} | 命中 ${contextStats.usage.prompt_cache_hit_tokens || 0} / 未命中 ${contextStats.usage.prompt_cache_miss_tokens || 0}`}
+                aria-label={`缓存命中率 ${formatPercent(contextStats.usage.prompt_cache_hit_rate)}`}
               >
                 {formatPercent(contextStats.usage.prompt_cache_hit_rate)}
               </span>
             ) : null}
           </div>
+          <ThemeToggle value={themePreference} onChange={handleThemeChange} />
         </header>
 
         <div className="top-panels">
@@ -3256,7 +3417,7 @@ export default function App() {
             {isDraggingFiles ? (
               <div className="composer-drop-prompt">
                 {isDraggingImages ? <FileImage size={18} /> : <Paperclip size={18} />}
-                {isDraggingImages ? "Drop images to upload" : "Drop files to attach"}
+                {isDraggingImages ? "松开以粘贴图片" : "松开以添加附件"}
               </div>
             ) : null}
             {pendingFiles.length ? (
@@ -3270,7 +3431,7 @@ export default function App() {
                       type="button"
                       className="attachment-remove"
                       onClick={() => removePendingFile(index)}
-                      aria-label={`Remove ${file.name}`}
+                      aria-label={`移除 ${file.name}`}
                       disabled={loading}
                     >
                       <X size={13} />
@@ -3283,7 +3444,7 @@ export default function App() {
               <button
                 className="skill-slash-btn"
                 onClick={handleOpenSkillPopup}
-                title="Open skills (/skill)"
+                title="打开技能 (/skill)"
                 disabled={loading}
               >
                 <Zap size={16} />
@@ -3292,7 +3453,7 @@ export default function App() {
                 type="button"
                 className="attach-btn"
                 onClick={() => fileInputRef.current?.click()}
-                title="Attach files"
+                title="附加文件"
                 disabled={loading || pendingFiles.length >= MAX_ATTACHMENTS}
               >
                 <Paperclip size={17} />
@@ -3314,19 +3475,19 @@ export default function App() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
-                placeholder={appendMode ? "追加指令到当前运行中的任务" : "Send a message or drop files here"}
+                placeholder={appendMode ? "追加指令到当前运行中的任务" : "发送消息,或拖入文件"}
                 rows={1}
                 disabled={false}
               />
               {loading ? (
-                <button className="stop-btn" onClick={handleStop} title="Stop current request">
+                <button className="stop-btn" onClick={handleStop} title="停止当前请求">
                   <Square size={16} />
                 </button>
               ) : null}
               <button
                 className="send-btn"
-                title={appendMode ? "Append command" : "Send message"}
-                aria-label={appendMode ? "Append command" : "Send message"}
+                title={appendMode ? "追加指令" : "发送消息"}
+                aria-label={appendMode ? "追加指令" : "发送消息"}
                 onClick={handleSend}
                 disabled={appendMode ? !input.trim() : (!input.trim() && !pendingFiles.length)}
               >
@@ -3334,8 +3495,8 @@ export default function App() {
               </button>
             </div>
             <div className={`composer-meta ${attachmentError ? "has-error" : ""}`}>
-              <span>{attachmentError || (appendMode ? "当前任务运行中：Enter 会追加到当前任务 · Shift+Enter 换行" : "Enter to send · Shift+Enter for a new line · drop or paste images · up to 10 files, 25 MB each")}</span>
-              <span>{input.length.toLocaleString()} chars</span>
+              <span>{attachmentError || (appendMode ? "当前任务运行中：Enter 会追加到当前任务 · Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行 · 可拖入或粘贴图片 · 最多 10 个文件,每个 25 MB")}</span>
+              <span>{input.length.toLocaleString()} 字符</span>
             </div>
           </div>
         </footer>
@@ -3375,10 +3536,10 @@ export default function App() {
           <TaskProgressPanel progress={taskProgress} onRefresh={refreshActiveSession} />
           <div className="subagent-sidebar-header">
             <div>
-              <div className="debug-sidebar-title">Subagents</div>
-              <div className="debug-sidebar-subtitle">{subagentTasks.length} tasks</div>
+              <div className="debug-sidebar-title">子代理</div>
+              <div className="debug-sidebar-subtitle">{subagentTasks.length} 个任务</div>
             </div>
-            <button className="session-toolbar-btn" onClick={refreshActiveSession} title="Refresh subagents">
+            <button className="session-toolbar-btn" onClick={refreshActiveSession} title="刷新子代理">
               <RefreshCw size={14} />
             </button>
           </div>
@@ -3390,7 +3551,7 @@ export default function App() {
                     task={task}
                   />
                 ))
-              : <div className="debug-empty">No subagent tasks yet.</div>}
+              : <div className="debug-empty">暂无子代理任务。</div>}
           </div>
         </aside>
       ) : null}
@@ -3427,6 +3588,8 @@ export default function App() {
           onTabChange={setSkillTab}
         />
       )}
+
+      <ToastHost />
     </div>
   );
 }
