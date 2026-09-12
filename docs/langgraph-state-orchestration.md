@@ -159,6 +159,8 @@ agent.astream_events(
 | 追加指令 | 内存队列 + `task_progress.append_commands` | 将运行中的用户补充注入后续模型调用 |
 | 模型用量 | `task_progress.usage` | 保存输入、输出、总量和缓存 token 统计 |
 
+任务计划的不可变性约束：`set_task_plan` 合并快照时锁定任务身份（content/activeForm），并拒绝把 `completed` 任务降级为 pending/in_progress/failed（保留原状态并记录 warning）；`update_task_plan_todo` 单项更新同样拒绝该回退并写入 `task_plan_todo_update_refused` 审计事件。agent 驱动层内的计划消费点（完成门禁、恢复上下文投影、追加命令事件记录、上下文压缩缓存）使用 `build_agent` 注入的 workspace root 构造 `SessionStore`，不再依赖进程当前工作目录；编译后的 ReAct 图对象携带 `workspace_root` 属性。
+
 ### 4.3 为什么没有使用 LangGraph checkpointer
 
 `create_react_agent()` 没有传入 `checkpointer` 或 `store`，调用图时也没有传入 LangGraph thread 配置。因此当前系统不是通过 LangGraph checkpoint 恢复会话，而是采用应用层恢复：
@@ -659,13 +661,16 @@ assess -> scheduler | planner | finalize
 ### 15.2 状态、工具与子图
 
 - `WorkflowState` 保存可信请求上下文、路由、计划、任务结果、证据、产物、错误、审批和审计事件；并行结果通过 reducer 合并，旧 attempt 不会覆盖新 attempt。
-- Executor 子图以单任务和 capability allowlist 运行，只有已授权工具会绑定到该任务；未授权调用在执行前返回 `tool_not_allowed`。
+- Executor 子图以单任务和 capability allowlist 运行，只有已授权工具会绑定到该任务；未授权调用在执行前返回 `tool_not_allowed`。单任务模型步数上限来自 `workflow.executor_max_steps`（默认 8，允许 1-64），由 `dispatch_task` 随每次任务分发传入。
 - Research 子图复用现有受预算研究运行时，只向父图返回结论摘要、去重后的引用、缺口、预算和状态，不回传完整内部推理消息。
 - `Send("dispatch_task", ...)` 只分发依赖已满足的任务；`join` 和 `assess` 汇聚结果并决定完成、重试、重规划或阻塞。
+- 重规划路径会把受界的失败摘要注入 planner 输入：失败任务的标识、类型、错误类别与上下文摘要，以及已完成任务的"勿重复执行"清单；摘要与请求合计按 4000 字符预算截断。
+- planner 异常时先降级到确定性单任务 planner（`deterministic_fallback_planner`），兜底计划同样经过 `plan_guard` 全量校验；兜底也失败才置 `blocked`，降级事件带 `planner_fallback_used` 标记。
+- `plan_guard` 在全局能力注册表校验之外，还会校验每个任务的能力是 route 批准集（`route.required_capabilities`）的子集，违例以 `capability_outside_route` 原因拒绝，不依赖 planner 的 prompt 自律。
 
 ### 15.3 路由、恢复与审批
 
-`route` 使用“LLM 提议 + Pydantic schema + 代码裁决”：LLM 不可指定图节点、边或未注册能力。高风险裁决会在 `approval_gate` 调用 LangGraph `interrupt()`；使用同一 `(session_id, run_id)` thread 调用 `POST /sessions/{session_id}/runs/{run_id}/workflow/approval` 才能恢复或拒绝该 checkpoint。
+`route` 使用“LLM 提议 + Pydantic schema + 代码裁决”：LLM 不可指定图节点、边或未注册能力。高风险裁决会在 `approval_gate` 调用 LangGraph `interrupt()`；使用同一 `(session_id, run_id)` thread 调用 `POST /sessions/{session_id}/runs/{run_id}/workflow/approval` 才能恢复或拒绝该 checkpoint。除 route 阶段的 `risk_level` 外，`plan_guard` 还会按 `HIGH_RISK_CAPABILITY_HINTS`（默认空集，能力标识模式，匹配等同名或 `hint:` 命名空间前缀）对计划重评审批要求：计划中任一任务能力命中即进入审批门，空集时行为与仅按 route 风险判定完全一致。
 
 当前 checkpoint backend 是进程内 `MemorySaver`，适用于单进程 rollout 和测试；跨进程恢复需要在部署前实现持久化 checkpointer。`SessionStore` 仍是跨运行的会话和业务结果事实源，workflow 只把经验证的阶段结果投影回 session。
 
