@@ -2538,11 +2538,19 @@ export default function App() {
       }
       setSessionDialogBusy(true);
       try {
-        const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
+        let resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(session.session_id)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json; charset=utf-8" },
           body: JSON.stringify({ title }),
         });
+        if (resp.status === 404) {
+          // Draft session exists only client-side; persist it with the new title.
+          resp = await fetch(`${API_BASE}/sessions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+            body: JSON.stringify({ session_id: session.session_id, title }),
+          });
+        }
         if (resp.ok) await refreshSessions();
       } finally {
         setSessionDialogBusy(false);

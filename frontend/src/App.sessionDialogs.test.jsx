@@ -145,6 +145,30 @@ describe("App session management", () => {
     });
   });
 
+  it("persists a draft session rename by creating it via POST", async () => {
+    const fetchMock = renderApp({
+      "PATCH /sessions/s-today": () => jsonResponse({ error: "Session not found" }, { status: 404 }),
+      "POST /sessions": () => jsonResponse({ ok: true }),
+    });
+    await screen.findByText("年初规划笔记");
+
+    const renameButtons = screen.getAllByTitle("重命名会话");
+    const draftButton = renameButtons.find((node) => !node.closest(".session-item")?.textContent.match(/调色板|复盘|规划/));
+    fireEvent.click(draftButton || renameButtons[0]);
+
+    const dialog = await screen.findByRole("dialog", { name: "重命名会话" });
+    fireEvent.change(screen.getByLabelText("会话标题"), { target: { value: "草稿新名字" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find(([url, options]) => url === "/sessions" && options?.method === "POST");
+      expect(postCall).toBeTruthy();
+      const body = JSON.parse(postCall[1].body);
+      expect(body.title).toBe("草稿新名字");
+      expect(body.session_id).toBe("s-today");
+    });
+  });
+
   it("closes dialogs with Escape", async () => {
     renderApp();
     await screen.findByText("昨日部署复盘");

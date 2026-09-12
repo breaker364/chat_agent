@@ -423,6 +423,7 @@ body.is-resizing-columns * {
   position: relative;
   background: var(--bg-root);
   overflow-y: auto;
+  overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) transparent;
 }
@@ -1378,6 +1379,10 @@ body.is-resizing-columns * {
 
 .header-badges {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 4px;
+  min-width: 0;
   gap: 6px;
 }
 
@@ -3895,4 +3900,20 @@ input:focus-visible {
   .welcome-chip:hover {
     transform: none;
   }
+}
+
+/* ============================================================
+   Narrow-column guards
+   ============================================================ */
+.badge {
+  white-space: nowrap;
+}
+
+.theme-toggle-option span {
+  white-space: nowrap;
+}
+
+.app-header {
+  flex-wrap: wrap;
+  gap: 10px;
 }
