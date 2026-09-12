@@ -36,6 +36,7 @@ DEFAULT_WORKFLOW_CONFIG: dict[str, Any] = {
     "max_parallel_tasks": 4,
     "max_task_attempts": 2,
     "max_replans": 1,
+    "executor_max_steps": 8,
     "checkpoint_backend": "memory",
     "tool_capabilities": {},
 }
@@ -98,6 +99,7 @@ def load_workflow_config(raw: Mapping[str, Any] | None = None) -> WorkflowConfig
         max_parallel_tasks=bounded("max_parallel_tasks", 1, 16),
         max_task_attempts=bounded("max_task_attempts", 1, 8),
         max_replans=bounded("max_replans", 0, 8),
+        executor_max_steps=bounded("executor_max_steps", 1, 64),
         checkpoint_backend=backend,
         tool_capabilities=tool_capabilities,
     )

@@ -233,6 +233,7 @@ def build_workflow_runtime(
         executor=executor,
         research=research,
         capabilities=capabilities,
+        executor_max_steps=config["executor_max_steps"],
     )
     return WorkflowRuntime(
         graph=graph,

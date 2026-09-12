@@ -542,6 +542,65 @@ class PlanRiskReevaluationTests(unittest.TestCase):
         self.assertEqual(result["response"], "unapproved result")
 
 
+class ExecutorBudgetTests(unittest.TestCase):
+    def _budget_graph(self, *, executor_max_steps=None):
+        from langchain_core.messages import AIMessage
+        from backend.executor_graph import build_executor_graph
+        from backend.workflow_graph import build_workflow_graph
+
+        reader = _FakeTool("read", ("read",))
+        model = _ScriptedModel([
+            AIMessage(content="", tool_calls=[{
+                "name": "read",
+                "args": {"path": "a.txt"},
+                "id": "call-1",
+                "type": "tool_call",
+            }]),
+            AIMessage(content="final answer"),
+        ])
+        executor = build_executor_graph(model=model, tools={"read": reader})
+        kwargs = {} if executor_max_steps is None else {"executor_max_steps": executor_max_steps}
+        graph = build_workflow_graph(
+            route_model=_RouteModel(),
+            planner=lambda _request, _route: [
+                {"task_id": "a", "kind": "execute", "depends_on": [], "capabilities": ["read"], "max_attempts": 1},
+            ],
+            executor=executor,
+            capabilities={"read"},
+            **kwargs,
+        )
+        return graph
+
+    def test_configured_executor_max_steps_exhausts_budget(self):
+        from backend.workflow_state import initial_workflow_state
+
+        graph = self._budget_graph(executor_max_steps=1)
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "budget-run", "read a file", control={"max_replans": 0}),
+            config={"configurable": {"thread_id": "session-1:budget-run"}},
+        ))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(
+            error.get("category") == "budget_exhausted"
+            for error in result["task_results"]["a"]["errors"]
+        ))
+
+    def test_default_executor_budget_allows_tool_roundtrip(self):
+        from backend.workflow_state import initial_workflow_state
+
+        graph = self._budget_graph()
+
+        result = asyncio.run(graph.ainvoke(
+            initial_workflow_state("session-1", "budget-default-run", "read a file", control={"max_replans": 0}),
+            config={"configurable": {"thread_id": "session-1:budget-default-run"}},
+        ))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["response"], "final answer")
+
+
 class TopLevelWorkflowTests(unittest.TestCase):
     def test_planned_workflow_dispatches_tasks_and_joins_results(self):
         from langchain_core.messages import AIMessage

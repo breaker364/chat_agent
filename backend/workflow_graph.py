@@ -148,6 +148,7 @@ def build_workflow_graph(
     capabilities: set[str] | frozenset[str],
     checkpointer: Any | None = None,
     planner_fallback: Callable[[str, Mapping[str, Any]], Sequence[Mapping[str, Any]]] | None = None,
+    executor_max_steps: int | None = None,
 ):
     """Compile the only parent topology permitted for a workflow invocation."""
     available_capabilities = {str(item or "").strip().lower() for item in capabilities if str(item or "").strip()}
@@ -323,6 +324,7 @@ def build_workflow_graph(
                     "attempt": task["attempt"],
                     "attempt_id": task["attempt_id"],
                     "request": request,
+                    "max_steps": executor_max_steps,
                 },
             )
             for task in ready
@@ -350,6 +352,7 @@ def build_workflow_graph(
                     "allowed_capabilities": state.get("allowed_capabilities") or [],
                     "messages": [],
                     "attempt": state.get("attempt") or 1,
+                    "max_steps": state.get("max_steps"),
                 })
                 status = str(result.get("status") or "failed")
                 output = str(result.get("output") or "")
@@ -453,6 +456,7 @@ def build_workflow_graph(
             "attempt": 1,
             "attempt_id": "direct:1",
             "request": request,
+            "max_steps": executor_max_steps,
         })
         return {**partial, "plan": {"version": 1, "tasks": [task], "validated": True, "batch_id": 1}}
 

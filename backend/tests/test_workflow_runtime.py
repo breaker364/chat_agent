@@ -34,6 +34,21 @@ class WorkflowRuntimeTests(unittest.TestCase):
         self.assertFalse(config["enabled"])
         self.assertIsNone(build_workflow_runtime(model=_Model(), tools=[], config=config))
 
+    def test_executor_max_steps_config_defaults_bounded(self):
+        from backend.config import WorkflowConfigError, load_workflow_config
+
+        self.assertEqual(load_workflow_config({})["executor_max_steps"], 8)
+        self.assertEqual(
+            load_workflow_config({"enabled": True, "executor_max_steps": 3})["executor_max_steps"],
+            3,
+        )
+        with self.assertRaises(WorkflowConfigError):
+            load_workflow_config({"executor_max_steps": 0})
+        with self.assertRaises(WorkflowConfigError):
+            load_workflow_config({"executor_max_steps": 65})
+        with self.assertRaises(WorkflowConfigError):
+            load_workflow_config({"executor_max_steps": "8"})
+
     def test_enabled_runtime_maps_lifecycle_to_existing_sse_events(self):
         from backend.config import load_workflow_config
         from backend.workflow_runtime import build_workflow_runtime
