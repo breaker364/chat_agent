@@ -61,7 +61,7 @@ describe("App visual system", () => {
   it("hides the skill badge when no skills are installed", async () => {
     renderWithFetch(standardHandler());
     await waitFor(() => expect(screen.getByRole("radiogroup", { name: "主题" })).toBeTruthy());
-    await waitFor(() => expect(screen.queryByText(/技能/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/^技能( \d+)?$/)).toBeNull());
   });
 
   it("shows a failure toast when knowledge sync fails", async () => {

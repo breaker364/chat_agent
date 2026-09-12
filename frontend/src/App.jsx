@@ -51,6 +51,8 @@ import { formatFullTime, formatRelativeTime } from "./relativeTime";
 import { readFeedbackStore, reportFeedback, toggleFeedback } from "./messageFeedback";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import { groupSessionsByDate } from "./sessionGroups";
+import Welcome from "./Welcome";
+import { buildWelcomeSuggestions } from "./welcomeSuggestions";
 import {
   appendRunText,
   applyRunAttribution,
@@ -2038,6 +2040,7 @@ export default function App() {
   const [feishuPanelCollapsed, setFeishuPanelCollapsed] = useState(readFeishuCollapsed);
   const [contextStats, setContextStats] = useState(null);
   const [messageFeedback, setMessageFeedback] = useState(readFeedbackStore);
+  const [welcomeConfig, setWelcomeConfig] = useState(null);
   const [renameDialogSession, setRenameDialogSession] = useState(null);
   const [deleteDialogSession, setDeleteDialogSession] = useState(null);
   const [sessionDialogBusy, setSessionDialogBusy] = useState(false);
@@ -2050,16 +2053,6 @@ export default function App() {
   const toolEvents = activeRun.toolEvents || [];
   const activityItems = activeRun.activityItems || [];
   const debugEvents = activeRun.debugEvents || [];
-
-  const defaultAssistantMessage = useMemo(
-    () => ({
-      role: "assistant",
-      content:
-        "Chat Agent 已就绪。我可以联网检索、读取文件、使用工具——描述你的需求即可。",
-      tools: [],
-    }),
-    []
-  );
 
   const scrollDown = useCallback((behavior = "auto") => {
     chatEndRef.current?.scrollIntoView({ behavior });
@@ -2352,7 +2345,7 @@ export default function App() {
       setActiveSessionId(data.session_id);
       activeSessionIdRef.current = data.session_id;
       writeLastSessionId(data.session_id);
-      setMessages(data.messages?.length ? data.messages : [defaultAssistantMessage]);
+      setMessages(data.messages || []);
       setSubagentTasks(data.subagent_tasks || []);
       setSubagentNotifications(data.subagent_notifications || []);
       setTaskProgress(data.task_progress || null);
@@ -2365,7 +2358,7 @@ export default function App() {
     } catch {
       return null;
     }
-  }, [defaultAssistantMessage, scrollDown]);
+  }, [scrollDown]);
 
   const refreshActiveSession = useCallback(async () => {
     if (!activeSessionId) return null;
@@ -2474,7 +2467,7 @@ export default function App() {
           setActiveSessionId(sessionId);
           activeSessionIdRef.current = sessionId;
           writeLastSessionId(sessionId);
-          setMessages([defaultAssistantMessage]);
+          setMessages([]);
           setSessions((prev) => replaceDraftSession(prev, sessionId));
         }
       } catch {
@@ -2488,14 +2481,14 @@ export default function App() {
         setActiveSessionId(sessionId);
         activeSessionIdRef.current = sessionId;
         writeLastSessionId(sessionId);
-        setMessages([defaultAssistantMessage]);
+        setMessages([]);
         setSessions((prev) => prev);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [defaultAssistantMessage, loadSession, refreshFeishuStatus, refreshSessions]);
+  }, [loadSession, refreshFeishuStatus, refreshSessions]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -2518,7 +2511,7 @@ export default function App() {
     setActiveSessionId(sessionId);
     activeSessionIdRef.current = sessionId;
     writeLastSessionId(sessionId);
-    setMessages([defaultAssistantMessage]);
+    setMessages([]);
     setSessions((prev) => replaceDraftSession(prev, sessionId));
     setSessionRuns((prev) => replaceRunEvents(replaceRunEvents(replaceRunEvents(prev, sessionId, "debugEvents", []), sessionId, "toolEvents", []), sessionId, "activityItems", []));
     setSubagentTasks([]);
@@ -2526,7 +2519,7 @@ export default function App() {
     setTaskProgress(null);
     setPendingFiles([]);
     setAttachmentError("");
-  }, [defaultAssistantMessage]);
+  }, []);
 
   const handleRenameSession = useCallback((event, session) => {
     event.preventDefault();
@@ -2585,7 +2578,7 @@ export default function App() {
           setActiveSessionId(rememberedSessionId);
           activeSessionIdRef.current = rememberedSessionId;
           writeLastSessionId(rememberedSessionId);
-          setMessages([defaultAssistantMessage]);
+          setMessages([]);
         }
       } else if (readLastSessionId() === session.session_id) {
         if (nextSessions[0]?.session_id) {
@@ -2597,7 +2590,7 @@ export default function App() {
       setSessionDialogBusy(false);
       setDeleteDialogSession(null);
     }
-  }, [activeSessionId, defaultAssistantMessage, deleteDialogSession, loadSession, refreshSessions, sessions]);
+  }, [activeSessionId, deleteDialogSession, loadSession, refreshSessions, sessions]);
 
   const handleStop = useCallback(() => {
     const sessionId = activeSessionIdRef.current;
@@ -2642,6 +2635,16 @@ export default function App() {
     },
     [activeSessionId]
   );
+
+  const welcomeSuggestions = useMemo(
+    () => buildWelcomeSuggestions(welcomeConfig?.welcome_suggestions, installedSkills),
+    [welcomeConfig, installedSkills]
+  );
+
+  const handleWelcomePick = useCallback((text) => {
+    setInput(text);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
 
   // --- Skill system helpers ---
 
@@ -2783,6 +2786,23 @@ export default function App() {
   useEffect(() => {
     fetchInstalledSkills();
   }, [fetchInstalledSkills]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/ui-config`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!cancelled) setWelcomeConfig(data && typeof data === "object" ? data : null);
+      } catch {
+        // Optional endpoint; defaults apply when unavailable.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleFeishuInit = useCallback(async () => {
     setFeishuLoading(true);
@@ -3471,6 +3491,9 @@ export default function App() {
 
         <main className="chat-area">
           <div className="messages-container">
+            {!loading && !messages.length ? (
+              <Welcome suggestions={welcomeSuggestions} onPick={handleWelcomePick} />
+            ) : null}
             {messages.map((msg, i) => {
               const feedbackRating = (messageFeedback[activeSessionId] || {})[i] || "";
               return (
