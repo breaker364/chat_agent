@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import os
 import re
 import shutil
@@ -46,10 +47,22 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         except Exception:
             pass
         raise
-    try:
-        candidate.replace(path)
-    except Exception as exc:
-        raise SessionPersistenceError(candidate, exc) from exc
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            candidate.replace(path)
+            last_exc = None
+            break
+        except PermissionError as exc:
+            # Windows: a concurrent reader (e.g. session list polling) may hold
+            # the target file briefly; back off and retry the replace.
+            last_exc = exc
+            time.sleep(0.1 * (attempt + 1))
+        except Exception as exc:
+            last_exc = exc
+            break
+    if last_exc is not None:
+        raise SessionPersistenceError(candidate, last_exc) from last_exc
 
 
 def _now_iso() -> str:
