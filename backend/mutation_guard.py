@@ -14,6 +14,42 @@ from .mutation_manifest import CommandManifest, normalize_command_manifest
 _MUTATING_OPERATIONS = frozenset({"append", "edit", "replace", "create", "delete"})
 _RECOGNIZED_OPERATIONS = _MUTATING_OPERATIONS | {"read"}
 _REPLACEMENT_WORKFLOW_TERMS = frozenset({"repair", "overwrite", "reformat", "replace", "replacement"})
+_CONTENT_FLAG_NAMES = frozenset({"--text", "--content", "--body", "--markdown", "--md"})
+_CONTENT_PAYLOAD_KEYS = ("content", "text", "body", "markdown")
+_VERSION_PAYLOAD_KEYS = ("version", "revision_id", "version_id")
+
+
+def expected_content_from_manifest(manifest: CommandManifest) -> str:
+    """Extract the inline textual payload a mutating command intends to write."""
+    argv = (manifest.arguments or {}).get("argv") or []
+    tokens = [str(token) for token in argv]
+    for index, token in enumerate(tokens):
+        if token.lower() not in _CONTENT_FLAG_NAMES:
+            continue
+        values: list[str] = []
+        for candidate in tokens[index + 1 :]:
+            if candidate.startswith("--"):
+                break
+            values.append(candidate)
+        if values:
+            return " ".join(values)
+    return ""
+
+
+def _first_non_empty(payload: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = (payload or {}).get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value)
+    return ""
+
+
+def extract_current_content(payload: dict) -> str:
+    return _first_non_empty(payload, _CONTENT_PAYLOAD_KEYS)
+
+
+def extract_state_version(payload: dict) -> str:
+    return _first_non_empty(payload, _VERSION_PAYLOAD_KEYS)
 
 
 @dataclass(frozen=True)

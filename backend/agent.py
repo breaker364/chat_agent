@@ -45,6 +45,7 @@ from .skills import get_skill_catalog_text
 from .token_counter import count_text_tokens
 from .runtime_context import current_knowledge_policy, current_run_id, current_session_id
 from .run_append import consume_pending_append_commands
+from .error_taxonomy import classify_exception, failure_payload_category
 from .tools import get_all_tools, _normalize_tool_payload_for_key
 from .vision import VisionConfigurationError, analyze_image_files, extract_image_paths
 from .workflow_runtime import WorkflowRuntime, build_workflow_runtime
@@ -70,6 +71,67 @@ _SENSITIVE_TEXT_RE = re.compile(
 
 def _append_marker(sequence: int) -> str:
     return f"用户追加指令（运行中补充，第 {sequence} 条）："
+
+
+def retryable_from_tool_output(output_str: str) -> bool | None:
+    """Return the retryability declared by a structured tool result, else None."""
+    text = (output_str or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    declared = payload.get("retryable")
+    if isinstance(declared, bool):
+        return declared
+    classification = failure_payload_category(text)
+    if classification is not None:
+        return classification.retryable
+    return None
+
+
+def retryable_from_exception(exc: BaseException) -> bool | None:
+    declared = getattr(exc, "retryable", None)
+    if isinstance(declared, bool):
+        return declared
+    return classify_exception(exc).retryable
+
+
+def split_tool_errors_by_retryability(errors: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition recorded tool errors; errors without a flag keep retryable semantics."""
+    retryable: list[dict[str, Any]] = []
+    fatal: list[dict[str, Any]] = []
+    for item in errors or []:
+        (fatal if item.get("retryable") is False else retryable).append(item)
+    return retryable, fatal
+
+
+def render_tool_error_guidance(errors: list[dict[str, Any]] | None) -> str:
+    """Render the recent tool error block, separating fatal from retryable failures."""
+    retryable, fatal = split_tool_errors_by_retryability(errors)
+    lines: list[str] = []
+    for item in retryable:
+        preview = item.get("message", "")
+        if len(preview) > 1200:
+            preview = preview[:1200] + "\n[... truncated ...]"
+        lines.append(f"- Tool `{item.get('tool', 'tool')}` failed/returned error (may retry after adjusting):\n{preview}")
+    if fatal:
+        lines.append(
+            "NON-RETRYABLE tool errors below. These calls failed for reasons that will not change "
+            "(invalid arguments, permission, policy, or budget). Do NOT re-issue them unchanged; "
+            "correct the arguments or use a different tool:"
+        )
+        for item in fatal:
+            preview = item.get("message", "")
+            if len(preview) > 1200:
+                preview = preview[:1200] + "\n[... truncated ...]"
+            lines.append(f"- Tool `{item.get('tool', 'tool')}` failed/returned error:\n{preview}")
+    if not lines:
+        lines.append("- No structured tool error captured.")
+    return "\n".join(lines)
 
 
 def _record_append_command_injected(session_id: str, command_payload: dict[str, Any], workspace_root: Path | None = None) -> None:
@@ -1323,17 +1385,7 @@ async def stream_agent_events(
         return False
 
     def build_retry_instruction(reason: str) -> str:
-        recent_errors = tool_errors[-5:]
-        if recent_errors:
-            error_lines = []
-            for item in recent_errors:
-                preview = item.get("message", "")
-                if len(preview) > 1200:
-                    preview = preview[:1200] + "\n[... truncated ...]"
-                error_lines.append(f"- Tool `{item.get('tool', 'tool')}` failed/returned error:\n{preview}")
-            errors_text = "\n".join(error_lines)
-        else:
-            errors_text = "- No structured tool error captured."
+        errors_text = render_tool_error_guidance(tool_errors[-5:])
 
         # Build a concrete inventory of every tool already called this run,
         # so the model can SEE what it already did and avoid restarting.
@@ -2146,7 +2198,13 @@ async def stream_agent_events(
         except Exception as exc:
             if repair_passes < MAX_AGENT_REPAIR_PASSES:
                 repair_passes += 1
-                tool_errors.append({"tool": active_tool or "agent_stream", "message": str(exc)})
+                tool_errors.append(
+                    {
+                        "tool": active_tool or "agent_stream",
+                        "message": str(exc),
+                        "retryable": retryable_from_exception(exc),
+                    }
+                )
                 messages.append(HumanMessage(content=build_retry_instruction(f"agent event stream raised: {exc}")))
                 _repair_dangling_tool_call_messages(messages)
                 injected_append_commands = inject_pending_append_commands()
@@ -2358,7 +2416,13 @@ async def stream_agent_events(
             tool_call_id = end_tool_call_id(event, tool_name)
             is_error = output_indicates_tool_error(tool_name, output_str)
             if is_error:
-                tool_errors.append({"tool": tool_name, "message": output_str[:4000]})
+                tool_errors.append(
+                    {
+                        "tool": tool_name,
+                        "message": output_str[:4000],
+                        "retryable": retryable_from_tool_output(output_str),
+                    }
+                )
                 mark_step(step_for_tool(tool_name), "failed", f"`{tool_name}` failed: {output_str[:400]}")
             else:
                 tool_successes.append({"tool": tool_name, "message": output_str[:800]})

@@ -42,6 +42,7 @@ from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
 from .subagents import built_in_subagents, run_subagent
 from .config import get_runtime_value, load_agent_memory_config, load_mcd_mcp_config
+from .error_taxonomy import classify_exception, failure_payload_category, normalize_failure_result
 from .mutation_manifest import normalize_command_manifest
 from .runtime_context import (
     copy_runtime_context,
@@ -98,6 +99,11 @@ _CURRENT_RUN_ID_ENV = "CHAT_AGENT_RUN_ID"
 _TOOL_DEDUPE_CACHE: dict[str, dict[str, str]] = {}
 _TOOL_DEDUPE_PENDING: dict[str, Any] = {}  # per-run_id -> per-key asyncio.Event + result
 _TOOL_DEDUPE_CACHE_MAX_RUNS = 32
+_RUN_FAILURE_COUNTS: dict[str, dict[str, int]] = {}  # per-run_id -> per-fingerprint failure count
+_RETRY_HINT_MESSAGE = (
+    "This exact call already failed with identical arguments in this run. "
+    "Do not re-issue it unchanged; adjust the arguments or use a different tool."
+)
 _TOOL_CACHEABLE_TTL_SECONDS: dict[str, int] = {
     "list_directory": 300,
     "read_file": 3600,
@@ -471,6 +477,8 @@ def _append_tool_audit(
     content: str = "",
     error: str = "",
     latency_ms: int | None = None,
+    error_category: str = "",
+    retryable: bool | None = None,
 ) -> None:
     session_id = _current_session_id()
     if not session_id:
@@ -481,6 +489,7 @@ def _append_tool_audit(
     payload = {
         "action": action,
         "call_key": call_key,
+        "action_id": _action_id(tool_name, arguments),
         "arguments_hash": _arguments_hash(arguments),
         "dedupe_scope": dedupe_scope,
         "reused_from_tool_call_id": reused_from_tool_call_id,
@@ -488,6 +497,10 @@ def _append_tool_audit(
         "error": error,
         "content_preview": content[:500],
     }
+    if error_category:
+        payload["error_category"] = error_category
+    if retryable is not None:
+        payload["retryable"] = retryable
     if tool_name == "bash":
         command = arguments.get("command") if isinstance(arguments, dict) else ""
         payload["command_hash"] = "sha256:" + hashlib.sha256(str(command or "").encode("utf-8")).hexdigest()
@@ -545,7 +558,7 @@ def _load_side_effect_repeat_block(tool_name: str, arguments: Any, call_key: str
     entry = store.get_tool_result_cache_entry(session_id, call_key)
     if not entry or entry.get("status") != "success" or not entry.get("side_effect"):
         return None
-    content = _side_effect_repeat_message(tool_name, call_key)
+    content = _side_effect_repeat_message(tool_name, call_key, action_id=_action_id(tool_name, arguments))
     _append_tool_audit(
         action="blocked",
         tool_name=tool_name,
@@ -602,13 +615,16 @@ def _save_conversation_cache_result(
         logger.debug("Failed to save tool result cache: %s", exc)
 
 
-def _side_effect_repeat_message(tool_name: str, call_key: str) -> str:
+def _side_effect_repeat_message(tool_name: str, call_key: str, action_id: str = "") -> str:
     return json.dumps(
         {
             "blocked": True,
             "reason": "duplicate_side_effect_tool_call",
+            "error_category": "policy_denied",
+            "retryable": False,
             "tool": tool_name,
             "call_key": call_key,
+            "action_id": action_id,
             "message": (
                 "Runtime blocked a repeated side-effect tool call with identical arguments. "
                 "Ask for explicit confirmation before executing this action again."
@@ -617,6 +633,75 @@ def _side_effect_repeat_message(tool_name: str, call_key: str) -> str:
         ensure_ascii=False,
         indent=2,
     )
+
+
+def _action_id(tool_name: str, payload: Any) -> str:
+    """Deterministic action identity derived from tool name plus canonical arguments."""
+    normalized = {
+        "tool": tool_name,
+        "arguments": _normalize_tool_payload_for_key(tool_name, payload),
+    }
+    return "sha256:" + hashlib.sha256(_canonical_json(normalized).encode("utf-8")).hexdigest()
+
+
+def _failure_counts_for_current_request() -> dict[str, int] | None:
+    run_id = _current_run_id()
+    if not run_id:
+        return None
+    if run_id not in _RUN_FAILURE_COUNTS:
+        _RUN_FAILURE_COUNTS[run_id] = {}
+    return _RUN_FAILURE_COUNTS[run_id]
+
+
+def _note_failure(fingerprint: str) -> int:
+    counts = _failure_counts_for_current_request()
+    if counts is None:
+        return 0
+    counts[fingerprint] = counts.get(fingerprint, 0) + 1
+    return counts[fingerprint]
+
+
+def _clear_failure(fingerprint: str) -> None:
+    counts = _failure_counts_for_current_request()
+    if counts is not None:
+        counts.pop(fingerprint, None)
+
+
+def _soft_failure_result(exc: Exception, category: str, retryable: bool, include_hint: bool) -> str:
+    payload: dict[str, Any] = {
+        "status": "command_failed",
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "error_category": category,
+        "retryable": retryable,
+    }
+    if include_hint:
+        payload["retry_hint"] = _RETRY_HINT_MESSAGE
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _apply_retry_hint(result_text: str, include_hint: bool) -> str:
+    if not include_hint:
+        return result_text
+    try:
+        payload = json.loads(result_text)
+    except (TypeError, ValueError):
+        return result_text + "\n" + _RETRY_HINT_MESSAGE
+    if isinstance(payload, dict):
+        payload["retry_hint"] = _RETRY_HINT_MESSAGE
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    return result_text + "\n" + _RETRY_HINT_MESSAGE
+
+
+def _inject_action_id(tool_name: str, arguments: Any, result_text: str) -> str:
+    try:
+        payload = json.loads(result_text)
+    except (TypeError, ValueError):
+        return result_text
+    if isinstance(payload, dict) and "action_id" not in payload:
+        payload["action_id"] = _action_id(tool_name, arguments)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    return result_text
 
 
 def _json_objects_from_text(text: str) -> list[dict[str, Any]]:
@@ -881,6 +966,7 @@ def _run_cache_for_current_request() -> dict[str, str] | None:
             if oldest:
                 _TOOL_DEDUPE_CACHE.pop(oldest, None)
                 _TOOL_DEDUPE_PENDING.pop(oldest, None)
+                _RUN_FAILURE_COUNTS.pop(oldest, None)
         _TOOL_DEDUPE_CACHE[run_id] = {}
     return _TOOL_DEDUPE_CACHE[run_id]
 
@@ -898,6 +984,7 @@ def clear_tool_dedupe_cache(run_id: str | None) -> None:
     if run_id:
         _TOOL_DEDUPE_CACHE.pop(run_id, None)
         _TOOL_DEDUPE_PENDING.pop(run_id, None)
+        _RUN_FAILURE_COUNTS.pop(run_id, None)
 
 
 def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
@@ -936,7 +1023,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
         if cache is not None and cache_key in cache:
             result_text = cache[cache_key]
             if policy.get("side_effect"):
-                result_text = _side_effect_repeat_message(tool_name, cache_key)
+                result_text = _side_effect_repeat_message(tool_name, cache_key, action_id=_action_id(tool_name, kwargs))
                 _append_tool_audit(
                     action="blocked",
                     tool_name=tool_name,
@@ -974,6 +1061,15 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
                 record_source_call(source_kind)
             result = tool_obj.invoke(kwargs)
             result_text = result if isinstance(result, str) else str(result)
+            failure_classification = failure_payload_category(result_text)
+            if failure_classification is not None:
+                failure_count = _note_failure(cache_key)
+                result_text = normalize_failure_result(result_text)
+                result_text = _apply_retry_hint(result_text, include_hint=failure_count == 2)
+            else:
+                _clear_failure(cache_key)
+            if policy.get("side_effect"):
+                result_text = _inject_action_id(tool_name, kwargs, result_text)
             latency_ms = int((time.monotonic() - started_at) * 1000)
             if cache is not None:
                 cache[cache_key] = result_text
@@ -997,6 +1093,13 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             return result_text
         except Exception as exc:
             latency_ms = int((time.monotonic() - started_at) * 1000)
+            classification = classify_exception(exc)
+            try:
+                exc.error_category = classification.category
+                exc.retryable = classification.retryable
+            except Exception:
+                pass
+            failure_count = _note_failure(cache_key)
             _save_conversation_cache_result(
                 tool_name=tool_name,
                 arguments=kwargs,
@@ -1013,7 +1116,16 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
                 call_key=cache_key,
                 error=str(exc),
                 latency_ms=latency_ms,
+                error_category=classification.category,
+                retryable=classification.retryable,
             )
+            if failure_count >= 2:
+                return _soft_failure_result(
+                    exc,
+                    classification.category,
+                    classification.retryable,
+                    include_hint=failure_count == 2,
+                )
             raise
 
     async def cached_coroutine(**kwargs: Any) -> str:
@@ -1027,7 +1139,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
         if cache is not None and cache_key in cache:
             result_text = cache[cache_key]
             if policy.get("side_effect"):
-                result_text = _side_effect_repeat_message(tool_name, cache_key)
+                result_text = _side_effect_repeat_message(tool_name, cache_key, action_id=_action_id(tool_name, kwargs))
                 _append_tool_audit(
                     action="blocked",
                     tool_name=tool_name,
@@ -1059,7 +1171,7 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             if cache is not None and cache_key in cache:
                 result_text = cache[cache_key]
                 if policy.get("side_effect"):
-                    result_text = _side_effect_repeat_message(tool_name, cache_key)
+                    result_text = _side_effect_repeat_message(tool_name, cache_key, action_id=_action_id(tool_name, kwargs))
                     _append_tool_audit(
                         action="blocked",
                         tool_name=tool_name,
@@ -1102,6 +1214,15 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
                 record_source_call(source_kind)
             result = await tool_obj.ainvoke(kwargs)
             result_text = result if isinstance(result, str) else str(result)
+            failure_classification = failure_payload_category(result_text)
+            if failure_classification is not None:
+                failure_count = _note_failure(cache_key)
+                result_text = normalize_failure_result(result_text)
+                result_text = _apply_retry_hint(result_text, include_hint=failure_count == 2)
+            else:
+                _clear_failure(cache_key)
+            if policy.get("side_effect"):
+                result_text = _inject_action_id(tool_name, kwargs, result_text)
             if cache is not None:
                 cache[cache_key] = result_text
             latency_ms = int((time.monotonic() - started_at) * 1000)
@@ -1125,6 +1246,13 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
             return result_text
         except Exception as exc:
             latency_ms = int((time.monotonic() - started_at) * 1000)
+            classification = classify_exception(exc)
+            try:
+                exc.error_category = classification.category
+                exc.retryable = classification.retryable
+            except Exception:
+                pass
+            failure_count = _note_failure(cache_key)
             _save_conversation_cache_result(
                 tool_name=tool_name,
                 arguments=kwargs,
@@ -1141,7 +1269,19 @@ def _wrap_tool_with_run_dedupe(tool_obj: Any) -> Any:
                 call_key=cache_key,
                 error=str(exc),
                 latency_ms=latency_ms,
+                error_category=classification.category,
+                retryable=classification.retryable,
             )
+            if failure_count >= 2:
+                soft_result = _soft_failure_result(
+                    exc,
+                    classification.category,
+                    classification.retryable,
+                    include_hint=failure_count == 2,
+                )
+                if cache is not None:
+                    cache[cache_key] = soft_result
+                return soft_result
             raise
         finally:
             if pending_map is not None and cache_key in pending_map:

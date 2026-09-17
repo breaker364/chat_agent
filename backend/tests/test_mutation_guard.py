@@ -73,6 +73,9 @@ class RemoteMutationCommandTests(unittest.TestCase):
 
         def fake_runner(_skill, params, _root):
             calls.append(dict(params))
+            request = str(params.get("request") or "")
+            if request.startswith("lark document read"):
+                return '{"version":"version-2"}'
             return '{"before_version":"version-1","after_version":"version-2","verified":true}'
 
         async def invoke_twice():
@@ -98,7 +101,10 @@ class RemoteMutationCommandTests(unittest.TestCase):
             reset_runtime_context(tokens)
 
         self.assertEqual(first, second)
-        self.assertEqual(len(calls), 1)
+        mutation_calls = [
+            call for call in calls if not str(call.get("request") or "").startswith("lark document read")
+        ]
+        self.assertEqual(len(mutation_calls), 1)
 
     def test_skill_boundary_blocks_append_when_workflow_requires_replacement(self):
         skill = SkillDefinition(

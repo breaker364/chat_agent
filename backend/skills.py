@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -29,11 +30,16 @@ from .mutation_guard import (
     MutationLedger,
     append_conflicts_with_workflow,
     build_idempotency_key,
+    expected_content_from_manifest,
+    extract_current_content,
+    extract_state_version,
     parse_standardized_remote_command,
 )
 from .mutation_manifest import normalize_command_manifest
 from .runtime_context import current_run_id
 
+
+logger = logging.getLogger(__name__)
 
 _RUN_MUTATION_LEDGERS: dict[str, MutationLedger] = {}
 @dataclass
@@ -558,20 +564,102 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
     if existing is not None:
         return str(existing.result)
 
+    expected_content = expected_content_from_manifest(manifest)
+
+    async def read_back_state() -> tuple[str, dict[str, Any] | None]:
+        """Probe the target state via the generic read operation.
+
+        Returns ("ok", payload), ("failed", None) for a broken read attempt, or
+        ("unavailable", None) when no read-back channel exists for the skill.
+        """
+        if _skill_runner_path(skill) is None:
+            return "unavailable", None
+        read_request = f"{manifest.provider} {manifest.resource} read {manifest.target}".strip()
+        read_params = {
+            name: value
+            for name, value in params.items()
+            if name not in {"request", "manifest", "tool_call_id"}
+        }
+        read_params["request"] = read_request
+        try:
+            raw = await asyncio.to_thread(_execute_skill_runner_sync, skill, read_params, root)
+        except Exception as exc:
+            logger.warning("Mutation read-back failed for %s: %s", read_request, exc)
+            return "failed", None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return "ok", {}
+        return "ok", payload if isinstance(payload, dict) else {}
+
+    if expected_content:
+        precheck_status, precheck_state = await read_back_state()
+        if precheck_status == "ok" and extract_current_content(precheck_state or {}) == expected_content:
+            satisfied = {
+                "status": "already_satisfied",
+                "action_id": key,
+                "message": "Target already matches the expected content; dispatch skipped.",
+            }
+            ledger.record_success(
+                key,
+                manifest,
+                json.dumps(satisfied, ensure_ascii=False),
+                after_version=extract_state_version(precheck_state or {}),
+                verified=True,
+            )
+            return json.dumps(satisfied, ensure_ascii=False, indent=2)
+
     result = await dispatch()
     if _skill_result_indicates_failure(result):
         return result
+
     try:
         audit = json.loads(result)
     except (TypeError, json.JSONDecodeError):
         audit = {}
+    audit_payload = audit if isinstance(audit, dict) else {}
+
+    after_version = str(audit_payload.get("after_version") or "") or extract_state_version(audit_payload)
+    read_status, probe_state = await read_back_state()
+    verified = False
+    verification = "unverified"
+    if read_status == "failed":
+        verification = "verification_failed"
+    elif read_status == "ok":
+        probe_state = probe_state or {}
+        read_version = extract_state_version(probe_state)
+        read_content = extract_current_content(probe_state)
+        if after_version and read_version:
+            verified = read_version == after_version
+            verification = "verified" if verified else "verification_failed"
+        elif expected_content and read_content:
+            verified = read_content == expected_content
+            verification = "verified" if verified else "verification_failed"
+
+    if verification == "verification_failed":
+        failure_payload = {
+            "status": "verification_failed",
+            "action_id": key,
+            "error_category": "business_rejected",
+            "retryable": False,
+            "message": "Mutation dispatched but the read-back could not confirm the expected result.",
+            "dispatch_result": result if isinstance(result, str) else str(result),
+        }
+        logger.warning("Mutation verification failed; key %s is not recorded as success.", key)
+        return json.dumps(failure_payload, ensure_ascii=False, indent=2)
+
+    if audit_payload:
+        audit_payload.setdefault("action_id", key)
+        audit_payload["verified"] = verified
+        audit_payload["verification"] = verification
+        result = json.dumps(audit_payload, ensure_ascii=False, indent=2)
     ledger.record_success(
         key,
         manifest,
         result,
-        before_version=str(audit.get("before_version") or "") if isinstance(audit, dict) else "",
-        after_version=str(audit.get("after_version") or "") if isinstance(audit, dict) else "",
-        verified=bool(audit.get("verified", False)) if isinstance(audit, dict) else False,
+        before_version=str(audit_payload.get("before_version") or ""),
+        after_version=str(audit_payload.get("after_version") or after_version),
+        verified=verified,
     )
     return result
 
