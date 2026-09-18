@@ -472,11 +472,17 @@ async def _compact_history_if_needed(
         source_items = merge_items or partition.eligible_items
 
         def generate_summary() -> Any:
+            summary_max_tokens = int(settings.get("summary_max_output_tokens", 4_096))
+            draft_max_tokens = (
+                int(settings.get("summary_draft_max_tokens", 2_048))
+                if settings.get("summary_draft_enabled", True)
+                else 0
+            )
             llm = create_chat_deepseek(
                 model_config,
                 temperature=0.0,
                 streaming=False,
-                max_tokens=int(settings.get("summary_max_output_tokens", 4_096)),
+                max_tokens=summary_max_tokens + draft_max_tokens,
             )
             return compact_history_with_llm(
                 llm,

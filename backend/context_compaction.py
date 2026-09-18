@@ -16,14 +16,19 @@ from .token_counter import count_text_tokens
 
 
 COMPACTION_SCHEMA_VERSION = 1
-COMPACTION_PROMPT_VERSION = "context-compaction-v1"
+COMPACTION_PROMPT_VERSION = "context-compaction-v2"
 COMPACTION_SUMMARY_SECTIONS = (
-    "## Facts and conclusions",
+    "## Primary request and intent",
+    "## User messages",
     "## Files and artifacts",
+    "## Errors and fixes",
     "## Unfinished items",
     "## Tool evidence",
 )
 COMPACTION_LEDGER_HEADER = "## Exact literal ledger"
+COMPACTION_CUSTOM_INSTRUCTIONS_MAX_CHARS = 2_000
+
+_ANALYSIS_BLOCK_RE = re.compile(r"<analysis>.*?</analysis>", re.DOTALL)
 
 _URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 _DATE_RE = re.compile(r"(?<![\w])\d{4}[-/]\d{1,2}[-/]\d{1,2}(?![\w])")
@@ -345,17 +350,43 @@ def chunk_history_items(
     return chunks
 
 
+def strip_analysis_draft(response: str) -> str:
+    """Drop the <analysis> draft block; validate and keep only the final summary."""
+    text = (response or "").strip()
+    if "<analysis>" not in text:
+        return text
+    closing = text.rfind("</analysis>")
+    if closing < 0:
+        return text
+    return text[closing + len("</analysis>"):].strip()
+
+
+# Backwards-compatible private alias used by tests.
+_strip_analysis_draft = strip_analysis_draft
+
+
 def build_summary_prompt(
     history_items: Iterable[dict[str, Any]],
     literals: Iterable[str],
     *,
     existing_summary: str = "",
+    custom_instructions: str = "",
 ) -> list[Any]:
     literal_text = "\n".join(f"- {literal}" for literal in literals) or "- none"
     merge_text = (
         "An earlier validated summary is included below. Preserve its facts and merge the new source.\n"
         f"EARLIER_SUMMARY_BEGIN\n{existing_summary}\nEARLIER_SUMMARY_END\n"
         if existing_summary
+        else ""
+    )
+    instructions = (custom_instructions or "").strip()
+    instructions = instructions[:COMPACTION_CUSTOM_INSTRUCTIONS_MAX_CHARS]
+    instructions_text = (
+        "Follow these operator-provided summarization instructions:\n"
+        "COMPACTION_INSTRUCTIONS_BEGIN\n"
+        f"{instructions}\n"
+        "COMPACTION_INSTRUCTIONS_END\n"
+        if instructions
         else ""
     )
     system_text = (
@@ -369,6 +400,11 @@ def build_summary_prompt(
     )
     user_text = (
         f"{merge_text}"
+        f"{instructions_text}"
+        "First review the source chronologically inside an <analysis> block: list user messages, "
+        "files and artifacts touched, errors and their fixes, and unfinished work. The analysis "
+        "draft is discarded and never validated. After the closing </analysis> tag, output the "
+        "final summary containing exactly the required sections.\n"
         "Required exact literals (copy verbatim):\n"
         f"{literal_text}\n\n"
         "HISTORICAL_CONTEXT_BEGIN\n"
@@ -442,6 +478,8 @@ def compact_history_with_llm(
         int(options.get("merge_target_tokens", min(target_tokens * 2, max_output_tokens))),
     )
     max_retries = max(0, int(options.get("max_retries", 1)))
+    draft_enabled = bool(options.get("summary_draft_enabled", True))
+    custom_instructions = str(options.get("custom_instructions", "") or "")
     source_items = [copy.deepcopy(item) for item in history_items if isinstance(item, dict)]
     literals = extract_exact_literals(source_items)
     chunks = chunk_history_items(source_items, target_tokens=target_tokens)
@@ -457,8 +495,18 @@ def compact_history_with_llm(
         for attempt in range(max_retries + 1):
             try:
                 model_calls += 1
-                raw = _response_text(llm.invoke(build_summary_prompt(items, chunk_literals, existing_summary=prior_summary)))
-                return validate_summary_text(raw, chunk_literals, max_output_tokens=max_output_tokens)
+                raw = _response_text(
+                    llm.invoke(
+                        build_summary_prompt(
+                            items,
+                            chunk_literals,
+                            existing_summary=prior_summary,
+                            custom_instructions=custom_instructions,
+                        )
+                    )
+                )
+                response_text = strip_analysis_draft(raw) if draft_enabled else raw
+                return validate_summary_text(response_text, chunk_literals, max_output_tokens=max_output_tokens)
             except ContextCompactionError as exc:
                 last_error = exc
                 if attempt >= max_retries:

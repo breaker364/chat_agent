@@ -278,6 +278,9 @@ DEFAULT_CONTEXT_COMPACTION_CONFIG: dict[str, Any] = {
     "chunk_target_tokens": 12_000,
     "merge_target_tokens": 12_000,
     "max_retries": 1,
+    "custom_instructions": "",
+    "summary_draft_enabled": True,
+    "summary_draft_max_tokens": 2_048,
 }
 
 
@@ -373,6 +376,14 @@ def load_context_compaction_config(config_path: str | Path | None = None) -> dic
     enabled = raw.get("enabled", DEFAULT_CONTEXT_COMPACTION_CONFIG["enabled"])
     if not isinstance(enabled, bool):
         enabled = bool(DEFAULT_CONTEXT_COMPACTION_CONFIG["enabled"])
+    summary_draft_enabled = raw.get(
+        "summary_draft_enabled", DEFAULT_CONTEXT_COMPACTION_CONFIG["summary_draft_enabled"]
+    )
+    if not isinstance(summary_draft_enabled, bool):
+        summary_draft_enabled = bool(DEFAULT_CONTEXT_COMPACTION_CONFIG["summary_draft_enabled"])
+    custom_instructions = raw.get("custom_instructions", DEFAULT_CONTEXT_COMPACTION_CONFIG["custom_instructions"])
+    if not isinstance(custom_instructions, str):
+        custom_instructions = str(DEFAULT_CONTEXT_COMPACTION_CONFIG["custom_instructions"])
     return {
         "enabled": enabled,
         "trigger_remaining_tokens": positive_int("trigger_remaining_tokens"),
@@ -382,6 +393,9 @@ def load_context_compaction_config(config_path: str | Path | None = None) -> dic
         "chunk_target_tokens": positive_int("chunk_target_tokens"),
         "merge_target_tokens": positive_int("merge_target_tokens"),
         "max_retries": positive_int("max_retries", allow_zero=True),
+        "custom_instructions": custom_instructions,
+        "summary_draft_enabled": summary_draft_enabled,
+        "summary_draft_max_tokens": positive_int("summary_draft_max_tokens"),
     }
 
 

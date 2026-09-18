@@ -14,6 +14,7 @@ from backend.context_compaction import (
     ContextCompactionError,
     append_literal_ledger,
     build_compaction_cache,
+    build_summary_prompt,
     canonical_history_fingerprint,
     chunk_history_items,
     compact_history_with_llm,
@@ -22,6 +23,7 @@ from backend.context_compaction import (
     is_compaction_cache_usable,
     should_compact_context,
     validate_summary_text,
+    _strip_analysis_draft,
 )
 from backend.session_store import SessionStore
 
@@ -78,14 +80,18 @@ class _MemoryCompactionStore:
 def _summary(literals):
     literal_text = ", ".join(literals)
     return (
-        "## Facts and conclusions\n"
-        f"Historical facts: {literal_text}\n\n"
+        "## Primary request and intent\n"
+        f"The user requested work involving: {literal_text}\n\n"
+        "## User messages\n"
+        f"Recorded user messages: {literal_text}\n\n"
         "## Files and artifacts\n"
         f"Referenced artifacts: {literal_text}\n\n"
+        "## Errors and fixes\n"
+        "No errors recorded.\n\n"
         "## Unfinished items\n"
         "No unfinished items recorded.\n\n"
         "## Tool evidence\n"
-        f"Evidence literals: {literal_text}"
+        f"Evidence literals: {literal_text}".rstrip()
     )
 
 
@@ -705,7 +711,7 @@ class ContextCompactionAgentIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(agent.calls), 1)
         message_text = "\n".join(str(message.content) for message in agent.calls[0])
-        self.assertIn("Facts and conclusions", message_text)
+        self.assertIn("Primary request and intent", message_text)
         self.assertNotIn("old answer", message_text)
         self.assertIn("recent request 1", message_text)
         self.assertIn("recent request 3", message_text)
@@ -823,6 +829,239 @@ class ContextCompactionAgentIntegrationTests(unittest.TestCase):
 
         self.assertEqual(summary_llm.calls, [])
         self.assertEqual(len(agent.calls), 1)
+
+
+class ContextCompactionSummaryTemplateV2Tests(unittest.TestCase):
+    def test_summary_sections_expanded_to_six(self):
+        self.assertEqual(
+            COMPACTION_SUMMARY_SECTIONS,
+            (
+                "## Primary request and intent",
+                "## User messages",
+                "## Files and artifacts",
+                "## Errors and fixes",
+                "## Unfinished items",
+                "## Tool evidence",
+            ),
+        )
+
+    def test_validate_rejects_summary_missing_new_section(self):
+        text = "\n".join(
+            line for line in _summary(["ERR-404"]).splitlines() if line != "## User messages"
+        )
+        with self.assertRaises(ContextCompactionError) as raised:
+            validate_summary_text(text, ["ERR-404"], max_output_tokens=500)
+        self.assertIn("## User messages", str(raised.exception))
+
+    def test_strip_analysis_draft_takes_text_after_block(self):
+        body = _summary([])
+        raw = f"<analysis>\ntimeline scan notes\n</analysis>\n\n{body}"
+
+        self.assertEqual(_strip_analysis_draft(raw), body)
+
+    def test_strip_analysis_draft_passthrough_without_block(self):
+        body = _summary([])
+
+        self.assertEqual(_strip_analysis_draft(body), body)
+        self.assertEqual(_strip_analysis_draft(f"  {body}\n"), body)
+
+    def test_strip_analysis_draft_keeps_unterminated_block_as_is(self):
+        raw = "<analysis>\nunfinished draft without closing tag"
+
+        self.assertEqual(_strip_analysis_draft(raw), raw)
+
+    def test_build_summary_prompt_includes_custom_instructions_block(self):
+        messages = build_summary_prompt([], [], custom_instructions="Always preserve table structures.")
+        user_text = str(messages[-1].content)
+
+        self.assertIn("COMPACTION_INSTRUCTIONS_BEGIN", user_text)
+        self.assertIn("Always preserve table structures.", user_text)
+        self.assertIn("COMPACTION_INSTRUCTIONS_END", user_text)
+
+    def test_build_summary_prompt_has_no_custom_block_by_default(self):
+        messages = build_summary_prompt([], [])
+
+        self.assertNotIn("COMPACTION_INSTRUCTIONS_BEGIN", str(messages[-1].content))
+
+    def test_build_summary_prompt_truncates_custom_instructions(self):
+        long_instructions = "x" * 2500 + "TAIL-MARKER"
+
+        messages = build_summary_prompt([], [], custom_instructions=long_instructions)
+
+        user_text = str(messages[-1].content)
+        self.assertIn("x" * 2000, user_text)
+        self.assertNotIn("TAIL-MARKER", user_text)
+
+    def test_build_summary_prompt_requires_analysis_draft(self):
+        messages = build_summary_prompt([], [])
+
+        self.assertIn("<analysis>", str(messages[0].content) + str(messages[-1].content))
+
+    def test_v1_prompt_version_cache_is_rejected(self):
+        source = [
+            {"role": "user", "content": "old-1"},
+            {"role": "assistant", "content": "answer-1"},
+        ]
+        cache = {
+            "schema_version": 1,
+            "summary_prompt_version": "context-compaction-v1",
+            "model_name": "test-model",
+            "summary": _summary(["old-1"]),
+            "literal_ledger": ["old-1"],
+            "source_fingerprint": canonical_history_fingerprint(source),
+            "covered_item_count": 2,
+            "covered_turn_count": 1,
+            "covered_through_message_index": 0,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        self.assertFalse(is_compaction_cache_usable(cache, source, model_name="test-model"))
+
+    def test_compact_history_strips_analysis_draft_from_model_response(self):
+        source = [
+            {"role": "user", "content": "upgrade to v1.2.3"},
+            {"role": "assistant", "content": "upgraded"},
+        ]
+        llm = _FakeLlm([f"<analysis>\nscan: v1.2.3\n</analysis>\n\n{_summary(['v1.2.3'])}"])
+
+        result = compact_history_with_llm(
+            llm,
+            source,
+            settings={"chunk_target_tokens": 200, "summary_max_output_tokens": 500, "max_retries": 0},
+        )
+
+        self.assertNotIn("<analysis>", result.summary)
+        self.assertIn("## Exact literal ledger", result.summary)
+        self.assertIn("v1.2.3", result.summary)
+
+    def test_compact_history_without_draft_block_still_succeeds(self):
+        source = [
+            {"role": "user", "content": "request one"},
+            {"role": "assistant", "content": "answer one"},
+        ]
+        llm = _FakeLlm([_summary(["answer one"])])
+
+        result = compact_history_with_llm(
+            llm,
+            source,
+            settings={"chunk_target_tokens": 200, "summary_max_output_tokens": 500, "max_retries": 0},
+        )
+
+        self.assertIn("## Primary request and intent", result.summary)
+
+    @patch("backend.config.load_app_config")
+    def test_draft_and_custom_instruction_config_defaults(self, mock_load):
+        mock_load.return_value = {}
+
+        config = load_context_compaction_config()
+
+        self.assertTrue(config["summary_draft_enabled"])
+        self.assertEqual(config["summary_draft_max_tokens"], 2048)
+        self.assertEqual(config["custom_instructions"], "")
+
+    @patch("backend.config.load_app_config")
+    def test_draft_and_custom_instruction_invalid_overrides_fall_back(self, mock_load):
+        mock_load.return_value = {
+            "context_compaction": {
+                "summary_draft_enabled": 1,
+                "summary_draft_max_tokens": "invalid",
+                "custom_instructions": 123,
+            }
+        }
+
+        config = load_context_compaction_config()
+
+        self.assertTrue(config["summary_draft_enabled"])
+        self.assertEqual(config["summary_draft_max_tokens"], 2048)
+        self.assertEqual(config["custom_instructions"], "")
+
+
+class ContextCompactionDraftBudgetTests(unittest.TestCase):
+    def setUp(self):
+        temp_root = Path.cwd() / "tmp" / "unittest"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_path = temp_root / f"{self._testMethodName}-{uuid4().hex}"
+        self.temp_path.mkdir(parents=True, exist_ok=False)
+        self.store = SessionStore(self.temp_path)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_path, ignore_errors=True)
+
+    @staticmethod
+    def _history():
+        history = []
+        for index in range(4):
+            history.extend(
+                [
+                    {"role": "user", "content": "old request" if index == 0 else f"recent request {index}"},
+                    {"role": "assistant", "content": "old answer" if index == 0 else f"recent answer {index}"},
+                ]
+            )
+        return history
+
+    def _run_compaction(self, settings, captured):
+        llm = _FakeLlm([_summary([])])
+
+        def fake_create(_model_config, **kwargs):
+            captured.update(kwargs)
+            return llm
+
+        async def run():
+            return await _compact_history_if_needed(
+                self._history(),
+                session_id="draft-budget-session",
+                model_config={"model": "test-model"},
+                model_context_window=100_000,
+                context_token_estimate=90_000,
+                settings=settings,
+            )
+
+        with patch("backend.agent.SessionStore", return_value=self.store), patch(
+            "backend.agent.create_chat_deepseek", side_effect=fake_create
+        ):
+            return asyncio.run(run())
+
+    def test_generate_summary_llm_max_tokens_includes_draft_budget(self):
+        captured = {}
+
+        effective_history, details = self._run_compaction(
+            {
+                "enabled": True,
+                "trigger_remaining_tokens": 20_000,
+                "retain_recent_turns": 3,
+                "summary_max_output_tokens": 500,
+                "summary_draft_enabled": True,
+                "summary_draft_max_tokens": 300,
+                "chunk_target_tokens": 500,
+                "max_retries": 0,
+            },
+            captured,
+        )
+
+        self.assertTrue(details["triggered"])
+        self.assertEqual(captured.get("max_tokens"), 800)
+        self.assertEqual(effective_history[0]["role"], "context_summary")
+
+    def test_generate_summary_llm_max_tokens_without_draft(self):
+        captured = {}
+
+        _, details = self._run_compaction(
+            {
+                "enabled": True,
+                "trigger_remaining_tokens": 20_000,
+                "retain_recent_turns": 3,
+                "summary_max_output_tokens": 500,
+                "summary_draft_enabled": False,
+                "summary_draft_max_tokens": 300,
+                "chunk_target_tokens": 500,
+                "max_retries": 0,
+            },
+            captured,
+        )
+
+        self.assertTrue(details["triggered"])
+        self.assertEqual(captured.get("max_tokens"), 500)
 
 
 if __name__ == "__main__":
