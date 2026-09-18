@@ -26,6 +26,10 @@ from .agentic_research.runtime import (
     build_agentic_research_runtime,
     build_research_planner_tool,
 )
+from .context_attachments import (
+    build_context_attachments,
+    collect_attachment_sources,
+)
 from .context_compaction import (
     ContextCompactionError,
     build_compaction_cache,
@@ -324,6 +328,7 @@ def _history_entry_text(entry: dict[str, Any]) -> str:
         "malformed_tool_result",
         "historical_tool_context",
         "context_summary",
+        "context_attachment",
     }:
         return json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
     return str(entry.get("content") or "")
@@ -389,6 +394,7 @@ async def _compact_history_if_needed(
     retain_recent_turns = int(settings.get("retain_recent_turns", 3))
     partition = partition_history(source_history, retain_recent_turns=retain_recent_turns)
     old_turn_count = max(0, len(partition.completed_turns) - retain_recent_turns)
+    empty_attachment_counts: dict[str, int] = {"file": 0, "skill": 0, "subagent": 0}
     details: dict[str, Any] = {
         "triggered": False,
         "cache_hit": False,
@@ -403,7 +409,28 @@ async def _compact_history_if_needed(
             else None
         ),
         "model_calls": 0,
+        "attachment_counts": dict(empty_attachment_counts),
+        "attachment_tokens": 0,
+        "attachment_skipped": 0,
     }
+
+    def _build_attachments() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if not settings.get("attachments_enabled", True):
+            return [], {"counts": dict(empty_attachment_counts), "tokens": 0, "skipped": []}
+        try:
+            sources = collect_attachment_sources(partition.eligible_items)
+            return build_context_attachments(
+                sources,
+                workspace_root=workspace_root or Path.cwd(),
+                settings=settings,
+            )
+        except Exception as exc:
+            # Attachments are a safety net; never fail the request over them.
+            return [], {
+                "counts": dict(empty_attachment_counts),
+                "tokens": 0,
+                "skipped": [f"attachment build failed: {exc}"],
+            }
     if not settings.get("enabled", True):
         details["skip_reason"] = "disabled"
         return source_history, details
@@ -449,10 +476,14 @@ async def _compact_history_if_needed(
             covered_count = int(cache.get("covered_item_count", 0))
             cached_summary = str(cache.get("summary") or "")
             if covered_count == len(partition.eligible_items):
+                attachment_items, attachment_details = _build_attachments()
                 details["triggered"] = True
                 details["cache_hit"] = True
                 details["summary"] = cached_summary
                 details["source_fingerprint"] = current_fingerprint
+                details["attachment_counts"] = attachment_details["counts"]
+                details["attachment_tokens"] = attachment_details["tokens"]
+                details["attachment_skipped"] = len(attachment_details.get("skipped") or [])
                 return [
                     {
                         "role": "context_summary",
@@ -461,6 +492,7 @@ async def _compact_history_if_needed(
                         "source_fingerprint": current_fingerprint,
                         "covered_turn_count": old_turn_count,
                     },
+                    *attachment_items,
                     *partition.protected_items,
                 ], details
             if covered_count < len(partition.eligible_items):
@@ -525,6 +557,10 @@ async def _compact_history_if_needed(
                 code="context_compaction_failed",
             ) from exc
         details["summary"] = result.summary
+        attachment_items, attachment_details = _build_attachments()
+        details["attachment_counts"] = attachment_details["counts"]
+        details["attachment_tokens"] = attachment_details["tokens"]
+        details["attachment_skipped"] = len(attachment_details.get("skipped") or [])
         return [
             {
                 "role": "context_summary",
@@ -533,6 +569,7 @@ async def _compact_history_if_needed(
                 "source_fingerprint": current_fingerprint,
                 "covered_turn_count": old_turn_count,
             },
+            *attachment_items,
             *partition.protected_items,
         ], details
 
@@ -612,7 +649,7 @@ def _append_native_history_messages(messages: list[BaseMessage], history_items: 
                     name=str(entry.get("name") or "tool"),
                 )
             )
-        elif role in {"historical_tool_context", "context_summary"}:
+        elif role in {"historical_tool_context", "context_summary", "context_attachment"}:
             messages.append(AIMessage(content=str(entry.get("content") or "")))
         elif role in {"legacy_tool_result", "malformed_tool_result"}:
             # An orphaned legacy result has no valid native call to reference.
@@ -2046,6 +2083,22 @@ async def stream_agent_events(
                     "eligible_turn_count": compaction_details.get("eligible_turn_count", 0),
                     "cache_hit": False,
                     "model_calls": compaction_details.get("model_calls", 0),
+                },
+                ensure_ascii=False,
+            ),
+        }
+    attachment_counts = compaction_details.get("attachment_counts") or {}
+    if any(attachment_counts.values()):
+        yield {
+            "event": "debug",
+            "data": json.dumps(
+                {
+                    "stage": "context_attachments_injected",
+                    "message": "Post-compaction state attachments were re-injected.",
+                    "session_id": session_id,
+                    "counts": attachment_counts,
+                    "tokens": compaction_details.get("attachment_tokens", 0),
+                    "skipped": compaction_details.get("attachment_skipped", 0),
                 },
                 ensure_ascii=False,
             ),

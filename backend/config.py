@@ -281,6 +281,12 @@ DEFAULT_CONTEXT_COMPACTION_CONFIG: dict[str, Any] = {
     "custom_instructions": "",
     "summary_draft_enabled": True,
     "summary_draft_max_tokens": 2_048,
+    "attachments_enabled": True,
+    "attachment_total_tokens": 16_000,
+    "attachment_file_max_tokens": 4_000,
+    "attachment_file_limit": 5,
+    "attachment_skill_max_tokens": 2_000,
+    "attachment_skill_limit": 3,
 }
 
 
@@ -384,6 +390,11 @@ def load_context_compaction_config(config_path: str | Path | None = None) -> dic
     custom_instructions = raw.get("custom_instructions", DEFAULT_CONTEXT_COMPACTION_CONFIG["custom_instructions"])
     if not isinstance(custom_instructions, str):
         custom_instructions = str(DEFAULT_CONTEXT_COMPACTION_CONFIG["custom_instructions"])
+    attachments_enabled = raw.get(
+        "attachments_enabled", DEFAULT_CONTEXT_COMPACTION_CONFIG["attachments_enabled"]
+    )
+    if not isinstance(attachments_enabled, bool):
+        attachments_enabled = bool(DEFAULT_CONTEXT_COMPACTION_CONFIG["attachments_enabled"])
     return {
         "enabled": enabled,
         "trigger_remaining_tokens": positive_int("trigger_remaining_tokens"),
@@ -396,6 +407,12 @@ def load_context_compaction_config(config_path: str | Path | None = None) -> dic
         "custom_instructions": custom_instructions,
         "summary_draft_enabled": summary_draft_enabled,
         "summary_draft_max_tokens": positive_int("summary_draft_max_tokens"),
+        "attachments_enabled": attachments_enabled,
+        "attachment_total_tokens": positive_int("attachment_total_tokens"),
+        "attachment_file_max_tokens": positive_int("attachment_file_max_tokens"),
+        "attachment_file_limit": positive_int("attachment_file_limit"),
+        "attachment_skill_max_tokens": positive_int("attachment_skill_max_tokens"),
+        "attachment_skill_limit": positive_int("attachment_skill_limit"),
     }
 
 

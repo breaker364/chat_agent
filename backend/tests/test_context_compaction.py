@@ -8,7 +8,13 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from backend.config import load_context_compaction_config
-from backend.agent import _compact_history_if_needed, stream_agent_events
+from backend.agent import (
+    _append_native_history_messages,
+    _compact_history_if_needed,
+    _history_entry_text,
+    stream_agent_events,
+)
+from langchain_core.messages import AIMessage
 from backend.context_compaction import (
     COMPACTION_SUMMARY_SECTIONS,
     ContextCompactionError,
@@ -1000,8 +1006,8 @@ class ContextCompactionDraftBudgetTests(unittest.TestCase):
             )
         return history
 
-    def _run_compaction(self, settings, captured):
-        llm = _FakeLlm([_summary([])])
+    def _run_compaction(self, settings, captured, history=None, responses=None):
+        llm = _FakeLlm(responses or [_summary([])])
 
         def fake_create(_model_config, **kwargs):
             captured.update(kwargs)
@@ -1009,7 +1015,7 @@ class ContextCompactionDraftBudgetTests(unittest.TestCase):
 
         async def run():
             return await _compact_history_if_needed(
-                self._history(),
+                history if history is not None else self._history(),
                 session_id="draft-budget-session",
                 model_config={"model": "test-model"},
                 model_context_window=100_000,
@@ -1021,6 +1027,120 @@ class ContextCompactionDraftBudgetTests(unittest.TestCase):
             "backend.agent.create_chat_deepseek", side_effect=fake_create
         ):
             return asyncio.run(run())
+
+    def _write_eligible_file(self):
+        target = self.temp_path / "docs" / "notes.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("alpha line\nbeta line\n", encoding="utf-8")
+        return target.relative_to(Path.cwd()).as_posix()
+
+    @staticmethod
+    def _history_with_file_read(path):
+        history = [
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant_tool_calls",
+                "tool_calls": [
+                    {"name": "read_file", "args": {"path": path}, "id": "t1", "type": "tool_call"}
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read_file",
+                "tool_call_id": "t1",
+                "content": "alpha line\nbeta line\n",
+            },
+            {"role": "assistant", "content": "old answer"},
+        ]
+        for index in range(1, 4):
+            history.extend(
+                [
+                    {"role": "user", "content": f"recent request {index}"},
+                    {"role": "assistant", "content": f"recent answer {index}"},
+                ]
+            )
+        return history
+
+    @staticmethod
+    def _attachment_settings(**overrides):
+        settings = {
+            "enabled": True,
+            "trigger_remaining_tokens": 20_000,
+            "retain_recent_turns": 3,
+            "summary_max_output_tokens": 500,
+            "summary_draft_enabled": False,
+            "chunk_target_tokens": 500,
+            "max_retries": 0,
+            "attachments_enabled": True,
+            "attachment_total_tokens": 16_000,
+            "attachment_file_max_tokens": 4_000,
+            "attachment_file_limit": 5,
+            "attachment_skill_max_tokens": 2_000,
+            "attachment_skill_limit": 3,
+        }
+        settings.update(overrides)
+        return settings
+
+    def test_compaction_injects_attachment_between_summary_and_protected(self):
+        path = self._write_eligible_file()
+        history = self._history_with_file_read(path)
+        captured = {}
+
+        effective, details = self._run_compaction(
+            self._attachment_settings(),
+            captured,
+            history=history,
+            responses=[_summary([path, "t1"])],
+        )
+
+        self.assertTrue(details["triggered"])
+        self.assertEqual(effective[0]["role"], "context_summary")
+        self.assertEqual(effective[1]["role"], "context_attachment")
+        self.assertEqual(effective[1]["attachment_type"], "file")
+        self.assertIn("alpha line", effective[1]["content"])
+        self.assertEqual(effective[2:], history[4:])
+        self.assertEqual(details["attachment_counts"]["file"], 1)
+        self.assertGreater(details["attachment_tokens"], 0)
+
+    def test_attachments_injected_on_cache_hit_projection(self):
+        path = self._write_eligible_file()
+        history = self._history_with_file_read(path)
+
+        first, first_details = self._run_compaction(
+            self._attachment_settings(),
+            {},
+            history=history,
+            responses=[_summary([path, "t1"])],
+        )
+        second, second_details = self._run_compaction(
+            self._attachment_settings(),
+            {},
+            history=history,
+            responses=[_summary([path, "t1"])],
+        )
+
+        self.assertTrue(first_details["triggered"])
+        self.assertFalse(first_details["cache_hit"])
+        self.assertTrue(second_details["cache_hit"])
+        self.assertEqual(second[0]["role"], "context_summary")
+        self.assertEqual(second[1]["role"], "context_attachment")
+        self.assertEqual(second_details["attachment_counts"]["file"], 1)
+
+    def test_attachments_disabled_keeps_plain_projection(self):
+        path = self._write_eligible_file()
+        history = self._history_with_file_read(path)
+
+        effective, details = self._run_compaction(
+            self._attachment_settings(attachments_enabled=False),
+            {},
+            history=history,
+            responses=[_summary([path, "t1"])],
+        )
+
+        self.assertTrue(details["triggered"])
+        self.assertEqual(effective[1]["role"], "user")
+        self.assertEqual(details["attachment_counts"]["file"], 0)
+        self.assertEqual(details["attachment_tokens"], 0)
 
     def test_generate_summary_llm_max_tokens_includes_draft_budget(self):
         captured = {}
@@ -1062,6 +1182,205 @@ class ContextCompactionDraftBudgetTests(unittest.TestCase):
 
         self.assertTrue(details["triggered"])
         self.assertEqual(captured.get("max_tokens"), 500)
+
+
+class ContextAttachmentReplayTests(unittest.TestCase):
+    @staticmethod
+    def _attachment_item():
+        return {
+            "role": "context_attachment",
+            "attachment_type": "file",
+            "title": "File: docs/notes.txt",
+            "content": "attachment body",
+            "source_ref": "docs/notes.txt",
+            "token_count": 3,
+        }
+
+    def test_history_entry_text_serializes_attachment_as_json(self):
+        parsed = json.loads(_history_entry_text(self._attachment_item()))
+
+        self.assertEqual(parsed["role"], "context_attachment")
+        self.assertEqual(parsed["attachment_type"], "file")
+
+    def test_native_replay_maps_attachment_to_ai_message(self):
+        messages = []
+
+        _append_native_history_messages(messages, [self._attachment_item()])
+
+        self.assertEqual(len(messages), 1)
+        self.assertIsInstance(messages[0], AIMessage)
+        self.assertEqual(messages[0].content, "attachment body")
+
+
+class ContextAttachmentAgentIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        temp_root = Path.cwd() / "tmp" / "unittest"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_path = temp_root / f"{self._testMethodName}-{uuid4().hex}"
+        self.temp_path.mkdir(parents=True, exist_ok=False)
+        target = self.temp_path / "docs" / "notes.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("alpha line\nbeta line\n", encoding="utf-8")
+        self.ws_relative = target.relative_to(Path.cwd()).as_posix()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_path, ignore_errors=True)
+
+    def _history_with_file_read(self):
+        history = [
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant_tool_calls",
+                "tool_calls": [
+                    {
+                        "name": "read_file",
+                        "args": {"path": self.ws_relative},
+                        "id": "t1",
+                        "type": "tool_call",
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read_file",
+                "tool_call_id": "t1",
+                "content": "alpha line\nbeta line\n",
+            },
+            {"role": "assistant", "content": "old answer"},
+        ]
+        for index in range(1, 4):
+            history.extend(
+                [
+                    {"role": "user", "content": f"recent request {index}"},
+                    {"role": "assistant", "content": f"recent answer {index}"},
+                ]
+            )
+        return history
+
+    def _run(self, *, summary_llm, attachments_enabled=True):
+        agent = _CapturingAgent()
+        memory_store = _MemoryCompactionStore()
+        history = self._history_with_file_read()
+        capacity_values = [
+            {
+                "model_context_window": 100_000,
+                "context_token_estimate": 90_001,
+                "remaining_tokens": 9_999,
+                "is_exceeded": False,
+            },
+            {
+                "model_context_window": 100_000,
+                "context_token_estimate": 10_000,
+                "remaining_tokens": 90_000,
+                "is_exceeded": False,
+            },
+        ]
+        context_metrics = [
+            {
+                "history_payloads": [],
+                "protected_tool_chars": 0,
+                "context_char_count": 100,
+                "context_message_count": 10,
+                "context_token_estimate": 90_001,
+            },
+            {
+                "history_payloads": [],
+                "protected_tool_chars": 0,
+                "context_char_count": 100,
+                "context_message_count": 5,
+                "context_token_estimate": 10_000,
+            },
+        ]
+
+        async def consume():
+            return [
+                event
+                async for event in stream_agent_events(
+                    agent,
+                    "current request",
+                    "compaction-integration",
+                    history,
+                )
+            ]
+
+        with patch("backend.agent.SessionStore", return_value=memory_store), patch(
+            "backend.agent.load_llm_config",
+            return_value={"model": "test-model", "base_url": "", "api_key": ""},
+        ), patch(
+            "backend.agent.load_context_compaction_config",
+            return_value={
+                "enabled": True,
+                "trigger_remaining_tokens": 20_000,
+                "retain_recent_turns": 3,
+                "summary_max_output_tokens": 500,
+                "chunk_target_tokens": 500,
+                "max_retries": 0,
+                "attachments_enabled": attachments_enabled,
+            },
+        ), patch(
+            "backend.agent.check_context_capacity",
+            side_effect=capacity_values,
+        ), patch(
+            "backend.agent._estimate_context_metrics",
+            side_effect=context_metrics,
+        ), patch(
+            "backend.agent.get_skill_catalog_text",
+            return_value="",
+        ), patch(
+            "backend.agent.create_chat_deepseek",
+            return_value=summary_llm,
+        ):
+            events = asyncio.run(consume())
+        return agent, memory_store, events
+
+    @staticmethod
+    def _stages(events):
+        return [
+            json.loads(event["data"]).get("stage")
+            for event in events
+            if event.get("event") == "debug"
+        ]
+
+    def test_stream_injects_attachment_between_summary_and_recent(self):
+        summary_llm = _FakeLlm([_summary([self.ws_relative, "t1"])])
+
+        agent, _, events = self._run(summary_llm=summary_llm)
+
+        self.assertEqual(len(agent.calls), 1)
+        contents = [str(message.content) for message in agent.calls[0]]
+        self.assertIn("[Context attachment] File:", "\n".join(contents))
+        index_summary = next(
+            index for index, text in enumerate(contents) if "Recorded user messages" in text
+        )
+        index_attachment = next(
+            index for index, text in enumerate(contents) if "[Context attachment] File:" in text
+        )
+        index_recent = next(
+            index for index, text in enumerate(contents) if "recent request 3" in text
+        )
+        self.assertLess(index_summary, index_attachment)
+        self.assertLess(index_attachment, index_recent)
+        stages = self._stages(events)
+        self.assertIn("context_attachments_injected", stages)
+        payload = json.loads(
+            next(
+                event
+                for event in events
+                if event.get("event") == "debug"
+                and json.loads(event["data"]).get("stage") == "context_attachments_injected"
+            )["data"]
+        )
+        self.assertEqual(payload["counts"]["file"], 1)
+        self.assertGreater(payload["tokens"], 0)
+
+    def test_stream_without_attachments_when_disabled(self):
+        summary_llm = _FakeLlm([_summary([self.ws_relative, "t1"])])
+
+        agent, _, events = self._run(summary_llm=summary_llm, attachments_enabled=False)
+
+        contents = [str(message.content) for message in agent.calls[0]]
+        self.assertNotIn("[Context attachment] File:", "\n".join(contents))
+        self.assertNotIn("context_attachments_injected", self._stages(events))
 
 
 if __name__ == "__main__":
