@@ -560,22 +560,30 @@ class MemoryContextProvider:
         enabled: bool,
         max_index_lines: int,
         max_index_bytes: int,
+        jev_read_gate: Any | None = None,
     ) -> None:
         self.store = store
         self.enabled = enabled
         self.max_index_lines = max(1, int(max_index_lines))
         self.max_index_bytes = max(1, int(max_index_bytes))
+        self.jev_read_gate = jev_read_gate
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "MemoryContextProvider":
+    def from_config(
+        cls,
+        config: dict[str, Any],
+        *,
+        jev_read_gate: Any | None = None,
+    ) -> "MemoryContextProvider":
         return cls(
             AgentMemoryStore(Path(str(config["directory"])), config),
             enabled=bool(config.get("enabled", False)),
             max_index_lines=int(config.get("max_index_lines", 200)),
             max_index_bytes=int(config.get("max_index_bytes", 25 * 1024)),
+            jev_read_gate=jev_read_gate,
         )
 
-    def get_context(self) -> str:
+    def get_context(self, user_message: str = "") -> str:
         if not self.enabled or not self.store.index_path.exists():
             return ""
         try:
@@ -604,6 +612,18 @@ class MemoryContextProvider:
             valid_lines.append(expected_line)
             if len(valid_lines) >= self.max_index_lines:
                 break
+        if (
+            self.jev_read_gate is not None
+            and getattr(self.jev_read_gate, "enabled", True)
+            and user_message
+            and len(valid_lines) > int(getattr(self.jev_read_gate, "filter_threshold", 0) or 0)
+        ):
+            try:
+                filtered = self.jev_read_gate.filter(user_message, valid_lines)
+            except Exception:
+                filtered = valid_lines
+            if filtered:
+                valid_lines = filtered
         if not valid_lines:
             return ""
         return (

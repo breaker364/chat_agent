@@ -389,6 +389,8 @@ async def _compact_history_if_needed(
     context_token_estimate: int,
     settings: dict[str, Any],
     workspace_root: Path | None = None,
+    jev_compaction_gate: Any | None = None,
+    jev_gray_zone_tokens: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     source_history = [dict(item) for item in (history or []) if isinstance(item, dict)]
     retain_recent_turns = int(settings.get("retain_recent_turns", 3))
@@ -437,13 +439,34 @@ async def _compact_history_if_needed(
     if model_context_window is None:
         details["skip_reason"] = "unknown_context_window"
         return source_history, details
-    if not should_compact_context(
-        context_token_estimate,
-        model_context_window,
-        int(settings.get("trigger_remaining_tokens", 20_000)),
-    ):
-        details["skip_reason"] = "above_threshold"
-        return source_history, details
+    trigger_remaining = int(settings.get("trigger_remaining_tokens", 20_000))
+    if not should_compact_context(context_token_estimate, model_context_window, trigger_remaining):
+        gray_zone_tokens = max(0, int(jev_gray_zone_tokens or 0))
+        remaining_tokens = model_context_window - context_token_estimate
+        in_gray_zone = (
+            jev_compaction_gate is not None
+            and gray_zone_tokens > 0
+            and trigger_remaining < remaining_tokens <= trigger_remaining + gray_zone_tokens
+        )
+        if not in_gray_zone:
+            details["skip_reason"] = "above_threshold"
+            return source_history, details
+        recent_text = "\n".join(
+            str(item.get("content") or "") for item in partition.protected_items[-6:]
+        )
+        try:
+            verdict = await jev_compaction_gate.holds(recent_text)
+        except Exception:
+            verdict = None
+        details["jev_gray_zone"] = {
+            "probability": round(float(getattr(verdict, "probability", 0.0)), 4),
+            "adopted": bool(getattr(verdict, "adopted", False)),
+            "held": not bool(getattr(verdict, "adopted", False) and getattr(verdict, "probability", 0.0) < 0.5),
+        }
+        if verdict is None or not verdict.adopted or verdict.probability >= 0.5:
+            details["skip_reason"] = "gray_zone_hold"
+            return source_history, details
+        details["skip_reason"] = "gray_zone_compact"
     if not partition.eligible_items:
         details["skip_reason"] = "no_eligible_history"
         return source_history, details
@@ -1743,7 +1766,14 @@ async def stream_agent_events(
     memory_context = ""
     try:
         memory_config = load_agent_memory_config(workspace_dir=Path.cwd())
-        memory_context = MemoryContextProvider.from_config(memory_config).get_context()
+        memory_provider = MemoryContextProvider.from_config(memory_config)
+        try:
+            from .jev_client import memory_read_gate_from_config
+
+            memory_provider.jev_read_gate = memory_read_gate_from_config()
+        except Exception:
+            memory_provider.jev_read_gate = None
+        memory_context = memory_provider.get_context(user_message=message)
     except Exception:
         memory_context = ""
     if memory_context:
@@ -1939,6 +1969,19 @@ async def stream_agent_events(
     model_config = load_llm_config()
     model_name = model_config.get("model", "")
     compaction_settings = load_context_compaction_config()
+    jev_compaction_gate = None
+    jev_gray_zone_tokens = 0
+    try:
+        from .config import load_jev_config as _load_jev_config
+        from .jev_client import compaction_gate_from_config as _compaction_gate_from_config
+
+        jev_compaction_settings = _load_jev_config()["gates"]["compaction"]
+        if jev_compaction_settings["enabled"]:
+            jev_compaction_gate = _compaction_gate_from_config()
+            jev_gray_zone_tokens = int(jev_compaction_settings["gray_zone_tokens"])
+    except Exception:
+        jev_compaction_gate = None
+        jev_gray_zone_tokens = 0
     reserved_output_tokens = int(compaction_settings.get("reserved_output_tokens", 0))
     pre_compaction_metrics = _estimate_context_metrics(
         raw_history,
@@ -1994,6 +2037,8 @@ async def stream_agent_events(
             context_token_estimate=pre_compaction_metrics["context_token_estimate"],
             settings=compaction_settings,
             workspace_root=driver_workspace,
+            jev_compaction_gate=jev_compaction_gate,
+            jev_gray_zone_tokens=jev_gray_zone_tokens,
         )
     except ContextCompactionError as exc:
         yield {

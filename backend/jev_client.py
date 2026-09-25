@@ -712,6 +712,159 @@ def build_skill_suggestion(
         return ""
 
 
+def compaction_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevCompactionGate | None":
+    """Build the compaction gray-zone gate, or None when disabled/unavailable."""
+    config = load_jev_config(config_path, raw=raw)
+    gate_config = config["gates"]["compaction"]
+    if not gate_config["enabled"]:
+        return None
+    client = JevClient.from_config(config_path, raw=raw)
+    if client is None:
+        return None
+    return JevCompactionGate(client, min_probability=float(gate_config["min_probability"]))
+
+
+class JevCompactionGate:
+    """Decide whether recent history still carries unfinished task state.
+
+    ``holds`` returns a GateVerdict whose probability means "unfinished state
+    present". The caller holds compaction when adopted and probability >= the
+    threshold; a gate failure always means hold (keep the legacy timing).
+    """
+
+    enabled = True
+
+    def __init__(self, client: Any, *, min_probability: float = 0.5) -> None:
+        self.client = client
+        self.min_probability = _clamped(min_probability, 0.5)
+        self.question = JevQuestion(
+            name="unfinished_state",
+            kind="noul",
+            instructions=(
+                "Does this recent conversation still carry unfinished task state: "
+                "open questions, results pending verification, or explicit user "
+                "instructions not yet fulfilled? Fully answered exchanges do not count."
+            ),
+        )
+
+    async def holds(self, recent_text: str) -> GateVerdict:
+        import asyncio
+
+        state = str(recent_text or "")[-6000:]
+        started = time.perf_counter()
+        try:
+            response = await asyncio.to_thread(self.client.ask, state, [self.question])
+        except Exception as exc:
+            log_decision(
+                "compaction",
+                state=state,
+                questions=[self.question],
+                response=None,
+                adopted=False,
+                elapsed=time.perf_counter() - started,
+                error=type(exc).__name__,
+            )
+            return GateVerdict(adopted=False, probability=0.0, source="fallback")
+        answer = response.answers.get(self.question.name)
+        probability = float(answer.value) if answer is not None else 0.0
+        adopted = answer is not None and probability >= self.min_probability
+        log_decision(
+            "compaction",
+            state=state,
+            questions=[self.question],
+            response=response,
+            adopted=adopted,
+            elapsed=time.perf_counter() - started,
+        )
+        return GateVerdict(
+            adopted=adopted,
+            probability=probability,
+            source="jev" if adopted else "fallback",
+        )
+
+
+def memory_read_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevMemoryReadGate | None":
+    """Build the memory read filter, or None when disabled/unavailable."""
+    config = load_jev_config(config_path, raw=raw)
+    gate_config = config["gates"]["memory_read"]
+    if not gate_config["enabled"]:
+        return None
+    client = JevClient.from_config(config_path, raw=raw)
+    if client is None:
+        return None
+    return JevMemoryReadGate(
+        client,
+        min_probability=float(gate_config["min_probability"]),
+        filter_threshold=int(gate_config["filter_threshold"]),
+        max_candidates=int(gate_config["max_candidates"]),
+    )
+
+
+class JevMemoryReadGate:
+    """Filter persistent-memory index lines by relevance to the current request.
+
+    Fail-open: any judging failure keeps the line.
+    """
+
+    enabled = True
+    filter_threshold: int
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        min_probability: float = 0.5,
+        filter_threshold: int = 10,
+        max_candidates: int = 40,
+    ) -> None:
+        self.client = client
+        self.min_probability = _clamped(min_probability, 0.5)
+        self.filter_threshold = max(1, int(filter_threshold))
+        self.max_candidates = max(1, int(max_candidates))
+
+    def filter(self, user_message: str, lines: Sequence[str]) -> list[str]:
+        kept: list[str] = []
+        for line in list(lines)[: self.max_candidates]:
+            state = {
+                "user_message": str(user_message or "")[:2000],
+                "memory_entry": str(line)[:1500],
+            }
+            question = JevQuestion(
+                "memory_relevant",
+                "noul",
+                "Is this memory entry relevant background for answering the current user message?",
+            )
+            started = time.perf_counter()
+            try:
+                response = self.client.ask(state, [question])
+            except Exception as exc:
+                log_decision(
+                    "memory_read",
+                    state=state,
+                    questions=[question],
+                    response=None,
+                    adopted=False,
+                    elapsed=time.perf_counter() - started,
+                    error=type(exc).__name__,
+                )
+                kept.append(line)
+                continue
+            answer = response.answers.get(question.name)
+            probability = float(answer.value) if answer is not None else 0.0
+            adopted = answer is not None
+            log_decision(
+                "memory_read",
+                state=state,
+                questions=[question],
+                response=response,
+                adopted=adopted,
+                elapsed=time.perf_counter() - started,
+            )
+            if not adopted or probability >= self.min_probability:
+                kept.append(line)
+        return kept
+
+
 def log_decision(
     access_point: str,
     *,
