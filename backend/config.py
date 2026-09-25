@@ -416,6 +416,99 @@ def load_context_compaction_config(config_path: str | Path | None = None) -> dic
     }
 
 
+DEFAULT_JEV_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "mode": "off",
+    "base_url": "https://api.typesafe.ai",
+    "api_key_env": "TYPESAFE_API_KEY",
+    "model": "jev-1.13.0",
+    "timeout_seconds": 2.0,
+    "mock_answers": {},
+    "gates": {
+        "routing": {"enabled": False, "min_confidence": 0.6},
+        "evidence": {"enabled": False, "min_confidence": 0.6},
+        "skill": {"enabled": False, "min_confidence": 0.7},
+        "rag": {
+            "enabled": False,
+            "max_passages": 6,
+            "min_relevance": 0.45,
+            "min_contradiction": 0.70,
+            "min_injection": 0.70,
+            "cache_max_entries": 512,
+        },
+        "memory_write": {"enabled": False, "min_probability": 0.5},
+        "memory_read": {
+            "enabled": False,
+            "filter_threshold": 10,
+            "min_probability": 0.5,
+            "max_candidates": 40,
+        },
+        "compaction": {"enabled": False, "gray_zone_tokens": 25_000, "min_probability": 0.5},
+    },
+}
+
+
+def load_jev_config(config_path: str | Path | None = None, *, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Load Jev decision-gateway settings with safe, all-disabled defaults.
+
+    Every gate degrades to its caller's original code path unless explicitly
+    enabled in the ``jev`` config section.
+    """
+    data = raw if isinstance(raw, dict) else load_app_config(config_path)
+    section = data.get("jev")
+    section = section if isinstance(section, dict) else {}
+
+    def gate(key: str) -> dict[str, Any]:
+        merged = dict(DEFAULT_JEV_CONFIG["gates"][key])
+        configured = section.get("gates")
+        configured = configured if isinstance(configured, dict) else {}
+        overrides = configured.get(key)
+        overrides = overrides if isinstance(overrides, dict) else {}
+        for name, default in merged.items():
+            value = overrides.get(name, default)
+            if isinstance(default, bool):
+                merged[name] = value if isinstance(value, bool) else default
+            elif isinstance(default, int):
+                if isinstance(value, int) and not isinstance(value, bool):
+                    merged[name] = max(1, value)
+                else:
+                    merged[name] = default
+            elif isinstance(default, float):
+                try:
+                    merged[name] = min(1.0, max(0.0, float(value)))
+                except (TypeError, ValueError):
+                    merged[name] = default
+        return merged
+
+    enabled = section.get("enabled", DEFAULT_JEV_CONFIG["enabled"])
+    if not isinstance(enabled, bool):
+        enabled = bool(DEFAULT_JEV_CONFIG["enabled"])
+
+    mode = str(section.get("mode", DEFAULT_JEV_CONFIG["mode"]) or "").strip().lower()
+    if mode not in {"live", "mock", "off"}:
+        mode = str(DEFAULT_JEV_CONFIG["mode"])
+
+    timeout = section.get("timeout_seconds", DEFAULT_JEV_CONFIG["timeout_seconds"])
+    try:
+        timeout = min(30.0, max(0.5, float(timeout)))
+    except (TypeError, ValueError):
+        timeout = float(DEFAULT_JEV_CONFIG["timeout_seconds"])
+
+    mock_answers = section.get("mock_answers", DEFAULT_JEV_CONFIG["mock_answers"])
+    mock_answers = mock_answers if isinstance(mock_answers, dict) else {}
+
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "base_url": str(section.get("base_url") or DEFAULT_JEV_CONFIG["base_url"]).rstrip("/"),
+        "api_key_env": str(section.get("api_key_env") or DEFAULT_JEV_CONFIG["api_key_env"]),
+        "model": str(section.get("model") or DEFAULT_JEV_CONFIG["model"]),
+        "timeout_seconds": timeout,
+        "mock_answers": mock_answers,
+        "gates": {key: gate(key) for key in DEFAULT_JEV_CONFIG["gates"]},
+    }
+
+
 def load_tavily_config(config_path: str | Path | None = None) -> dict[str, str | None]:
     """Load Tavily configuration from env or config JSON."""
     data = load_app_config(config_path)
