@@ -613,6 +613,105 @@ class JevEvidenceGate:
         )
 
 
+def skill_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevSkillGate | None":
+    """Build the skill preselection gate, or None when disabled/unavailable."""
+    config = load_jev_config(config_path, raw=raw)
+    gate_config = config["gates"]["skill"]
+    if not gate_config["enabled"]:
+        return None
+    client = JevClient.from_config(config_path, raw=raw)
+    if client is None:
+        return None
+    return JevSkillGate(client, min_confidence=float(gate_config["min_confidence"]))
+
+
+class JevSkillGate:
+    """Preselect a skill from the installed catalog; advisory only."""
+
+    enabled = True
+
+    def __init__(self, client: Any, *, min_confidence: float = 0.7, max_skills: int = 40) -> None:
+        self.client = client
+        self.min_confidence = _clamped(min_confidence, 0.7)
+        self.max_skills = max(1, int(max_skills))
+
+    def select(self, message: str, catalog_items: Sequence[tuple[str, str]]) -> str:
+        if not catalog_items:
+            return ""
+        criteria = {str(name): str(description or "")[:200] for name, description in list(catalog_items)[: self.max_skills]}
+        question = JevQuestion(
+            "skill",
+            "choice",
+            "Which installed skill, if any, is most relevant to this request?",
+            criteria=criteria,
+        )
+        state = str(message or "")[:4000]
+        started = time.perf_counter()
+        try:
+            response = self.client.ask(state, [question])
+        except Exception as exc:
+            log_decision(
+                "skill",
+                state=state,
+                questions=[question],
+                response=None,
+                adopted=False,
+                elapsed=time.perf_counter() - started,
+                error=type(exc).__name__,
+            )
+            return ""
+        answer = response.answers.get(question.name)
+        selected = str(answer.value) if answer is not None else ""
+        adopted = (
+            answer is not None
+            and selected in criteria
+            and float(answer.confidence) >= self.min_confidence
+        )
+        log_decision(
+            "skill",
+            state=state,
+            questions=[question],
+            response=response,
+            adopted=adopted,
+            elapsed=time.perf_counter() - started,
+        )
+        return selected if adopted else ""
+
+
+def build_skill_suggestion(
+    root: Any,
+    message: str,
+    config_path: Any = None,
+    *,
+    raw: dict[str, Any] | None = None,
+) -> str:
+    """Return an advisory skill hint for the system prompt, or an empty string.
+
+    Never raises: any failure means "no suggestion" and the prompt stays as it
+    would without the gateway.
+    """
+    try:
+        config = load_jev_config(config_path, raw=raw)
+        if not config["gates"]["skill"]["enabled"]:
+            return ""
+        client = JevClient.from_config(config_path, raw=raw)
+        if client is None:
+            return ""
+        from .skills import list_skill_catalog
+
+        items = [(item.name, item.description) for item in list_skill_catalog(root)]
+        gate = JevSkillGate(client, min_confidence=float(config["gates"]["skill"]["min_confidence"]))
+        selected = gate.select(message, items)
+        if not selected:
+            return ""
+        return (
+            f"Skill suggestion: the installed skill '{selected}' appears relevant to this request. "
+            "Read its full detail via the skill detail tool before deciding whether to execute it."
+        )
+    except Exception:
+        return ""
+
+
 def log_decision(
     access_point: str,
     *,

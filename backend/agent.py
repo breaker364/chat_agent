@@ -1762,6 +1762,14 @@ async def stream_agent_events(
                 )
             )
         )
+    try:
+        from .jev_client import build_skill_suggestion
+
+        skill_suggestion = build_skill_suggestion(Path.cwd(), message)
+    except Exception:
+        skill_suggestion = ""
+    if skill_suggestion:
+        messages.append(SystemMessage(content=skill_suggestion))
     resume_context = {}
     try:
         resume_context = SessionStore(driver_workspace).get_resume_context(session_id)
