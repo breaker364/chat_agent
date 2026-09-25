@@ -127,6 +127,22 @@ def _safe_chunk_excerpt(text: str, query: str = "", limit: int = 1200) -> str:
     return _safe_snippet(text, query=query, limit=limit)
 
 
+# (resolved path, mtime_ns, size) -> parsed-content hash. Any byte change
+# moves mtime/size, so the stat signature is a sound cache key; this keeps
+# `list_source_files` from re-reading every source file on each call.
+_SOURCE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _file_content_matches(path: Path, reader: Any, expected_hash: str) -> bool:
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    cached = _SOURCE_HASH_CACHE.get(key)
+    if cached is None:
+        cached = content_hash(reader(path))
+        _SOURCE_HASH_CACHE[key] = cached
+    return cached == expected_hash
+
+
 def _cosine(left: dict[str, float], right: dict[str, float]) -> float:
     if not left or not right:
         return 0.0
@@ -1293,7 +1309,9 @@ class PersonalKnowledgeBase:
                 source_type = manifest.source_type
                 latest_error = manifest.latest_error
                 try:
-                    current_content = content_hash(self._read_supported_file(path)) == manifest.content_hash
+                    current_content = _file_content_matches(
+                        path, self._read_supported_file, manifest.content_hash
+                    )
                     current_signature = manifest.retrieval_signature == self._retrieval_signature()
                     current_vectors = self._document_vectors_current(manifest.doc_id)
                     status = "indexed" if current_content and current_signature and current_vectors else "pending_sync"

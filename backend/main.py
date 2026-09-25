@@ -469,13 +469,18 @@ def _remote_sync_request(body: Any) -> tuple[dict[str, Any] | None, dict[str, An
 @app.get("/knowledge/documents")
 async def list_knowledge_documents(collection: str | None = None) -> JSONResponse:
     kb = _project_knowledge_base()
-    return JSONResponse({"documents": kb.list_documents(collection)})
+    documents = await asyncio.to_thread(kb.list_documents, collection)
+    return JSONResponse({"documents": documents})
 
 
 @app.get("/knowledge/sources")
 async def list_knowledge_sources(collection: str | None = None) -> JSONResponse:
     kb = _project_knowledge_base()
-    return JSONResponse({"sources": kb.list_source_files(collection)})
+    # Re-validating every source file (full content hash) takes seconds on
+    # large stores; keep it off the event loop so startup requests like
+    # /sessions are not queued behind it.
+    sources = await asyncio.to_thread(kb.list_source_files, collection)
+    return JSONResponse({"sources": sources})
 
 
 @app.delete("/knowledge/sources")
@@ -1366,7 +1371,10 @@ async def delete_memory(memory_id: str) -> JSONResponse:
 
 @app.get("/sessions")
 async def list_sessions() -> JSONResponse:
-    return JSONResponse({"sessions": get_session_store().list_sessions()})
+    # File scan + JSON parse run off the event loop; the store can hold
+    # hundreds of megabytes of session files.
+    sessions = await asyncio.to_thread(get_session_store().list_sessions)
+    return JSONResponse({"sessions": sessions})
 
 
 @app.get("/subagents")

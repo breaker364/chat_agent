@@ -449,6 +449,10 @@ class SessionStore:
         session_dir = str(get_runtime_value("paths", "session_dir", "sessionss") or "sessionss")
         self.sessions_dir = self.root / session_dir
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # path -> ((mtime_ns, size), slim summary). list_sessions re-parses a
+        # session file only when its stat signature changes; the store grows
+        # unboundedly, so re-reading every file per request is quadratic.
+        self._list_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
     def session_path(self, session_id: str) -> Path:
         return self.session_dir_path(session_id) / "session.json"
@@ -526,31 +530,62 @@ class SessionStore:
         for path in sorted(candidate_paths, key=lambda item: item.stat().st_mtime, reverse=True):
             if self._is_reserved_session_file(path) or self._is_archived_session_file(path):
                 continue
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            summary = self._session_summary(path)
+            if summary is None:
                 continue
-            if not self._looks_like_chat_session(data):
+            if self._is_empty_default_placeholder_summary(summary):
                 continue
-            if self._is_empty_default_placeholder_session(data):
-                continue
-            session_id = data.get("session_id", path.stem)
+            session_id = summary.get("session_id", path.stem)
             if session_id in seen_session_ids:
                 continue
             seen_session_ids.add(session_id)
-            sessions.append(
-                {
-                    "session_id": session_id,
-                    "title": data.get("title", path.stem),
-                    "created_at": data.get("created_at"),
-                    "updated_at": data.get("updated_at"),
-                    "message_count": len(data.get("messages", [])),
-                    "task_progress": data.get("task_progress", {}),
-                    "subagent_tasks": data.get("subagent_tasks", []),
-                    "subagent_notifications": data.get("subagent_notifications", []),
-                }
-            )
+            sessions.append(summary)
         return sessions
+
+    def _session_summary(self, path: Path) -> dict[str, Any] | None:
+        """Parse a session file into the slim list payload, cached by stat.
+
+        The sidebar only needs identity, timestamps, message count, and the
+        run status. Full task_progress blobs (execution summaries, task
+        outputs, script stages) stay out of the list response; the detail
+        endpoint serves them.
+        """
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+        cached = self._list_cache.get(str(path))
+        if cached and cached[0] == signature:
+            return cached[1]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self._list_cache.pop(str(path), None)
+            return None
+        if not self._looks_like_chat_session(data):
+            self._list_cache.pop(str(path), None)
+            return None
+        progress = data.get("task_progress") or {}
+        summary = {
+            "session_id": data.get("session_id", path.stem),
+            "title": data.get("title", path.stem),
+            "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
+            "message_count": len(data.get("messages", [])),
+            "task_progress": {
+                "status": progress.get("status", "idle") if isinstance(progress, dict) else "idle",
+                "message": progress.get("message", "") if isinstance(progress, dict) else "",
+            },
+        }
+        self._list_cache[str(path)] = (signature, summary)
+        return summary
+
+    def _is_empty_default_placeholder_summary(self, summary: dict[str, Any]) -> bool:
+        return (
+            not summary.get("message_count")
+            and str(summary.get("title") or "").strip() == "New Session"
+        )
 
     def load_session(self, session_id: str) -> dict[str, Any] | None:
         path = self.session_path(session_id)
