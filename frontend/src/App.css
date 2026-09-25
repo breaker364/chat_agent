@@ -3649,6 +3649,20 @@ input:focus-visible {
   text-align: center;
 }
 
+.session-retry-btn {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.session-retry-btn:hover {
+  color: var(--text-secondary);
+  text-decoration: underline;
+}
+
 /* ============================================================
    Dialog primitives
    ============================================================ */

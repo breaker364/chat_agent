@@ -714,6 +714,8 @@ function SessionSidebar({
   onCreate,
   onRename,
   onDelete,
+  loadState = "ready",
+  onRetryLoad,
 }) {
   const [query, setQuery] = useState("");
   const normalizedQuery = query.trim().toLowerCase();
@@ -785,6 +787,12 @@ function SessionSidebar({
                   ))}
                 </div>
               ))
+            ) : loadState === "loading" ? (
+              <div className="session-empty">正在加载会话…</div>
+            ) : loadState === "error" ? (
+              <button type="button" className="session-empty session-retry-btn" onClick={onRetryLoad}>
+                会话加载失败,点击重试
+              </button>
             ) : (
               <div className="session-empty">没有匹配的会话。</div>
             )}
@@ -1985,6 +1993,10 @@ function ThemeToggle({ value, onChange }) {
 
 export default function App() {
   const [sessions, setSessions] = useState([]);
+  // "loading" until the first /sessions fetch resolves; "error" when every
+  // bootstrap retry failed. Keeps the sidebar from claiming "no sessions"
+  // while the backend is still starting up.
+  const [sessionListState, setSessionListState] = useState("loading");
   const [activeSessionId, setActiveSessionId] = useState("");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -2311,6 +2323,7 @@ export default function App() {
       const data = await resp.json();
       const nextSessions = data.sessions || [];
       setSessions(nextSessions);
+      setSessionListState("ready");
       return nextSessions;
     } catch {
       return null;
@@ -2450,46 +2463,61 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [activeSessionId, refreshActiveSession]);
 
-  useEffect(() => {
+  const bootstrapSessionData = useCallback(async () => {
+    // Feishu status and the session list run in parallel; the session fetch
+    // retries with backoff so a backend restart window (uvicorn cold start)
+    // no longer strands the page on the welcome screen until a manual reload.
     let cancelled = false;
-    (async () => {
-      try {
-        await refreshFeishuStatus();
-        const sessionList = await refreshSessions();
-        if (cancelled) return;
-        if (sessionList?.length) {
-          const rememberedSessionId = readLastSessionId();
-          const matchedSession = rememberedSessionId
-            ? sessionList.find((session) => session.session_id === rememberedSessionId)
-            : null;
-          await loadSession((matchedSession || sessionList[0]).session_id, { scrollToBottom: true });
-        } else {
-          const sessionId = makeSessionId();
-          setActiveSessionId(sessionId);
-          activeSessionIdRef.current = sessionId;
-          writeLastSessionId(sessionId);
-          setMessages([]);
-          setSessions((prev) => replaceDraftSession(prev, sessionId));
-        }
-      } catch {
-        const fallbackSessions = await refreshSessions();
-        if (cancelled) return;
-        if (fallbackSessions?.length) {
-          await loadSession(fallbackSessions[0].session_id, { scrollToBottom: true });
-          return;
-        }
-        const sessionId = makeSessionId();
-        setActiveSessionId(sessionId);
-        activeSessionIdRef.current = sessionId;
-        writeLastSessionId(sessionId);
-        setMessages([]);
-        setSessions((prev) => prev);
+    const loadSessionListWithRetry = async () => {
+      const backoffs = [0, 500, 1000, 2000, 4000, 8000];
+      let list = null;
+      for (const delay of backoffs) {
+        if (cancelled) return null;
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        list = await refreshSessions();
+        if (list) return list;
       }
-    })();
+      return null;
+    };
+    const [, sessionList] = await Promise.all([refreshFeishuStatus(), loadSessionListWithRetry()]);
+    if (cancelled) return;
+    if (sessionList?.length) {
+      const rememberedSessionId = readLastSessionId();
+      const matchedSession = rememberedSessionId
+        ? sessionList.find((session) => session.session_id === rememberedSessionId)
+        : null;
+      const targetSessionId = (matchedSession || sessionList[0]).session_id;
+      // Set the id before loading so the 3s poll recovers messages on its
+      // own if this first loadSession call fails.
+      setActiveSessionId(targetSessionId);
+      activeSessionIdRef.current = targetSessionId;
+      writeLastSessionId(targetSessionId);
+      await loadSession(targetSessionId, { scrollToBottom: true });
+    } else {
+      if (!sessionList) setSessionListState("error");
+      const sessionId = makeSessionId();
+      setActiveSessionId(sessionId);
+      activeSessionIdRef.current = sessionId;
+      writeLastSessionId(sessionId);
+      setMessages([]);
+      if (sessionList) setSessions((prev) => replaceDraftSession(prev, sessionId));
+    }
     return () => {
       cancelled = true;
     };
   }, [loadSession, refreshFeishuStatus, refreshSessions]);
+
+  useEffect(() => {
+    const cleanupPromise = bootstrapSessionData();
+    return () => {
+      Promise.resolve(cleanupPromise).then((cleanup) => cleanup?.());
+    };
+  }, [bootstrapSessionData]);
+
+  const retrySessionLoad = useCallback(() => {
+    setSessionListState("loading");
+    bootstrapSessionData();
+  }, [bootstrapSessionData]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -3423,6 +3451,8 @@ export default function App() {
         onCreate={handleCreateSession}
         onRename={handleRenameSession}
         onDelete={handleDeleteSession}
+        loadState={sessionListState}
+        onRetryLoad={retrySessionLoad}
       />
       {!sessionSidebarCollapsed ? (
         <ColumnResizer
