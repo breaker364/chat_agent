@@ -54,5 +54,52 @@
     "max_image_bytes": 20971520,
     "max_output_tokens": 2048,
     "timeout_seconds": 60
+  },
+  "jev": {
+    "enabled": false,
+    "mode": "off",
+    "base_url": "https://api.typesafe.ai",
+    "api_key_env": "TYPESAFE_API_KEY",
+    "model": "jev-1.13.0",
+    "timeout_seconds": 2.0,
+    "_privacy_note": "live mode sends user message fragments and retrieved passages to the configured endpoint",
+    "_mode_values": "live | mock | off",
+    "gates": {
+      "routing": {
+        "enabled": false,
+        "min_confidence": 0.6
+      },
+      "evidence": {
+        "enabled": false,
+        "min_confidence": 0.6
+      },
+      "skill": {
+        "enabled": false,
+        "min_confidence": 0.7
+      },
+      "rag": {
+        "enabled": false,
+        "max_passages": 6,
+        "min_relevance": 0.45,
+        "min_contradiction": 0.7,
+        "min_injection": 0.7,
+        "cache_max_entries": 512
+      },
+      "memory_write": {
+        "enabled": false,
+        "min_probability": 0.5
+      },
+      "memory_read": {
+        "enabled": false,
+        "filter_threshold": 10,
+        "min_probability": 0.5,
+        "max_candidates": 40
+      },
+      "compaction": {
+        "enabled": false,
+        "gray_zone_tokens": 25000,
+        "min_probability": 0.5
+      }
+    }
   }
 }
