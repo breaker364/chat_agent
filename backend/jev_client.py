@@ -728,8 +728,10 @@ class JevCompactionGate:
     """Decide whether recent history still carries unfinished task state.
 
     ``holds`` returns a GateVerdict whose probability means "unfinished state
-    present". The caller holds compaction when adopted and probability >= the
-    threshold; a gate failure always means hold (keep the legacy timing).
+    present" (0-1). ``adopted`` is True when the model is confident in EITHER
+    direction (``max(p, 1-p) >= min_probability``); the caller then compacts
+    early on p < 0.5 and holds on p >= 0.5. Unconfident or failed judgments
+    mean hold (keep the legacy timing).
     """
 
     enabled = True
@@ -767,7 +769,7 @@ class JevCompactionGate:
             return GateVerdict(adopted=False, probability=0.0, source="fallback")
         answer = response.answers.get(self.question.name)
         probability = float(answer.value) if answer is not None else 0.0
-        adopted = answer is not None and probability >= self.min_probability
+        adopted = answer is not None and max(probability, 1.0 - probability) >= self.min_probability
         log_decision(
             "compaction",
             state=state,
