@@ -63,6 +63,7 @@ output/feedback/
 skills/pisces-ebom-matcher
 tmp/
 .worktrees/
+.zcode/
 knowledge_base/documents/
 knowledge_base/index/
 knowledge_base/manifests/
