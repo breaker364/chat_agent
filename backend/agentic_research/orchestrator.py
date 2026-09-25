@@ -65,8 +65,9 @@ class ModelResearchPlanner:
 class ModelEvidenceAssessor:
     """Use a configured model only for a schema-bounded evidence decision."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, jev_gate: Any | None = None) -> None:
         self.model = model
+        self.jev_gate = jev_gate
 
     def assess(
         self,
@@ -76,6 +77,11 @@ class ModelEvidenceAssessor:
         next_source_available: bool,
     ) -> EvidenceAssessment:
         from langchain_core.messages import HumanMessage, SystemMessage
+
+        if self.jev_gate is not None:
+            gate_decision = self.jev_gate.assess(message, plan, observations, next_source_available)
+            if gate_decision is not None:
+                return gate_decision
 
         payload = {
             "request": message[:4000],

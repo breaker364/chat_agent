@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import WorkflowConfig
 from .executor_graph import build_executor_graph
+from .jev_client import route_gate_from_config
 from .research_graph import build_research_graph
 from .session_store import SessionStore
 from .workflow_compat import Command
@@ -40,14 +41,19 @@ def _json_object(value: Any) -> dict[str, Any]:
 class ModelRouteAdapter:
     """Restrict model responsibility to a bounded route proposal."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, jev_gate: Any | None = None) -> None:
         self.model = model
+        self.jev_gate = jev_gate
 
     def invoke(self, messages: Sequence[Any]) -> dict[str, Any]:
         request = ""
         if messages:
             last = messages[-1]
             request = str(last.get("content") if isinstance(last, Mapping) else getattr(last, "content", "") or "")
+        if self.jev_gate is not None:
+            proposal = self.jev_gate.propose(request)
+            if proposal is not None:
+                return proposal
         prompt = (
             "Return JSON only. Select workflow mode and generic required capabilities. "
             "Allowed mode values are direct, planned, research, clarify. "
@@ -228,7 +234,7 @@ def build_workflow_runtime(
     executor = build_executor_graph(model=model, tools=tool_map, tool_metadata=metadata)
     research = build_research_graph(research_runtime) if research_runtime is not None else None
     graph = build_workflow_graph(
-        route_model=ModelRouteAdapter(model),
+        route_model=ModelRouteAdapter(model, jev_gate=route_gate_from_config()),
         planner=ModelTaskPlanner(model),
         executor=executor,
         research=research,

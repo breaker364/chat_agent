@@ -10,6 +10,7 @@ from langchain_core.tools import StructuredTool
 
 from .adapters import EvidenceRegistry, KnowledgeEvidenceAdapter, WebEvidenceAdapter, WorkspaceEvidenceAdapter
 from .config import AgenticResearchConfig
+from ..jev_client import evidence_gate_from_config
 from .models import ResearchBudget
 from .orchestrator import (
     AgenticResearchOrchestrator,
@@ -132,7 +133,7 @@ def build_agentic_research_runtime(
     return AgenticResearchRuntime(
         orchestrator=AgenticResearchOrchestrator(
             planner=ModelResearchPlanner(model),
-            assessor=ModelEvidenceAssessor(model),
+            assessor=ModelEvidenceAssessor(model, jev_gate=evidence_gate_from_config()),
             registry=EvidenceRegistry(adapters),
             budget=ResearchBudget(
                 max_route_transitions=config.max_route_transitions,
