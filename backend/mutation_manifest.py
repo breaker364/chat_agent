@@ -116,7 +116,9 @@ def normalize_command_manifest(
     if operation not in _RECOGNIZED_OPERATIONS:
         command_family = f"{provider} {raw_resource}"
         configured_operations = (subcommand_operations or {}).get(command_family, {})
-        operation = str(configured_operations.get(raw_operation) or "")
+        # "*" classifies resource-level commands (e.g. `lark msg <id>`) whose
+        # third token is an argument rather than a subcommand.
+        operation = str(configured_operations.get(raw_operation) or configured_operations.get("*") or "")
     if operation not in _RECOGNIZED_OPERATIONS:
         raise ValueError(f"Command manifest cannot normalize operation: {raw_operation}")
     target = "" if raw_operation == "create" else (parts[3] if len(parts) > 3 and not parts[3].startswith("-") else "")

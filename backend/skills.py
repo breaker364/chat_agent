@@ -313,8 +313,23 @@ def get_skill_catalog_text(root: Path) -> str:
     lines = ["Installed skills catalog:"]
     for item in items:
         lines.append(f"- {item.name}: {item.description} [category={item.category}]")
+        # CLI-backed skills can publish a short command cheat-sheet so the
+        # agent can form correct `use_skill` requests without a detail read.
+        for hint in skill_catalog_command_hints(root, item.name):
+            lines.append(f"  {hint}")
     lines.append("Use the skill details tool only when you decide a skill is needed.")
     return "\n".join(lines)
+
+
+def skill_catalog_command_hints(root: Path, skill_name: str) -> list[str]:
+    """Return the optional `catalog_commands` hints declared by a skill manifest."""
+    skill = get_installed_skill(root, skill_name)
+    if skill is None or not isinstance(skill.manifest_config, dict):
+        return []
+    hints = skill.manifest_config.get("catalog_commands")
+    if not isinstance(hints, list):
+        return []
+    return [str(hint).strip() for hint in hints if str(hint).strip()][:40]
 
 
 def get_skill_detail_text(root: Path, skill_name: str) -> str:
@@ -498,6 +513,24 @@ def _skill_result_indicates_failure(result: Any) -> bool:
     }
 
 
+def _unclassified_command_message(request: str, skill: Any, exc: Exception) -> str:
+    """Build an actionable block message so the agent can self-correct in one retry."""
+    parts = str(request or "").strip().split()
+    family = " ".join(parts[:2]).lower() if len(parts) >= 2 else ""
+    configured: dict = {}
+    if isinstance(skill.manifest_config, dict):
+        configured = skill.manifest_config.get("subcommand_operations") or {}
+    valid = configured.get(family)
+    message = "Unclassified standardized remote command was blocked before dispatch."
+    if isinstance(valid, dict) and valid:
+        message += f" Valid subcommands for '{family}': {', '.join(sorted(valid))}."
+    else:
+        catalog = skill.manifest_config.get("catalog_commands") if isinstance(skill.manifest_config, dict) else None
+        if isinstance(catalog, list) and catalog:
+            message += " Known command families: " + "; ".join(str(c).split(" |")[0] for c in catalog[:8]) + "."
+    return message
+
+
 async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> str:
     from .config import create_chat_deepseek, load_llm_config
 
@@ -518,7 +551,9 @@ async def execute_skill(root: Path, skill_name: str, params: dict[str, Any]) -> 
                 subcommand_operations=subcommand_operations,
             )
         except ValueError as exc:
-            raise ValueError("Unclassified standardized remote command was blocked before dispatch.") from exc
+            raise ValueError(
+                _unclassified_command_message(request, skill, exc)
+            ) from exc
         supplied_manifest = params.get("manifest")
         if supplied_manifest is not None:
             manifest = normalize_command_manifest(supplied_manifest)
