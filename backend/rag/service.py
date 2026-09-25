@@ -174,9 +174,11 @@ class PersonalKnowledgeBase:
         reranker_provider: RerankerProvider | None = None,
         vector_store: Any | None = None,
         remote_provider: RemoteDocumentProvider | None = None,
+        jev_gate: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.store_path = Path(store_path).resolve()
+        self.jev_gate = jev_gate
         if config is None:
             config = load_rag_config(
                 {
@@ -1669,6 +1671,13 @@ class PersonalKnowledgeBase:
                     )
                 )
 
+            gate_conflicts: list[tuple[Any, float]] = []
+            if self.jev_gate is not None and getattr(self.jev_gate, "enabled", True):
+                try:
+                    fused, gate_conflicts = self.jev_gate.apply(query, fused)
+                except Exception:
+                    # Gate failure never removes evidence: keep the original order.
+                    gate_conflicts = []
             fused, adjacent_to = self._expand_with_adjacent_chunks(fused, chunks)
             results = []
             for chunk, fused_score in fused[: max(0, int(top_k))]:
@@ -1706,10 +1715,28 @@ class PersonalKnowledgeBase:
                 if include_scores:
                     item["scores"] = score_payload
                 results.append(item)
+            conflict_results = []
+            for chunk, _conflict_score in gate_conflicts:
+                manifest = self.manifests.get(chunk.doc_id)
+                conflict_results.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "doc_id": chunk.doc_id,
+                        "collection": chunk.collection,
+                        "citation_id": chunk.chunk_id,
+                        "source_ref": chunk.source_ref,
+                        "source_uri": manifest.source_uri if manifest else "",
+                        "title": manifest.title if manifest else chunk.source_ref,
+                        "heading_path": chunk.heading_path,
+                        "excerpt": _safe_chunk_excerpt(chunk.text, query=query),
+                        "conflict": True,
+                    }
+                )
             return {
                 "query": query,
                 "collection": normalized_collection,
                 "results": results,
+                "conflicts": conflict_results,
                 "settings": self._stack_settings(
                     latency_ms=(time.perf_counter() - started) * 1000.0,
                     embedding_active=bool(self.config.vector_backend == "qdrant" and dense),

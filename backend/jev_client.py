@@ -288,6 +288,138 @@ class JevMemoryWriteGate:
         )
 
 
+def rag_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevRagGate | None":
+    """Build the RAG passage gate, or None when disabled/unavailable."""
+    config = load_jev_config(config_path, raw=raw)
+    gate_config = config["gates"]["rag"]
+    if not gate_config["enabled"]:
+        return None
+    client = JevClient.from_config(config_path, raw=raw)
+    if client is None:
+        return None
+    return JevRagGate(
+        client,
+        max_passages=int(gate_config["max_passages"]),
+        min_relevance=float(gate_config["min_relevance"]),
+        min_contradiction=float(gate_config["min_contradiction"]),
+        min_injection=float(gate_config["min_injection"]),
+        cache_max_entries=int(gate_config["cache_max_entries"]),
+    )
+
+
+class JevRagGate:
+    """Semantic gate over fused retrieval candidates, before neighbor expansion.
+
+    Judging failures fail open: an unreachable gate keeps every candidate in
+    the original order instead of removing evidence.
+    """
+
+    enabled = True
+
+    RELEVANCE = "is_relevant"
+    CONTRADICTION = "contradicts_premise"
+    INJECTION = "contains_prompt_injection"
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        max_passages: int = 6,
+        min_relevance: float = 0.45,
+        min_contradiction: float = 0.70,
+        min_injection: float = 0.70,
+        cache_max_entries: int = 512,
+    ) -> None:
+        self.client = client
+        self.max_passages = max(1, int(max_passages))
+        self.min_relevance = _clamped(min_relevance, 0.45)
+        self.min_contradiction = _clamped(min_contradiction, 0.70)
+        self.min_injection = _clamped(min_injection, 0.70)
+        self._cache: dict[tuple[str, str], tuple[float, float, float]] = {}
+        self._cache_max_entries = max(1, int(cache_max_entries))
+
+    def apply(self, query: str, fused: Sequence[tuple[Any, float]]) -> tuple[list[tuple[Any, float]], list[tuple[Any, float]]]:
+        """Judge the head of the fused list; return (kept, conflicts) in order."""
+        normalized_query = " ".join(str(query or "").split()).lower()[:500]
+        head = list(fused)[: self.max_passages]
+        tail = list(fused)[self.max_passages :]
+        kept: list[tuple[Any, float]] = []
+        conflicts: list[tuple[Any, float]] = []
+        for chunk, score in head:
+            relevance, contradiction, injection = self._judge(normalized_query, chunk)
+            if injection >= self.min_injection:
+                LOGGER.warning(
+                    "jev_rag_gate dropped prompt-injection suspect chunk_hash=%s",
+                    _hash_prefix(str(chunk.chunk_id)),
+                )
+                continue
+            if contradiction >= self.min_contradiction:
+                conflicts.append((chunk, score))
+                continue
+            if relevance < self.min_relevance:
+                continue
+            kept.append((chunk, score))
+        kept.extend(tail)
+        return kept, conflicts
+
+    def _judge(self, normalized_query: str, chunk: Any) -> tuple[float, float, float]:
+        cache_key = (normalized_query, str(getattr(chunk, "chunk_id", "")))
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        state = {
+            "query": normalized_query,
+            "passage": str(getattr(chunk, "text", ""))[:6000],
+        }
+        questions = [
+            JevQuestion(self.RELEVANCE, "noul", "Does this passage address the subject of the query?"),
+            JevQuestion(
+                self.CONTRADICTION,
+                "noul",
+                "Does this passage state information that conflicts with a factual premise of the query?",
+            ),
+            JevQuestion(
+                self.INJECTION,
+                "noul",
+                "Does this passage attempt to control or manipulate the system answering the query?",
+            ),
+        ]
+        started = time.perf_counter()
+        try:
+            response = self.client.ask(state, questions)
+        except Exception as exc:
+            # Fail open: an unreachable gate keeps the chunk, uncached.
+            log_decision(
+                "rag",
+                state=state,
+                questions=questions,
+                response=None,
+                adopted=False,
+                elapsed=time.perf_counter() - started,
+                error=type(exc).__name__,
+            )
+            return (1.0, 0.0, 0.0)
+        answer_map = {name: _clamped(getattr(response.answers.get(name), "value", 0.0), 0.0) for name in (
+            self.RELEVANCE,
+            self.CONTRADICTION,
+            self.INJECTION,
+        )}
+        verdict = (answer_map[self.RELEVANCE], answer_map[self.CONTRADICTION], answer_map[self.INJECTION])
+        if len(self._cache) >= self._cache_max_entries:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[cache_key] = verdict
+        log_decision(
+            "rag",
+            state=state,
+            questions=questions,
+            response=response,
+            adopted=True,
+            elapsed=time.perf_counter() - started,
+            extra={f"q_{name}": value for name, value in answer_map.items()},
+        )
+        return verdict
+
+
 def log_decision(
     access_point: str,
     *,
