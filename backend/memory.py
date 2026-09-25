@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Protocol, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -618,6 +618,18 @@ class MemoryContextProvider:
 MemoryActivityCallback = Callable[[str, dict[str, Any]], None]
 
 
+@dataclass(frozen=True)
+class MemoryPrefilterDecision:
+    """Outcome of an optional cheap pre-check before LLM memory extraction."""
+
+    skip: bool
+    probability: float = 0.0
+    source: str = "jev"
+
+
+MemoryWritePrefilter = Callable[[list[dict[str, str]]], Awaitable[MemoryPrefilterDecision]]
+
+
 class MemoryExtractionScheduler:
     """Background extraction serialized per memory root and coalesced by freshness."""
 
@@ -630,11 +642,13 @@ class MemoryExtractionScheduler:
         *,
         recent_message_limit: int = 10,
         on_activity: MemoryActivityCallback | None = None,
+        prefilter: MemoryWritePrefilter | None = None,
     ) -> None:
         self.store = store
         self.extractor = extractor
         self.recent_message_limit = max(1, int(recent_message_limit))
         self.on_activity = on_activity
+        self.prefilter = prefilter
         self._running = False
         self._pending: tuple[str, list[dict[str, str]]] | None = None
         self._task: asyncio.Task[None] | None = None
@@ -689,6 +703,19 @@ class MemoryExtractionScheduler:
     async def _extract_once(self, session_id: str, messages: list[dict[str, str]]) -> None:
         lock = self._root_locks.setdefault(str(self.store.root), asyncio.Lock())
         async with lock:
+            if self.prefilter is not None:
+                try:
+                    decision = await self.prefilter(messages)
+                except Exception:
+                    decision = None
+                if decision is not None and decision.skip:
+                    self._emit(
+                        session_id,
+                        "memory_extraction_prefiltered",
+                        probability=round(float(decision.probability), 4),
+                        source=str(decision.source),
+                    )
+                    return
             try:
                 result = await self.extractor.extract(
                     messages=messages,

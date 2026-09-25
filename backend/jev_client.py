@@ -209,6 +209,85 @@ class JevClient:
         return JevResponse(answers=answers, model=f"{self.model}+mock", elapsed_seconds=0.0)
 
 
+def memory_write_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevMemoryWriteGate | None":
+    """Build the memory-write prefilter, or None when disabled/unavailable."""
+    config = load_jev_config(config_path, raw=raw)
+    gate_config = config["gates"]["memory_write"]
+    if not gate_config["enabled"]:
+        return None
+    client = JevClient.from_config(config_path, raw=raw)
+    if client is None:
+        return None
+    return JevMemoryWriteGate(client, min_probability=float(gate_config["min_probability"]))
+
+
+class JevMemoryWriteGate:
+    """Cheap yes/no pre-check before spending an LLM memory-extraction call.
+
+    Falls back to "extract" whenever the answer is missing or the gateway is
+    unavailable — never skip extraction because the gate itself failed.
+    """
+
+    def __init__(self, client: Any, *, min_probability: float = 0.5) -> None:
+        self.client = client
+        self.min_probability = _clamped(min_probability, 0.5)
+        self.question = JevQuestion(
+            name="worth_long_term",
+            kind="noul",
+            instructions=(
+                "Does this conversation contain information worth remembering long-term: "
+                "durable user preferences, collaboration feedback, non-derivable project "
+                "context, or external references? Temporary task details do not count."
+            ),
+        )
+
+    async def __call__(self, messages: Sequence[Mapping[str, Any]]) -> Any:
+        from .memory import MemoryPrefilterDecision
+
+        state = {
+            "recent_messages": [
+                {
+                    "role": str(item.get("role") or ""),
+                    "content": str(item.get("content") or "")[:2000],
+                }
+                for item in messages
+                if isinstance(item, Mapping)
+            ]
+        }
+        started = time.perf_counter()
+        try:
+            response = self.client.ask(state, [self.question])
+        except Exception as exc:
+            log_decision(
+                "memory_write",
+                state=state,
+                questions=[self.question],
+                response=None,
+                adopted=False,
+                elapsed=time.perf_counter() - started,
+                error=type(exc).__name__,
+            )
+            return MemoryPrefilterDecision(skip=False, probability=0.0, source="fallback")
+        answer = response.answers.get(self.question.name)
+        probability = float(answer.value) if answer is not None else 0.0
+        adopted = answer is not None
+        log_decision(
+            "memory_write",
+            state=state,
+            questions=[self.question],
+            response=response,
+            adopted=adopted,
+            elapsed=time.perf_counter() - started,
+        )
+        if adopted and probability < self.min_probability:
+            return MemoryPrefilterDecision(skip=True, probability=probability, source="jev")
+        return MemoryPrefilterDecision(
+            skip=False,
+            probability=probability,
+            source="jev" if adopted else "fallback",
+        )
+
+
 def log_decision(
     access_point: str,
     *,

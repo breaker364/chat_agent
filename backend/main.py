@@ -22,6 +22,7 @@ from .agentic_research.models import ResearchPolicyError, resolve_knowledge_poli
 from .agentic_research.config import load_agentic_research_config
 from .agentic_research.runtime import build_synthesis_context
 from .config import PROJECT_ROOT, get_runtime_value, load_agent_memory_config
+from .jev_client import memory_write_gate_from_config
 from .memory import (
     AgentMemoryStore,
     MemoryExtractionScheduler,
@@ -162,11 +163,13 @@ def get_memory_scheduler() -> MemoryExtractionScheduler | None:
     settings = load_agent_memory_config(workspace_dir=_workspace())
     if not settings.get("enabled", False):
         return None
+    prefilter = memory_write_gate_from_config()
     key = (
         str(settings["directory"]),
         int(settings["recent_message_limit"]),
         int(settings["max_candidates"]),
         int(settings["extraction_timeout_seconds"]),
+        prefilter is not None,
     )
     if _memory_scheduler is None or _memory_scheduler_key != key:
         store = AgentMemoryStore(Path(str(settings["directory"])), settings)
@@ -179,6 +182,7 @@ def get_memory_scheduler() -> MemoryExtractionScheduler | None:
             extractor,
             recent_message_limit=int(settings["recent_message_limit"]),
             on_activity=_record_memory_activity,
+            prefilter=prefilter,
         )
         _memory_scheduler_key = key
     return _memory_scheduler
