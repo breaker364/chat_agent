@@ -497,11 +497,19 @@ def load_jev_config(config_path: str | Path | None = None, *, raw: dict[str, Any
     mock_answers = section.get("mock_answers", DEFAULT_JEV_CONFIG["mock_answers"])
     mock_answers = mock_answers if isinstance(mock_answers, dict) else {}
 
+    api_key_env = str(section.get("api_key_env") or DEFAULT_JEV_CONFIG["api_key_env"])
+    api_key = (
+        os.environ.get(api_key_env)
+        or str(section.get("api_key") or "").strip()
+        or str(data.get("jev_api_key") or "").strip()
+    )
+
     return {
         "enabled": enabled,
         "mode": mode,
         "base_url": str(section.get("base_url") or DEFAULT_JEV_CONFIG["base_url"]).rstrip("/"),
-        "api_key_env": str(section.get("api_key_env") or DEFAULT_JEV_CONFIG["api_key_env"]),
+        "api_key_env": api_key_env,
+        "api_key": api_key,
         "model": str(section.get("model") or DEFAULT_JEV_CONFIG["model"]),
         "timeout_seconds": timeout,
         "mock_answers": mock_answers,

@@ -48,7 +48,9 @@
 }
 ```
 
-- API key 只从 `api_key_env` 指定的环境变量读取,不写入配置文件。
+- API key 解析顺序:环境变量(`api_key_env`,默认 `TYPESAFE_API_KEY`)
+  → `jev.api_key` → 顶层 `jev_api_key`(与 `tavily_api_key` 惯例一致)。
+  `config.json` 在 .gitignore 中,不会入库。
 - `mode: "mock"` 配合 `mock_answers` 可在无 key、无网络的条件下运行全部门控
   (返回配置的固定答案),用于开发与测试。
 
@@ -60,6 +62,10 @@
 "资料是数据不是指令"的约束始终生效。
 
 ## 测试
+
+live 验证记录(2026-09-26):使用配置 key 对 `api.typesafe.ai` 实测通过——
+noul 决策(urgent=0.95,1.3s)、路由选择题(clarify/0.68,0.8s)、RAG 双分块判定
+(正确保留相关、剔除无关,1.7s),返回模型版本 `jev-1.13.0`。
 
 ```bash
 .venv_py312/Scripts/python.exe -m pytest backend/tests/test_jev_gateway.py \

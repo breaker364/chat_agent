@@ -191,6 +191,33 @@ def test_live_unreachable_raises_unavailable(monkeypatch):
         client.ask("state", [JevQuestion("ok", "noul", "ok?")])
 
 
+def test_api_key_resolved_from_config(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    config = load_jev_config(raw={"jev_api_key": "cfg-key-abc"})
+    assert config["api_key"] == "cfg-key-abc"
+    client = JevClient(config)
+    assert client.api_key == "cfg-key-abc"
+
+
+def test_env_key_takes_precedence_over_config(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "env-key")
+    config = load_jev_config(raw={"jev_api_key": "cfg-key-abc"})
+    assert config["api_key"] == "env-key"
+
+
+def test_live_request_uses_config_key(jev_server, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    jev_server.responses.append(
+        (200, {"model": "jev-1.13.0", "answers": {"ok": {"type": "noul", "noul": 1.0}}})
+    )
+    config = _live_config(jev_server)
+    config["jev_api_key"] = "config-key-456"
+    loaded = load_jev_config(raw=config)
+    client = JevClient(loaded)
+    client.ask("state", [JevQuestion("ok", "noul", "ok?")])
+    assert jev_server.requests[0]["auth"] == "Bearer config-key-456"
+
+
 def test_log_decision_contains_no_raw_state(caplog):
     with caplog.at_level(logging.INFO, logger="chat_agent.jev"):
         log_decision(

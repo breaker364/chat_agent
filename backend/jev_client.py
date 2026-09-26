@@ -91,12 +91,14 @@ class JevClient:
         self.timeout_seconds = float(config.get("timeout_seconds") or 2.0)
         self.base_url = str(config.get("base_url") or "").rstrip("/")
         self.mock_answers = dict(config.get("mock_answers") or {})
-        self.api_key = ""
-        if self.mode == "live":
+        # load_jev_config already resolves env -> section -> top-level key;
+        # keep the env lookup as a fallback for directly built configs.
+        self.api_key = str(config.get("api_key") or "")
+        if not self.api_key:
             env_name = str(config.get("api_key_env") or "TYPESAFE_API_KEY")
             self.api_key = str(os.environ.get(env_name) or "")
-            if not self.api_key:
-                raise JevUnavailable(f"missing API key environment variable: {env_name}")
+        if self.mode == "live" and not self.api_key:
+            raise JevUnavailable(f"missing API key environment variable: {config.get('api_key_env')}")
 
     @classmethod
     def from_config(cls, config_path: Any = None, *, raw: dict[str, Any] | None = None) -> "JevClient | None":

@@ -41,6 +41,7 @@
     "max_command_chars": 8192
   },
   "tavily_api_key": "",
+  "jev_api_key": "",
   "tavily_base_url": "",
   "mcd_mcp_url": "",
   "mcd_mcp_token": "",

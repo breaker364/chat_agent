@@ -42,4 +42,5 @@
 - [x] 7.3 检查 AGENTS.md 合规:问题文本、阈值、配置无任何实体硬编码;运行 Python 编译与 `git diff --check`。
 - [x] 7.4 mock 模式下端到端手工验证四个区域各一个场景,确认决策日志、降级路径与关闭态一致性;live 模式验证待 API key 就绪后补充执行。
   - 执行记录(2026-09-25):全量后端测试 477 passed / 3 skipped;mock 冒烟覆盖路由、证据、技能、记忆写入、记忆读取、压缩灰区、RAG 七个门控;
-  live 模式验证 pending(TYPESAFE_API_KEY 未就绪)。
+  live 模式验证已完成(2026-09-26,使用 config.json 顶层 jev_api_key 实测 api.typesafe.ai:
+  noul 0.95/1.3s、路由 clarify/0.68/0.8s、RAG 正确保留与剔除/1.7s)。
