@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -312,11 +313,15 @@ def rag_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | None 
 class JevRagGate:
     """Semantic gate over fused retrieval candidates, before neighbor expansion.
 
-    Judging failures fail open: an unreachable gate keeps every candidate in
-    the original order instead of removing evidence.
+    Head candidates are judged concurrently (one request per chunk, three
+    questions per request). Judging failures fail open: an unreachable gate
+    keeps every candidate in the original order instead of removing evidence.
     """
 
     enabled = True
+
+    # Rate-limit-safe concurrency for per-chunk judging (cookbook guidance).
+    MAX_CONCURRENT_JUDGMENTS = 4
 
     RELEVANCE = "is_relevant"
     CONTRADICTION = "contradicts_premise"
@@ -345,10 +350,14 @@ class JevRagGate:
         normalized_query = " ".join(str(query or "").split()).lower()[:500]
         head = list(fused)[: self.max_passages]
         tail = list(fused)[self.max_passages :]
+        if head:
+            with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT_JUDGMENTS) as pool:
+                verdicts = list(pool.map(lambda pair: self._judge(normalized_query, pair[0]), head))
+        else:
+            verdicts = []
         kept: list[tuple[Any, float]] = []
         conflicts: list[tuple[Any, float]] = []
-        for chunk, score in head:
-            relevance, contradiction, injection = self._judge(normalized_query, chunk)
+        for (chunk, score), (relevance, contradiction, injection) in zip(head, verdicts):
             if injection >= self.min_injection:
                 LOGGER.warning(
                     "jev_rag_gate dropped prompt-injection suspect chunk_hash=%s",
