@@ -633,23 +633,60 @@ def skill_gate_from_config(config_path: Any = None, *, raw: dict[str, Any] | Non
     client = JevClient.from_config(config_path, raw=raw)
     if client is None:
         return None
-    return JevSkillGate(client, min_confidence=float(gate_config["min_confidence"]))
+    return JevSkillGate(
+        client,
+        advisory_min_confidence=float(gate_config["advisory_min_confidence"]),
+        directive_min_confidence=float(gate_config["directive_min_confidence"]),
+    )
+
+
+TIER_DIRECTIVE = "directive"
+TIER_ADVISORY = "advisory"
+TIER_NONE = "none"
+
+NO_SKILL_OPTION = "no_skill"
+
+
+@dataclass(frozen=True)
+class SkillSuggestion:
+    """Tiered skill preselection outcome; empty name means no injection."""
+
+    name: str
+    confidence: float
+    tier: str
 
 
 class JevSkillGate:
-    """Preselect a skill from the installed catalog; advisory only."""
+    """Preselect a skill from the installed catalog, or answer no_skill.
+
+    Tiers: confidence >= directive threshold -> directive; >= advisory
+    threshold -> advisory; below -> none. A no_skill answer never injects,
+    regardless of confidence.
+    """
 
     enabled = True
 
-    def __init__(self, client: Any, *, min_confidence: float = 0.7, max_skills: int = 40) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        advisory_min_confidence: float = 0.6,
+        directive_min_confidence: float = 0.8,
+        max_skills: int = 40,
+    ) -> None:
         self.client = client
-        self.min_confidence = _clamped(min_confidence, 0.7)
+        self.advisory_min_confidence = _clamped(advisory_min_confidence, 0.6)
+        self.directive_min_confidence = _clamped(directive_min_confidence, 0.8)
         self.max_skills = max(1, int(max_skills))
 
-    def select(self, message: str, catalog_items: Sequence[tuple[str, str]]) -> str:
+    def select(self, message: str, catalog_items: Sequence[tuple[str, str]]) -> SkillSuggestion:
         if not catalog_items:
-            return ""
-        criteria = {str(name): str(description or "")[:200] for name, description in list(catalog_items)[: self.max_skills]}
+            return SkillSuggestion("", 0.0, TIER_NONE)
+        criteria = {
+            str(name): str(description or "")[:200]
+            for name, description in list(catalog_items)[: self.max_skills]
+        }
+        criteria[NO_SKILL_OPTION] = "None of these skills is relevant; handle the request directly"
         question = JevQuestion(
             "skill",
             "choice",
@@ -670,23 +707,30 @@ class JevSkillGate:
                 elapsed=time.perf_counter() - started,
                 error=type(exc).__name__,
             )
-            return ""
+            return SkillSuggestion("", 0.0, TIER_NONE)
         answer = response.answers.get(question.name)
         selected = str(answer.value) if answer is not None else ""
-        adopted = (
-            answer is not None
-            and selected in criteria
-            and float(answer.confidence) >= self.min_confidence
-        )
+        confidence = float(answer.confidence) if answer is not None else 0.0
+        if selected == NO_SKILL_OPTION or selected not in criteria:
+            tier = TIER_NONE
+            selected = ""
+        elif confidence >= self.directive_min_confidence:
+            tier = TIER_DIRECTIVE
+        elif confidence >= self.advisory_min_confidence:
+            tier = TIER_ADVISORY
+        else:
+            tier = TIER_NONE
+            selected = ""
         log_decision(
             "skill",
             state=state,
             questions=[question],
             response=response,
-            adopted=adopted,
+            adopted=tier != TIER_NONE,
             elapsed=time.perf_counter() - started,
+            extra={"tier": tier, "answer": selected},
         )
-        return selected if adopted else ""
+        return SkillSuggestion(selected, confidence, tier)
 
 
 def build_skill_suggestion(
@@ -696,14 +740,17 @@ def build_skill_suggestion(
     *,
     raw: dict[str, Any] | None = None,
 ) -> str:
-    """Return an advisory skill hint for the system prompt, or an empty string.
+    """Return a tiered skill hint for the system prompt, or an empty string.
 
-    Never raises: any failure means "no suggestion" and the prompt stays as it
-    would without the gateway.
+    Directive tier (high confidence): instruct the model to use the skill and
+    allow skipping the full skill-detail read. Advisory tier: suggest reading
+    the detail first. Any failure means "no suggestion" and the prompt stays
+    as it would without the gateway.
     """
     try:
         config = load_jev_config(config_path, raw=raw)
-        if not config["gates"]["skill"]["enabled"]:
+        gate_config = config["gates"]["skill"]
+        if not gate_config["enabled"]:
             return ""
         client = JevClient.from_config(config_path, raw=raw)
         if client is None:
@@ -711,14 +758,25 @@ def build_skill_suggestion(
         from .skills import list_skill_catalog
 
         items = [(item.name, item.description) for item in list_skill_catalog(root)]
-        gate = JevSkillGate(client, min_confidence=float(config["gates"]["skill"]["min_confidence"]))
-        selected = gate.select(message, items)
-        if not selected:
-            return ""
-        return (
-            f"Skill suggestion: the installed skill '{selected}' appears relevant to this request. "
-            "Read its full detail via the skill detail tool before deciding whether to execute it."
+        gate = JevSkillGate(
+            client,
+            advisory_min_confidence=float(gate_config["advisory_min_confidence"]),
+            directive_min_confidence=float(gate_config["directive_min_confidence"]),
         )
+        suggestion = gate.select(message, items)
+        if suggestion.tier == TIER_DIRECTIVE:
+            return (
+                f"Skill directive: use the installed skill '{suggestion.name}' for this request. "
+                "Other catalog skills are not relevant. The catalog command hints above are "
+                "sufficient - you may skip reading the full skill detail via read_skill_detail "
+                "unless the request needs information beyond them."
+            )
+        if suggestion.tier == TIER_ADVISORY:
+            return (
+                f"Skill suggestion: the installed skill '{suggestion.name}' appears relevant to this request. "
+                "Read its full detail via the skill detail tool before deciding whether to execute it."
+            )
+        return ""
     except Exception:
         return ""
 

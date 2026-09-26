@@ -427,7 +427,7 @@ DEFAULT_JEV_CONFIG: dict[str, Any] = {
     "gates": {
         "routing": {"enabled": False, "min_confidence": 0.6},
         "evidence": {"enabled": False, "min_confidence": 0.6},
-        "skill": {"enabled": False, "min_confidence": 0.7},
+        "skill": {"enabled": False, "advisory_min_confidence": 0.6, "directive_min_confidence": 0.8},
         "rag": {
             "enabled": False,
             "max_passages": 6,

@@ -76,7 +76,8 @@
       },
       "skill": {
         "enabled": false,
-        "min_confidence": 0.7
+        "advisory_min_confidence": 0.6,
+        "directive_min_confidence": 0.8
       },
       "rag": {
         "enabled": false,

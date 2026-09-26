@@ -54,9 +54,9 @@ TypeSafe AI 于 2026-09 发布的 Jev(System One 决策模型)针对该场景:�
 
 问题设计遵循官方建议:每题只含一个判断,不给复合条件;状态只放必要片段(用户消息 + 任务描述),不放全文历史,控制上下文并降低噪声。
 
-### 4. Skill 预选:只注入建议提示,不改技能执行路径
+### 4. Skill 预选:带 no_skill 选项的分档注入
 
-在 `stream_agent_events` 组装系统提示前,若开启 `jev.gates.skill`,将用户消息与技能目录(name + description 作为选择题选项)交给 Jev;最高选项概率达到阈值 `jev.gates.skill.min_confidence`(默认 0.7)时,在系统提示追加一条通用建议消息("针对本请求可优先参考技能 X,仍需按工具流程确认"),不自动执行任何技能,主模型仍经 `read_skill_detail`/`use_skill` 自主决策。不达标或失败时不追加任何内容。技能目录文本的精简属后续变更,本期不动。`skills.py` 的命令前缀检测是确定性格式匹配,不改造。
+在 `stream_agent_events` 组装系统提示前,若开启 `jev.gates.skill`,将用户消息与技能目录(name + description 作为选择题选项)交给 Jev,选项固定追加 `no_skill`(都不相关,直接处理),避免强制选择导致的伪命中。结果按置信度分档:达到 `directive_min_confidence`(默认 0.8)注入指令消息("使用技能 X,目录中其他技能无需考虑;目录命令速查已覆盖时可跳过完整技能详情阅读"),达到 `advisory_min_confidence`(默认 0.6)注入建议消息(先读详情再决策),否则不注入。`no_skill` 回答无论置信度多高都不注入。技能执行始终由主模型经 `use_skill` 完成,分档只改变提示强度与是否允许跳过详情阅读。`skills.py` 的命令前缀检测是确定性格式匹配,不改造。
 
 ### 5. RAG 门控:重排后、邻块扩展前,top-N 逐块并行判断
 
