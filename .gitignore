@@ -78,3 +78,10 @@ skills/pptx
 skills/pdf
 skills/skill-creator
 skills/xlsx
+
+# Local tool-shipped skills and zcode state
+.zcodeignore
+skills/playwright/
+skills/screenshot/
+skills/receiving-code-review/
+skills/requesting-code-review/
