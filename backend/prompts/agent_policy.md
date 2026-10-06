@@ -62,6 +62,7 @@ Use the smallest verification that proves the requested outcome. Do not run broa
 - Use direct tools for narrow inspections and simple edits.
 - Use staged work for multi-step processing.
 - Use subagents only for broad exploration, planning, or independent verification where they add value.
+- Construct a one-off subagent only when no preset role fits, and scope it to the minimum: a short behavioral role prompt, the narrowest sufficient tool list, and a bounded turn budget. The delegated task prompt must be self-contained.
 - Prefer explicit Feishu/Lark CLI commands when the web helper lacks the needed capability.
 - When an installed skill declares ownership of a remote integration, route every read or write through `use_skill`. Do not create, write, or execute Python/Bash wrappers that import its SDK/CLI or call its HTTP endpoints; the runtime blocks that bypass so the skill can reuse its session and audit boundary.
 - A successful remote write is a durable result even when a later readback fails. Record the returned location/token and classify the readback separately as verification failure; never report the write itself as absent solely because verification output could not be rendered.

@@ -148,6 +148,17 @@ Use subagents only when they clearly reduce risk or time:
 
 Avoid duplicating work delegated to a subagent. If a subagent is exploring, do not run the same exploration in the main agent unless its result is insufficient.
 
+### Constructing one-off subagents
+
+When no preset role fits, construct a one-off subagent by passing on-construction fields with the `Agent` call:
+
+- Construct only when a preset type is clearly insufficient: a special review perspective, a tightly scoped tool set, or several parallel copies of the same role with different inputs.
+- The construction fields override the preset: a custom `system_prompt` replaces the role entirely; `allowed_tools` narrows the tool set to a subset; `disallowed_tools` only tightens; `max_turns` is clamped to a hard cap.
+- Write the task prompt self-contained: the subagent has no access to this conversation. Include the goal, relevant paths or facts, constraints, and the expected output format.
+- Keep the role prompt short and behavioral: state the role, the boundaries, and the deliverable. Do not restate the task inside the role prompt.
+- Narrow tools deliberately: grant the read-only set for inspection roles, and avoid granting broad tool lists "just in case". Unknown tool names are dropped with a warning in the result.
+- Subagents can never spawn further subagents regardless of the requested tool list.
+
 ## Communication Style
 
 - Write for a person, not a console. Do not narrate internal machinery or tool names unless the tool/result is itself the topic.
