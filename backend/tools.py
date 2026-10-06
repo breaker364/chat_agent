@@ -40,7 +40,7 @@ from .adapters import (
 )
 from .session_store import SessionStore
 from .subagent_runtime import get_subagent_manager
-from .subagents import built_in_subagents, run_subagent
+from .subagents import resolve_agent_definition, run_subagent
 from .config import get_runtime_value, load_agent_memory_config, load_mcd_mcp_config
 from .error_taxonomy import classify_exception, failure_payload_category, normalize_failure_result
 from .mutation_manifest import normalize_command_manifest
@@ -1537,9 +1537,13 @@ class AgentToolInput(BaseModel):
     """Arguments for launching a delegated subagent."""
 
     description: str = Field(..., description="Short task description for the subagent.")
-    prompt: str = Field(..., description="Full delegated task prompt.")
-    subagent_type: str = Field("general-purpose", description="Subagent type, e.g. general-purpose, Explore, Plan, verification.")
+    prompt: str = Field(..., description="Full delegated task prompt. Must be self-contained.")
+    subagent_type: str = Field("general-purpose", description="Preset base type, e.g. general-purpose, Explore, Plan, verification.")
     run_in_background: bool = Field(False, description="Whether to run the subagent in background mode.")
+    system_prompt: str = Field("", description="On-construction role prompt overriding the preset system prompt.")
+    allowed_tools: list[str] = Field(default_factory=list, description="On-construction whitelist narrowing the tool set.")
+    disallowed_tools: list[str] = Field(default_factory=list, description="On-construction blacklist added to the preset one.")
+    max_turns: int = Field(0, description="On-construction turn budget; 0 keeps the preset default; clamped to a hard cap.")
 
 
 class SendMessageInput(BaseModel):
@@ -2186,21 +2190,47 @@ def Agent(
     prompt: str,
     subagent_type: str = "general-purpose",
     run_in_background: bool = False,
+    system_prompt: str = "",
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    max_turns: int = 0,
 ) -> str:
-    """Launch a delegated subagent to handle a scoped task."""
+    """Launch a delegated subagent to handle a scoped task.
+
+    Optional on-construction fields (system_prompt, allowed_tools,
+    disallowed_tools, max_turns) build a one-off role on top of the preset
+    type; explicit fields override, omitted fields keep preset values.
+    """
     workspace = _workspace_root()
-    normalized_type = (subagent_type or "general-purpose").strip()
-    if normalized_type not in built_in_subagents():
-        normalized_type = "general-purpose"
+    try:
+        definition, resolution_meta = resolve_agent_definition(
+            subagent_type=subagent_type,
+            system_prompt=system_prompt or "",
+            allowed_tools=list(allowed_tools or []),
+            disallowed_tools=list(disallowed_tools or []),
+            max_turns=int(max_turns or 0),
+        )
+    except ValueError as exc:
+        return json.dumps({"status": "rejected", "error": str(exc)}, ensure_ascii=False, indent=2)
+    requested_type = str(resolution_meta.get("requested_type", subagent_type))
+    launch_summary = {
+        "base_type": resolution_meta.get("base_type", definition.agent_type),
+        "base_type_fallback": bool(resolution_meta.get("base_type_fallback", False)),
+        "custom_system_prompt": bool(resolution_meta.get("custom_system_prompt", False)),
+        "effective_tool_count": None,
+        "effective_max_turns": definition.max_turns,
+    }
 
     if run_in_background:
         session_id = _current_session_id()
         launched = _SUBAGENT_MANAGER.launch(
             prompt=prompt,
             description=description,
-            subagent_type=normalized_type,
+            subagent_type=requested_type,
             workspace_dir=workspace,
             session_id=session_id or None,
+            definition=definition,
+            resolution_meta=resolution_meta,
         )
         if session_id:
             SessionStore(workspace).add_subagent_task(session_id, launched)
@@ -2209,7 +2239,8 @@ def Agent(
                 "status": "async_launched",
                 "agent_id": launched["agent_id"],
                 "description": description,
-                "subagent_type": normalized_type,
+                "subagent_type": requested_type,
+                "definition_summary": launch_summary,
             },
             ensure_ascii=False,
             indent=2,
@@ -2220,8 +2251,9 @@ def Agent(
             run_subagent(
                 prompt=prompt,
                 description=description,
-                subagent_type=normalized_type,
                 workspace_dir=workspace,
+                definition=definition,
+                resolution_meta=resolution_meta,
             ),
             _SUBAGENT_SYNC_TIMEOUT_SECONDS,
         )
@@ -2230,9 +2262,11 @@ def Agent(
         launched = _SUBAGENT_MANAGER.launch(
             prompt=prompt,
             description=description,
-            subagent_type=normalized_type,
+            subagent_type=requested_type,
             workspace_dir=workspace,
             session_id=session_id or None,
+            definition=definition,
+            resolution_meta=resolution_meta,
         )
         if session_id:
             SessionStore(workspace).add_subagent_task(session_id, launched)
@@ -2240,9 +2274,10 @@ def Agent(
             {
                 "status": "timed_out_relaunched",
                 "description": description,
-                "subagent_type": normalized_type,
+                "subagent_type": requested_type,
                 "error": str(exc),
                 "replacement_agent_id": launched["agent_id"],
+                "definition_summary": launch_summary,
             },
             ensure_ascii=False,
             indent=2,
@@ -2255,9 +2290,10 @@ def Agent(
                 "agent_id": payload["agent_id"],
                 "status": "completed",
                 "description": description,
-                "subagent_type": normalized_type,
+                "subagent_type": requested_type,
                 "result": payload["result"],
                 "duration_seconds": payload["duration_seconds"],
+                "definition_summary": payload.get("definition_summary", launch_summary),
             },
         )
     return json.dumps(
@@ -2265,9 +2301,11 @@ def Agent(
             "status": "completed",
             "agent_id": payload["agent_id"],
             "description": description,
-            "subagent_type": normalized_type,
+            "subagent_type": requested_type,
             "content": payload["result"],
             "duration_seconds": payload["duration_seconds"],
+            "definition_summary": payload.get("definition_summary", launch_summary),
+            "warnings": payload.get("warnings", []),
         },
         ensure_ascii=False,
         indent=2,

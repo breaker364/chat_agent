@@ -323,7 +323,19 @@ class AsyncSubagentManager:
         config_path: str | Path | None = None,
         history: list[dict[str, str]] | None = None,
         session_id: str | None = None,
+        definition: AgentDefinition | None = None,
+        resolution_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if definition is None:
+            definition, resolution_meta = resolve_agent_definition(subagent_type=subagent_type)
+        resolution_meta = dict(resolution_meta or {})
+        launch_summary = {
+            "base_type": resolution_meta.get("base_type", definition.agent_type),
+            "base_type_fallback": bool(resolution_meta.get("base_type_fallback", False)),
+            "custom_system_prompt": bool(resolution_meta.get("custom_system_prompt", False)),
+            "effective_tool_count": None,
+            "effective_max_turns": definition.max_turns,
+        }
         agent_id = f"subagent-{uuid4().hex[:10]}"
         state = {
             "agent_id": agent_id,
@@ -338,6 +350,8 @@ class AsyncSubagentManager:
             "session_id": session_id or "",
             "message_queue_size": 0,
             "last_notification": "",
+            "definition": definition_to_payload(definition),
+            "definition_summary": launch_summary,
         }
         self._tasks[agent_id] = state
         self._mailboxes.setdefault(agent_id, [])
@@ -358,10 +372,13 @@ class AsyncSubagentManager:
                         workspace_dir=workspace_dir,
                         config_path=config_path,
                         history=history,
+                        definition=definition,
+                        resolution_meta=resolution_meta,
                     )
                 )
                 state["status"] = "idle"
                 state["result"] = payload.get("result", "")
+                state["definition_summary"].update(payload.get("definition_summary") or {})
                 state["transcript_file"] = str(_subagent_transcript_path(Path(workspace_dir).resolve(), payload["agent_id"]))
                 state["last_notification"] = "Initial run completed."
                 self._persist(workspace_dir, agent_id)

@@ -283,5 +283,137 @@ class TestRunSubagentDefinitionIntegration(unittest.TestCase):
         self.assertEqual(summary["base_type"], "Explore")
 
 
+class TestAgentToolConstructionFields(unittest.TestCase):
+    def setUp(self):
+        from backend import tools as runtime_tools
+        from backend.subagent_runtime import get_subagent_manager
+
+        self.runtime_tools = runtime_tools
+        self.manager = get_subagent_manager()
+        self._original_root = runtime_tools._ALLOWED_ROOT
+        self.tmp_root = Path(__file__).parent.parent / "tmp_test_dynamic_subagents"
+        self.tmp_root.mkdir(parents=True, exist_ok=True)
+        runtime_tools.set_allowed_root(self.tmp_root)
+
+        async def neutral_fake_run(**kwargs):
+            return {
+                "agent_id": kwargs["agent_id"],
+                "result": "ok",
+                "duration_seconds": 0.01,
+                "definition_summary": {},
+                "warnings": [],
+            }
+
+        # Never touch the real LLM or tool registry from tool-level tests.
+        self._patches = [
+            patch("backend.tools.run_subagent", neutral_fake_run),
+            patch("backend.subagents.run_subagent", neutral_fake_run),
+        ]
+        for item in self._patches:
+            item.start()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for item in self._patches:
+            item.stop()
+        self.runtime_tools._ALLOWED_ROOT = self._original_root
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+    def _invoke(self, **overrides):
+        from backend.tools import Agent
+
+        args = {
+            "description": "desc",
+            "prompt": "task prompt",
+            "subagent_type": "general-purpose",
+            "run_in_background": False,
+        }
+        args.update(overrides)
+        return json.loads(Agent.invoke(args))
+
+    def test_input_model_accepts_construction_fields(self):
+        from backend.tools import AgentToolInput
+
+        model = AgentToolInput(
+            description="desc",
+            prompt="task prompt",
+            system_prompt="CUSTOM ROLE",
+            allowed_tools=["read_file"],
+            disallowed_tools=["bash"],
+            max_turns=9,
+        )
+        self.assertEqual(model.max_turns, 9)
+
+    def test_rejects_oversized_system_prompt_without_dispatch(self):
+        from backend.subagents import SUBAGENT_SYSTEM_PROMPT_MAX_CHARS
+
+        before = set(self.manager._tasks.keys())
+        result = self._invoke(system_prompt="x" * (SUBAGENT_SYSTEM_PROMPT_MAX_CHARS + 1))
+        self.assertEqual(result["status"], "rejected")
+        self.assertIn("system_prompt", result["error"])
+        self.assertEqual(set(self.manager._tasks.keys()), before)
+
+    def test_sync_result_carries_definition_summary_and_warnings(self):
+        summary = {
+            "base_type": "general-purpose",
+            "base_type_fallback": False,
+            "custom_system_prompt": True,
+            "effective_tool_count": 3,
+            "effective_max_turns": 9,
+        }
+
+        async def fake_run_subagent(**kwargs):
+            return {
+                "agent_id": "subagent-fake1",
+                "result": "ok",
+                "duration_seconds": 0.01,
+                "definition_summary": summary,
+                "warnings": ["allowed_tools dropped unknown tool name: ghost_tool"],
+            }
+
+        with patch("backend.tools.run_subagent", fake_run_subagent):
+            result = self._invoke(system_prompt="CUSTOM ROLE", max_turns=9)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["definition_summary"], summary)
+        self.assertTrue(any("ghost_tool" in warning for warning in result["warnings"]))
+
+    def test_background_launch_persists_definition_and_reports_summary(self):
+        captured = {}
+
+        async def fake_run_subagent(**kwargs):
+            captured.update(kwargs)
+            return {
+                "agent_id": kwargs["agent_id"],
+                "result": "ok",
+                "duration_seconds": 0.01,
+                "definition_summary": {
+                    "base_type": "general-purpose",
+                    "base_type_fallback": False,
+                    "custom_system_prompt": True,
+                    "effective_tool_count": 2,
+                    "effective_max_turns": kwargs.get("definition").max_turns,
+                },
+                "warnings": [],
+            }
+
+        with patch("backend.subagents.run_subagent", fake_run_subagent):
+            result = self._invoke(
+                run_in_background=True,
+                system_prompt="CUSTOM ROLE",
+                max_turns=9,
+            )
+        self.assertEqual(result["status"], "async_launched")
+        self.assertTrue(result["definition_summary"]["custom_system_prompt"])
+        self.assertEqual(result["definition_summary"]["effective_max_turns"], 9)
+        agent_id = result["agent_id"]
+        self.assertTrue(
+            wait_until(lambda: (self.manager.get_task(agent_id, self.tmp_root) or {}).get("status") == "idle")
+        )
+        state = self.manager.get_task(agent_id, self.tmp_root)
+        self.assertEqual(state["definition"]["system_prompt"], "CUSTOM ROLE")
+        self.assertEqual(state["definition_summary"]["effective_tool_count"], 2)
+        self.assertEqual(captured["definition"].system_prompt, "CUSTOM ROLE")
+
+
 if __name__ == "__main__":
     unittest.main()
