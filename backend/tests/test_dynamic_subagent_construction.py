@@ -9,12 +9,15 @@ Covers openspec change `add-dynamic-subagent-construction`:
 
 import asyncio
 import json
+import shutil
 import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from langchain_core.messages import AIMessage
 
 from backend.subagents import (
     SUBAGENT_MAX_TURNS_HARD_CAP,
@@ -26,6 +29,7 @@ from backend.subagents import (
     definition_to_payload,
     filter_tools_for_subagent,
     resolve_agent_definition,
+    run_subagent,
 )
 
 
@@ -142,6 +146,141 @@ class TestDefinitionPayloadRoundTrip(unittest.TestCase):
         definition, _ = resolve_agent_definition(subagent_type="general-purpose")
         restored = definition_from_payload(definition_to_payload(definition))
         self.assertIsNone(restored.allowed_tool_names)
+
+
+class TestRecursionBlockingAndToolBoundary(unittest.TestCase):
+    def setUp(self):
+        self.tools = make_tools(
+            "read_file", "glob", "write_file", "web_search", "Agent", "SendMessage"
+        )
+
+    def test_recursion_tools_blocked_for_every_preset(self):
+        for agent_type, definition in built_in_subagents().items():
+            filtered, _ = filter_tools_for_subagent(self.tools, definition)
+            names = tool_names(filtered)
+            self.assertNotIn("Agent", names, agent_type)
+            self.assertNotIn("SendMessage", names, agent_type)
+
+    def test_recursion_blocked_even_when_whitelisted(self):
+        definition, _ = resolve_agent_definition(
+            subagent_type="general-purpose",
+            allowed_tools=["Agent", "read_file"],
+        )
+        filtered, _ = filter_tools_for_subagent(self.tools, definition)
+        self.assertEqual(tool_names(filtered), {"read_file"})
+
+    def test_allowed_whitelist_filters_to_subset(self):
+        definition, _ = resolve_agent_definition(
+            subagent_type="general-purpose",
+            allowed_tools=["read_file"],
+        )
+        filtered, warnings = filter_tools_for_subagent(self.tools, definition)
+        self.assertEqual(tool_names(filtered), {"read_file"})
+        self.assertEqual(warnings, [])
+
+    def test_allowed_unknown_names_dropped_with_warning(self):
+        definition, _ = resolve_agent_definition(
+            subagent_type="general-purpose",
+            allowed_tools=["read_file", "ghost_tool"],
+        )
+        filtered, warnings = filter_tools_for_subagent(self.tools, definition)
+        self.assertEqual(tool_names(filtered), {"read_file"})
+        self.assertTrue(any("ghost_tool" in warning for warning in warnings))
+
+    def test_allowed_matching_nothing_raises(self):
+        definition, _ = resolve_agent_definition(
+            subagent_type="general-purpose",
+            allowed_tools=["ghost_tool"],
+        )
+        with self.assertRaises(ValueError):
+            filter_tools_for_subagent(self.tools, definition)
+
+    def test_disallowed_union_applies_to_filtering(self):
+        definition, _ = resolve_agent_definition(
+            subagent_type="Explore",
+            disallowed_tools=["web_search"],
+        )
+        filtered, _ = filter_tools_for_subagent(self.tools, definition)
+        names = tool_names(filtered)
+        self.assertNotIn("write_file", names)
+        self.assertNotIn("web_search", names)
+        self.assertIn("read_file", names)
+
+
+class TestRunSubagentDefinitionIntegration(unittest.TestCase):
+    """run_subagent end-to-end with the LLM and tool registry patched out."""
+
+    def setUp(self):
+        self.workspace = Path(__file__).parent.parent / "tmp_test_dynamic_subagents"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.captured: dict = {}
+
+        class FakeAgent:
+            async def ainvoke(self, values, config=None):
+                self.captured_tools = None
+                return {"messages": [AIMessage(content="done")]}
+
+        self.fake_agent = FakeAgent()
+
+        def fake_create_react_agent(*, model, tools, state_schema=None):
+            self.captured["tools"] = list(tools)
+            return self.fake_agent
+
+        async def fake_get_all_tools(workspace_dir=None, rag_config_overrides=None):
+            return make_tools("read_file", "write_file", "web_search", "Agent", "SendMessage")
+
+        self._patches = [
+            patch("backend.subagents.load_llm_config", lambda config_path=None: {}),
+            patch("backend.subagents.create_chat_deepseek", lambda config=None: object()),
+            patch("backend.tools.get_all_tools", fake_get_all_tools),
+            patch("langgraph.prebuilt.create_react_agent", fake_create_react_agent),
+        ]
+        for item in self._patches:
+            item.start()
+        self.addCleanup(self._stop_patches)
+
+    def _stop_patches(self):
+        for item in self._patches:
+            item.stop()
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def test_constructed_definition_applied_and_summary_reported(self):
+        definition, meta = resolve_agent_definition(
+            subagent_type="general-purpose",
+            system_prompt="CUSTOM ROLE",
+            allowed_tools=["read_file", "Agent"],
+            max_turns=5,
+        )
+        payload = asyncio.run(
+            run_subagent(
+                prompt="task",
+                description="desc",
+                workspace_dir=self.workspace,
+                definition=definition,
+                resolution_meta=meta,
+            )
+        )
+        self.assertEqual(tool_names(self.captured["tools"]), {"read_file"})
+        summary = payload["definition_summary"]
+        self.assertTrue(summary["custom_system_prompt"])
+        self.assertFalse(summary["base_type_fallback"])
+        self.assertEqual(summary["effective_tool_count"], 1)
+        self.assertEqual(summary["effective_max_turns"], 5)
+        self.assertEqual(payload["warnings"], [])
+
+    def test_preset_path_blocks_write_tools(self):
+        payload = asyncio.run(
+            run_subagent(
+                prompt="task",
+                description="desc",
+                subagent_type="Explore",
+                workspace_dir=self.workspace,
+            )
+        )
+        self.assertNotIn("write_file", tool_names(self.captured["tools"]))
+        summary = payload["definition_summary"]
+        self.assertFalse(summary["custom_system_prompt"])
+        self.assertEqual(summary["base_type"], "Explore")
 
 
 if __name__ == "__main__":

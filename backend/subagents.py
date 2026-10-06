@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 SUBAGENT_MAX_RUNTIME_SECONDS = 180
 SUBAGENT_MAX_TURNS_HARD_CAP = 40
 SUBAGENT_SYSTEM_PROMPT_MAX_CHARS = 4000
+SUBAGENT_RECURSION_BLOCKED_TOOLS = frozenset({"Agent", "SendMessage"})
 
 
 @dataclass
@@ -169,13 +170,43 @@ def built_in_subagents() -> dict[str, AgentDefinition]:
     }
 
 
-def filter_tools_for_subagent(tools: list[Any], definition: AgentDefinition) -> list[Any]:
-    filtered = list(tools)
+def filter_tools_for_subagent(tools: list[Any], definition: AgentDefinition) -> tuple[list[Any], list[str]]:
+    """Scope tools for one subagent run.
+
+    Returns the filtered tool list plus warnings for whitelist names that do
+    not exist at runtime. The whitelist is a subset filter over the already
+    environment-scoped tool set (it can only narrow); disallowed names are
+    removed on top; recursion tools are removed unconditionally last so no
+    definition or construction field can re-enable them.
+    """
+    warnings: list[str] = []
+    by_name: dict[str, Any] = {}
+    for tool in tools:
+        name = getattr(tool, "name", "")
+        if name:
+            by_name[name] = tool
+
+    filtered: list[Any]
     if definition.allowed_tool_names is not None:
-        filtered = [tool for tool in filtered if getattr(tool, "name", "") in definition.allowed_tool_names]
+        unknown = sorted(definition.allowed_tool_names - by_name.keys())
+        for name in unknown:
+            warnings.append(f"allowed_tools dropped unknown tool name: {name}")
+        matched = definition.allowed_tool_names & by_name.keys()
+        if definition.allowed_tool_names and not matched:
+            raise ValueError(
+                "allowed_tools matched no available tools: "
+                + ", ".join(sorted(definition.allowed_tool_names))
+            )
+        filtered = [by_name[name] for name in matched]
+    else:
+        filtered = list(tools)
+
     if definition.disallowed_tool_names:
-        filtered = [tool for tool in filtered if getattr(tool, "name", "") not in definition.disallowed_tool_names]
-    return filtered
+        blocked = definition.disallowed_tool_names
+        filtered = [tool for tool in filtered if getattr(tool, "name", "") not in blocked]
+    if SUBAGENT_RECURSION_BLOCKED_TOOLS:
+        filtered = [tool for tool in filtered if getattr(tool, "name", "") not in SUBAGENT_RECURSION_BLOCKED_TOOLS]
+    return filtered, warnings
 
 
 def write_subagent_transcript(root: Path, agent_id: str, payload: dict[str, Any]) -> None:
@@ -204,22 +235,27 @@ async def run_subagent(
     agent_id: str | None = None,
     prompt: str,
     description: str,
-    subagent_type: str,
+    subagent_type: str = "general-purpose",
     workspace_dir: str | Path,
     config_path: str | Path | None = None,
     history: list[dict[str, str]] | None = None,
+    definition: AgentDefinition | None = None,
+    resolution_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
     from langgraph.prebuilt import create_react_agent
 
     workspace = Path(workspace_dir).resolve()
-    definition = built_in_subagents().get(subagent_type) or built_in_subagents()["general-purpose"]
+    if definition is None:
+        definition, resolution_meta = resolve_agent_definition(subagent_type=subagent_type)
+    resolution_meta = dict(resolution_meta or {})
     cfg = load_llm_config(config_path)
     llm = create_chat_deepseek(cfg)
     from .tools import get_all_tools
 
     all_tools = await get_all_tools(workspace_dir=workspace)
-    tools = filter_tools_for_subagent(all_tools, definition)
+    tools, tool_warnings = filter_tools_for_subagent(all_tools, definition)
+    warnings = list(tool_warnings)
     agent = create_react_agent(model=llm, tools=tools, state_schema=None)
 
     agent_id = agent_id or f"subagent-{uuid4().hex[:10]}"
@@ -254,6 +290,14 @@ async def run_subagent(
         "result": final_text,
         "duration_seconds": round(time.monotonic() - started_at, 3),
         "created_at": time.time(),
+        "definition_summary": {
+            "base_type": resolution_meta.get("base_type", definition.agent_type),
+            "base_type_fallback": bool(resolution_meta.get("base_type_fallback", False)),
+            "custom_system_prompt": bool(resolution_meta.get("custom_system_prompt", False)),
+            "effective_tool_count": len(tools),
+            "effective_max_turns": definition.max_turns,
+        },
+        "warnings": warnings,
     }
     write_subagent_transcript(workspace, agent_id, payload)
     return payload
