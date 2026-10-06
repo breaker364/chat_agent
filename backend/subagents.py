@@ -15,6 +15,8 @@ from .session_events import get_session_event_hub
 
 logger = logging.getLogger(__name__)
 SUBAGENT_MAX_RUNTIME_SECONDS = 180
+SUBAGENT_MAX_TURNS_HARD_CAP = 40
+SUBAGENT_SYSTEM_PROMPT_MAX_CHARS = 4000
 
 
 @dataclass
@@ -26,6 +28,91 @@ class AgentDefinition:
     disallowed_tool_names: set[str] | None = None
     max_turns: int = 20
     background: bool = False
+
+
+def resolve_agent_definition(
+    *,
+    subagent_type: str = "general-purpose",
+    system_prompt: str = "",
+    allowed_tools: list[str] | tuple[str, ...] | None = None,
+    disallowed_tools: list[str] | tuple[str, ...] | None = None,
+    max_turns: int = 0,
+) -> tuple[AgentDefinition, dict[str, Any]]:
+    """Merge on-construction fields over the preset type template.
+
+    Explicit fields override preset values; omitted fields keep preset values.
+    Disallowed names only ever accumulate (union) so construction cannot loosen
+    a preset boundary. Returns the definition plus a resolution summary used
+    for observability. Raises ValueError for an oversized system_prompt.
+    """
+    registry = built_in_subagents()
+    requested_type = (subagent_type or "").strip() or "general-purpose"
+    fallback = requested_type not in registry
+    base = registry.get(requested_type) or registry["general-purpose"]
+
+    custom_prompt = bool((system_prompt or "").strip())
+    if custom_prompt and len(system_prompt) > SUBAGENT_SYSTEM_PROMPT_MAX_CHARS:
+        raise ValueError(
+            f"system_prompt exceeds the {SUBAGENT_SYSTEM_PROMPT_MAX_CHARS} character limit "
+            f"(got {len(system_prompt)}); shorten the role prompt and retry."
+        )
+
+    disallowed = set(base.disallowed_tool_names or set())
+    disallowed.update(name.strip() for name in (disallowed_tools or []) if name and name.strip())
+
+    allowed: set[str] | None = None
+    cleaned_allowed = {name.strip() for name in (allowed_tools or []) if name and name.strip()}
+    if cleaned_allowed:
+        allowed = cleaned_allowed
+
+    requested_turns = int(max_turns or 0)
+    effective_turns = min(requested_turns, SUBAGENT_MAX_TURNS_HARD_CAP) if requested_turns > 0 else base.max_turns
+
+    definition = AgentDefinition(
+        agent_type=base.agent_type,
+        when_to_use=base.when_to_use,
+        system_prompt=system_prompt.strip() if custom_prompt else base.system_prompt,
+        allowed_tool_names=allowed,
+        disallowed_tool_names=disallowed or None,
+        max_turns=effective_turns,
+        background=base.background,
+    )
+    meta = {
+        "requested_type": requested_type,
+        "base_type": base.agent_type,
+        "base_type_fallback": fallback,
+        "custom_system_prompt": custom_prompt,
+        "effective_max_turns": effective_turns,
+    }
+    return definition, meta
+
+
+def definition_to_payload(definition: AgentDefinition) -> dict[str, Any]:
+    """JSON-serializable form persisted with the background task state."""
+    return {
+        "agent_type": definition.agent_type,
+        "when_to_use": definition.when_to_use,
+        "system_prompt": definition.system_prompt,
+        "allowed_tool_names": (
+            sorted(definition.allowed_tool_names) if definition.allowed_tool_names is not None else None
+        ),
+        "disallowed_tool_names": sorted(definition.disallowed_tool_names or set()),
+        "max_turns": definition.max_turns,
+        "background": definition.background,
+    }
+
+
+def definition_from_payload(payload: dict[str, Any]) -> AgentDefinition:
+    allowed = payload.get("allowed_tool_names")
+    return AgentDefinition(
+        agent_type=str(payload.get("agent_type", "general-purpose")),
+        when_to_use=str(payload.get("when_to_use", "")),
+        system_prompt=str(payload.get("system_prompt", "")),
+        allowed_tool_names=set(allowed) if allowed is not None else None,
+        disallowed_tool_names=set(payload.get("disallowed_tool_names") or []),
+        max_turns=int(payload.get("max_turns", 20)),
+        background=bool(payload.get("background", False)),
+    )
 
 
 def _subagent_dir(root: Path) -> Path:
