@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +12,7 @@ from uuid import uuid4
 
 from .config import create_chat_deepseek, load_llm_config
 from .session_events import get_session_event_hub
+from .session_store import _atomic_write_json as _atomic_write_json_file
 
 logger = logging.getLogger(__name__)
 SUBAGENT_MAX_RUNTIME_SECONDS = 180
@@ -220,13 +220,8 @@ def write_subagent_task_state(root: Path, agent_id: str, payload: dict[str, Any]
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write via tmp+replace so concurrent readers never see truncated JSON."""
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(tmp_path, path)
+    """Persist via tmp+replace with the shared Windows-safe retry from session_store."""
+    _atomic_write_json_file(path, payload)
 
 
 def read_subagent_task_state(root: Path, agent_id: str) -> dict[str, Any] | None:

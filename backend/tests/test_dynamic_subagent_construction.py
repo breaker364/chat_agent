@@ -443,6 +443,13 @@ class TestBackgroundConcurrencyAndResume(unittest.TestCase):
     def _restore(self):
         self._patch.stop()
         self.release.set()
+        # Let launched threads reach a terminal state (and finish their final
+        # persist) before removing the workspace, or Windows raises in-thread.
+        deadline = time.monotonic() + 5
+        for task in list(self.manager._tasks.values()):
+            while time.monotonic() < deadline and task["status"] in {"queued", "running"}:
+                time.sleep(0.02)
+        time.sleep(0.05)
         shutil.rmtree(self.workspace, ignore_errors=True)
 
     def _launch(self, **overrides):
