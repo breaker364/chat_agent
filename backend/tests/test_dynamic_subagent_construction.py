@@ -402,17 +402,133 @@ class TestAgentToolConstructionFields(unittest.TestCase):
                 system_prompt="CUSTOM ROLE",
                 max_turns=9,
             )
-        self.assertEqual(result["status"], "async_launched")
-        self.assertTrue(result["definition_summary"]["custom_system_prompt"])
-        self.assertEqual(result["definition_summary"]["effective_max_turns"], 9)
-        agent_id = result["agent_id"]
-        self.assertTrue(
-            wait_until(lambda: (self.manager.get_task(agent_id, self.tmp_root) or {}).get("status") == "idle")
-        )
+            self.assertEqual(result["status"], "async_launched")
+            self.assertTrue(result["definition_summary"]["custom_system_prompt"])
+            self.assertEqual(result["definition_summary"]["effective_max_turns"], 9)
+            agent_id = result["agent_id"]
+            # Wait while the patched fake is still active so the thread
+            # cannot fall through to the class-level neutral fake.
+            self.assertTrue(
+                wait_until(lambda: (self.manager.get_task(agent_id, self.tmp_root) or {}).get("status") == "idle")
+            )
         state = self.manager.get_task(agent_id, self.tmp_root)
         self.assertEqual(state["definition"]["system_prompt"], "CUSTOM ROLE")
         self.assertEqual(state["definition_summary"]["effective_tool_count"], 2)
         self.assertEqual(captured["definition"].system_prompt, "CUSTOM ROLE")
+
+
+class TestBackgroundConcurrencyAndResume(unittest.TestCase):
+    def setUp(self):
+        self.manager = AsyncSubagentManager()
+        self.workspace = Path(__file__).parent.parent / "tmp_test_dynamic_subagents"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.captured: list[dict] = []
+        self.release = threading.Event()
+
+        async def fake_run(**kwargs):
+            self.captured.append(kwargs)
+            self.release.wait(timeout=10)
+            return {
+                "agent_id": kwargs["agent_id"],
+                "result": "ok",
+                "duration_seconds": 0.01,
+                "definition_summary": {"custom_system_prompt": True},
+                "warnings": [],
+            }
+
+        self._patch = patch("backend.subagents.run_subagent", fake_run)
+        self._patch.start()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self._patch.stop()
+        self.release.set()
+        shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def _launch(self, **overrides):
+        args = {
+            "prompt": "task",
+            "description": "desc",
+            "subagent_type": "general-purpose",
+            "workspace_dir": self.workspace,
+        }
+        args.update(overrides)
+        return self.manager.launch(**args)
+
+    def test_launch_queues_when_concurrency_full(self):
+        from backend.subagents import SUBAGENT_MAX_CONCURRENCY
+
+        acquired = []
+        try:
+            for _ in range(SUBAGENT_MAX_CONCURRENCY):
+                self.manager._semaphore.acquire()
+                acquired.append(True)
+            state = self._launch()
+            self.assertEqual(state["status"], "queued")
+            time.sleep(0.2)
+            self.assertEqual(self.manager._tasks[state["agent_id"]]["status"], "queued")
+        finally:
+            for _ in acquired:
+                self.manager._semaphore.release()
+        self.release.set()
+        self.assertTrue(
+            wait_until(lambda: self.manager._tasks[state["agent_id"]]["status"] == "idle")
+        )
+
+    def test_failed_run_releases_concurrency_slot(self):
+        async def failing_run(**kwargs):
+            raise RuntimeError("boom")
+
+        with patch("backend.subagents.run_subagent", failing_run):
+            failing = self._launch()
+            self.assertTrue(
+                wait_until(lambda: self.manager._tasks[failing["agent_id"]]["status"] == "failed")
+            )
+        # The failed run released its slot: the semaphore is immediately acquirable.
+        self.assertTrue(self.manager._semaphore.acquire(blocking=False))
+        self.manager._semaphore.release()
+
+    def test_resume_keeps_constructed_definition(self):
+        definition, meta = resolve_agent_definition(
+            subagent_type="general-purpose",
+            system_prompt="CUSTOM ROLE",
+            allowed_tools=["read_file"],
+            max_turns=6,
+        )
+        state = self._launch(definition=definition, resolution_meta=meta)
+        agent_id = state["agent_id"]
+        self.release.set()
+        self.assertTrue(
+            wait_until(lambda: self.manager._tasks[agent_id]["status"] == "idle")
+        )
+        self.assertTrue(self.manager.send_message(agent_id, "follow-up", workspace_dir=self.workspace))
+        self.assertTrue(
+            wait_until(lambda: len(self.captured) >= 2 and self.manager._tasks[agent_id]["status"] == "idle")
+        )
+        resumed_definition = self.captured[1].get("definition")
+        self.assertIsNotNone(resumed_definition)
+        self.assertEqual(resumed_definition.system_prompt, "CUSTOM ROLE")
+        self.assertEqual(resumed_definition.allowed_tool_names, {"read_file"})
+        self.assertEqual(resumed_definition.max_turns, 6)
+
+    def test_task_state_persists_resolved_definition(self):
+        definition, meta = resolve_agent_definition(
+            subagent_type="Explore",
+            system_prompt="CUSTOM ROLE",
+        )
+        state = self._launch(definition=definition, resolution_meta=meta)
+        agent_id = state["agent_id"]
+        # launch persists the task state synchronously before the thread starts.
+        persisted = _read_state(self.workspace, agent_id)
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted["definition"]["system_prompt"], "CUSTOM ROLE")
+        self.assertEqual(persisted["definition"]["agent_type"], "Explore")
+
+
+def _read_state(workspace: Path, agent_id: str):
+    from backend.subagents import read_subagent_task_state
+
+    return read_subagent_task_state(workspace, agent_id)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, Semaphore, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 SUBAGENT_MAX_RUNTIME_SECONDS = 180
 SUBAGENT_MAX_TURNS_HARD_CAP = 40
 SUBAGENT_SYSTEM_PROMPT_MAX_CHARS = 4000
+SUBAGENT_MAX_CONCURRENCY = 8
 SUBAGENT_RECURSION_BLOCKED_TOOLS = frozenset({"Agent", "SendMessage"})
 
 
@@ -210,17 +212,21 @@ def filter_tools_for_subagent(tools: list[Any], definition: AgentDefinition) -> 
 
 
 def write_subagent_transcript(root: Path, agent_id: str, payload: dict[str, Any]) -> None:
-    _subagent_transcript_path(root, agent_id).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _atomic_write_json(_subagent_transcript_path(root, agent_id), payload)
 
 
 def write_subagent_task_state(root: Path, agent_id: str, payload: dict[str, Any]) -> None:
-    _subagent_task_path(root, agent_id).write_text(
+    _atomic_write_json(_subagent_task_path(root, agent_id), payload)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write via tmp+replace so concurrent readers never see truncated JSON."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    os.replace(tmp_path, path)
 
 
 def read_subagent_task_state(root: Path, agent_id: str) -> dict[str, Any] | None:
@@ -308,6 +314,7 @@ class AsyncSubagentManager:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._mailboxes: dict[str, list[str]] = {}
         self._locks: dict[str, Lock] = {}
+        self._semaphore = Semaphore(SUBAGENT_MAX_CONCURRENCY)
 
     def _persist(self, workspace_dir: str | Path, agent_id: str) -> None:
         state = self._tasks[agent_id]
@@ -339,7 +346,7 @@ class AsyncSubagentManager:
         agent_id = f"subagent-{uuid4().hex[:10]}"
         state = {
             "agent_id": agent_id,
-            "status": "running",
+            "status": "queued",
             "description": description,
             "subagent_type": subagent_type,
             "prompt": prompt,
@@ -351,6 +358,7 @@ class AsyncSubagentManager:
             "message_queue_size": 0,
             "last_notification": "",
             "definition": definition_to_payload(definition),
+            "resolution_meta": dict(resolution_meta or {}),
             "definition_summary": launch_summary,
         }
         self._tasks[agent_id] = state
@@ -359,8 +367,14 @@ class AsyncSubagentManager:
         self._persist(workspace_dir, agent_id)
 
         def _thread_runner() -> None:
+            acquired = False
             try:
                 from .session_store import SessionStore
+                self._semaphore.acquire()
+                acquired = True
+                state["status"] = "running"
+                state["last_notification"] = "Acquired concurrency slot."
+                self._persist(workspace_dir, agent_id)
                 started_at = time.monotonic()
 
                 payload = asyncio.run(
@@ -411,6 +425,9 @@ class AsyncSubagentManager:
                 state["status"] = "failed"
                 state["error"] = str(exc)
                 self._persist(workspace_dir, agent_id)
+            finally:
+                if acquired:
+                    self._semaphore.release()
 
         Thread(target=_thread_runner, daemon=True).start()
         return dict(state)
@@ -472,9 +489,15 @@ class AsyncSubagentManager:
             return
 
         def _thread_runner() -> None:
+            acquired = False
             try:
                 from .session_store import SessionStore
 
+                persisted = state.get("definition")
+                resume_definition = definition_from_payload(persisted) if persisted else None
+                resume_meta = dict(state.get("resolution_meta") or {})
+                self._semaphore.acquire()
+                acquired = True
                 while True:
                     mailbox = self._mailboxes.setdefault(agent_id, [])
                     if not mailbox:
@@ -527,6 +550,8 @@ class AsyncSubagentManager:
                             workspace_dir=workspace_dir,
                             config_path=config_path,
                             history=state.get("history", []),
+                            definition=resume_definition,
+                            resolution_meta=resume_meta,
                         )
                     )
                     state["result"] = payload.get("result", "")
@@ -560,6 +585,8 @@ class AsyncSubagentManager:
                 state["error"] = str(exc)
                 self._persist(workspace_dir, agent_id)
             finally:
+                if acquired:
+                    self._semaphore.release()
                 lock.release()
 
         Thread(target=_thread_runner, daemon=True).start()
